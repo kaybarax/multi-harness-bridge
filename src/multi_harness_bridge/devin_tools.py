@@ -186,7 +186,7 @@ def make_role_server(cfg, project):
                 raise PermissionError("Role challenge is expired, used, or belongs to another native session")
             db.execute("UPDATE devin_role_challenges SET used=1,role=? WHERE challenge_hash=?", (role,digest))
         try:
-            roles = store.bind(project,"devin",role_values[role],call["session"])
+            roles = store.bind(project,"devin",role_values[role],call["session"], take=True)
         except Exception:
             with closing(sqlite3.connect(cfg.database)) as db, db:
                 db.execute("UPDATE devin_role_challenges SET used=0 WHERE challenge_hash=? AND expires>?",

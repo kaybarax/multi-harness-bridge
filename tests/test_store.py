@@ -156,3 +156,25 @@ def test_previous_schema_is_migrated(tmp_path):
         assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert "explicit" in {r[1] for r in db.execute("PRAGMA table_info(control)")}
         assert "updated" in {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+
+
+@pytest.mark.parametrize("harness", ["codex", "claude", "devin", "antigravity"])
+def test_inbox_takeover_resumes_only_verified_route(tmp_path, harness):
+    store = Store(tmp_path / "queue.db")
+    store.set_enabled("alpha", harness, False)
+    store.set_enabled("beta", harness, False)
+    store.bind("alpha", harness, "inbox", "first", take=True)
+    assert not store.status("alpha", harness)["enabled"]
+    store.bind("alpha", harness, "coordinator", "co", take=True)
+    assert store.status("alpha", harness)["enabled"]
+    store.set_enabled("alpha", harness, False)
+    store.bind("alpha", harness, "coordinator", "co2", take=True)
+    with pytest.raises(ValueError):
+        store.bind("alpha", harness, "inbox", "co2", take=True)
+    assert not store.status("alpha", harness)["enabled"]
+    store.bind("alpha", harness, "inbox", "next", take=True)
+    assert store.status("alpha", harness)["enabled"]
+    assert not store.status("beta", harness)["enabled"]
+    store.set_enabled("alpha", harness, False)
+    store.bind("alpha", harness, "inbox", "next", take=True)
+    assert store.status("alpha", harness)["enabled"]

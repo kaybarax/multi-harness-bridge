@@ -39,7 +39,7 @@ The default state directory is `~/.multi-harness-bridge`. Set `MHB_HOME` before 
 
    Run `multi-harness-skills --help` and follow the [host setup guide](docs/skills.md) to enable the project’s native integration for each app. Use the local Desktop surface for a desktop-visible chat. An unrelated cloud session has a different identity.
 
-3. **Assign the roles.** In one project chat enter `take coordinator "Orchard Coordinator"`. In another enter `take bridge "Orchard Bridge Inbox"`. The title is optional. The native chat identity and registered workspace determine the binding.
+3. **Assign the roles.** In one project chat enter `take coordinator "Orchard Coordinator"`. In another enter `take bridge "Orchard Bridge Inbox"`. A verified Take Bridge resumes pickup for this project and harness once both roles are assigned. Either role can be assigned first. Take Coordinator alone preserves an explicit stop. The title is optional. The native chat identity and registered workspace determine the binding.
 4. **Enable pickup.** Follow the [native wake guide](docs/native.md). Check the project with `mhb status orchard codex`. For automatic startup, generate a [user service definition](docs/services.md). Send a short test to the destination's inbox, inspect the coordinator's receipt, then send a correlated reply. The sender and recipient can belong to different harnesses.
 5. **Connect Telegram if desired.** Choose a shared bot or dedicated bots, configure the authorized chat and users, and select who owns the Telegram connection. A threaded reply returns through the PMA to the originating harness and project. See [Telegram and Hermes](docs/telegram.md).
 

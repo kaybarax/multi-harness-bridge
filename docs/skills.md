@@ -1,5 +1,7 @@
 # Project skills and native role access
 
+A verified Take Bridge resumes pickup for this project and harness once both roles are assigned. Either role can be assigned first. Take Coordinator alone preserves an explicit stop.
+
 Setup provisions three user-wide skills. Open a fresh chat in your registered project and use the composer for your app.
 
 | App | Coordinator | Bridge Inbox | Propagation |

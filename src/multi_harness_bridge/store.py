@@ -93,7 +93,7 @@ class Store:
             raise ValueError(f"{field} must be a non-empty string")
         return value
 
-    def bind(self, project, harness, role, session):
+    def bind(self, project, harness, role, session, *, take=False):
         project, harness, session = (
             self._name(project, "project"),
             self._name(harness, "harness"),
@@ -111,9 +111,10 @@ class Store:
                 "SELECT session FROM bindings WHERE project=? AND harness=? AND role=?",
                 (project, harness, role),
             ).fetchone()
-            if old and old[0] == session:
+            resume = take and role == "inbox"
+            if old and old[0] == session and not resume:
                 return self.roles(project, harness)
-            if old:
+            if old and old[0] != session:
                 active = db.execute(
                     """SELECT 1 FROM messages WHERE project=? AND recipient=?
                     AND lease_role=? AND lease_session=? AND lease IS NOT NULL AND deadline>? LIMIT 1""",
@@ -131,6 +132,10 @@ class Store:
                 raise ValueError(
                     "session is already bound to this harness in another project or role"
                 ) from exc
+            if resume:
+                # Return this route to automatic activation when both roles exist.
+                db.execute("UPDATE control SET explicit=0, enabled=0 WHERE project=? AND harness=?",
+                           (project, harness))
             complete = (
                 db.execute(
                     "SELECT COUNT(*) FROM bindings WHERE project=? AND harness=?",

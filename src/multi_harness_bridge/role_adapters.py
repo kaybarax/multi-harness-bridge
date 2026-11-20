@@ -79,7 +79,7 @@ def bind(store, invocation: Invocation):
             session = str(uuid.UUID(session))
         except (ValueError, TypeError, AttributeError):
             raise ValueError("Invalid native chat session identity") from None
-    store.bind(project, invocation.harness, invocation.role, session)
+    store.bind(project, invocation.harness, invocation.role, session, take=True)
     return {"project": project, "harness": invocation.harness, "role": invocation.role,
             "session": session, **store.roles(project, invocation.harness)}
 

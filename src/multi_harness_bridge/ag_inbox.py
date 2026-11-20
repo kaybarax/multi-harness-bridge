@@ -94,7 +94,7 @@ def invoke(cfg, project, tool, grant):
     if tool in {"take_coordinator", "take_bridge"}:
         role = "coordinator" if tool == "take_coordinator" else "inbox"
         previous = roles[role]
-        roles = store.bind(project, "antigravity", role, session)
+        roles = store.bind(project, "antigravity", role, session, take=True)
         result = {"project":project,"harness":"antigravity","role":role,"previous":previous,
                   "roles":roles,"status":store.status(project,"antigravity"),
                   "pending":store.pending_overview(project,"antigravity",20)}
