@@ -42,6 +42,8 @@ def test_inbox_forwarding_and_coordinator_ack_are_durable(tmp_path):
         "alpha", "one", "coordinator", "c1", message["id"], coordinator_job["lease"]
     )
     assert store.status("alpha", "one")["done"] == 1
+    assert [e["event"] for e in store.trace("alpha",message["id"])["events"]] == [
+        "enqueued","inbox-claimed","forwarded","coordinator-claimed","acknowledged"]
 
 
 def test_concurrent_claims_expiry_and_retirement_guard(tmp_path):
@@ -151,6 +153,6 @@ def test_previous_schema_is_migrated(tmp_path):
         """)
     Store(path)
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
         assert "explicit" in {r[1] for r in db.execute("PRAGMA table_info(control)")}
         assert "updated" in {r[1] for r in db.execute("PRAGMA table_info(messages)")}

@@ -8,7 +8,7 @@ import uuid
 
 ROLES = {"coordinator", "inbox"}
 LEASE_SECONDS = 30
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Store:
@@ -66,6 +66,18 @@ class Store:
             db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS binding_session_scope ON bindings(harness,session)"
             )
+            db.execute("""CREATE TABLE IF NOT EXISTS delivery_events(
+                message_id TEXT NOT NULL, at REAL NOT NULL, event TEXT NOT NULL,
+                attempt INTEGER NOT NULL, PRIMARY KEY(message_id,event,attempt))""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS record_enqueue AFTER INSERT ON messages
+                BEGIN INSERT INTO delivery_events VALUES(NEW.id,NEW.created,'enqueued',0); END""")
+            db.execute("""CREATE TRIGGER IF NOT EXISTS record_delivery AFTER UPDATE ON messages
+                WHEN OLD.stage<>NEW.stage OR OLD.attempts<>NEW.attempts
+                BEGIN INSERT INTO delivery_events VALUES(NEW.id,NEW.updated,
+                    CASE WHEN OLD.attempts<>NEW.attempts THEN NEW.stage || '-claimed'
+                         WHEN NEW.stage='done' THEN 'acknowledged' ELSE 'forwarded' END,
+                    NEW.attempts); END""")
+            db.execute("CREATE INDEX IF NOT EXISTS replies ON messages(project,reply_to)")
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
     def _connect(self):
@@ -225,7 +237,7 @@ class Store:
                 )
             return {"id": row[0]}
 
-    def claim(self, project, harness, role, session):
+    def claim(self, project, harness, role, session, *, message_id=None):
         self._validate_claim(project, harness, role, session)
         now, lease = time.time(), secrets.token_urlsafe(24)
         stage = "inbox" if role == "inbox" else "coordinator"
@@ -243,8 +255,8 @@ class Store:
                 return None
             row = db.execute(
                 """SELECT * FROM messages WHERE project=? AND recipient=? AND stage=?
-                AND (lease IS NULL OR deadline<=?) ORDER BY created,id LIMIT 1""",
-                (project, harness, stage, now),
+                AND (lease IS NULL OR deadline<=?) AND (? IS NULL OR id=?) ORDER BY created,id LIMIT 1""",
+                (project, harness, stage, now, message_id, message_id),
             ).fetchone()
             if row is None:
                 return None
@@ -373,10 +385,16 @@ class Store:
         with closing(self._connect()) as db:
             row = db.execute(
                 """SELECT id,project,sender,recipient,stage,created,updated,
-                attempts,lease_role,deadline FROM messages WHERE project=? AND id=?""",
+                attempts,lease_role,deadline,reply_to FROM messages WHERE project=? AND id=?""",
                 (project, message_id),
             ).fetchone()
-            return dict(row) if row else None
+            if row is None:
+                return None
+            return {**dict(row),
+                    "events": [dict(event) for event in db.execute(
+                        "SELECT at,event,attempt FROM delivery_events WHERE message_id=? ORDER BY rowid", (message_id,))],
+                    "replies": [r[0] for r in db.execute(
+                        "SELECT id FROM messages WHERE project=? AND reply_to=? ORDER BY created,id", (project,message_id))]}
 
     @staticmethod
     def _validate_claim(project, harness, role, session):
