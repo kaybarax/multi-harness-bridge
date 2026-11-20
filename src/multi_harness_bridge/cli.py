@@ -28,7 +28,7 @@ def build_parser():
     add = project.add_parser("add")
     add.add_argument("name")
     add.add_argument("roots", nargs="+", type=Path)
-    for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace", "pending"):
+    for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace", "pending", "monitor"):
         cmd = commands.add_parser(name)
         cmd.add_argument("project")
         if name == "pending":
@@ -39,7 +39,7 @@ def build_parser():
             cmd.add_argument("id")
             continue
         cmd.add_argument("harness", help="Local actor name")
-        if name in ("bind", "claim", "finish"):
+        if name in ("bind", "claim", "finish", "monitor"):
             cmd.add_argument("role", choices=("inbox", "coordinator"))
             cmd.add_argument("session")
         if name == "finish":
@@ -138,6 +138,10 @@ def run(args):
     if args.command == "trace":
         return store.trace(project, args.id)
     harness = settings.identifier(args.harness)
+    if args.command == "monitor":
+        from .monitor import subscribe
+        subscribe(config, store, project, harness, args.role, args.session, output=sys.stdout)
+        return
     if args.command == "bind":
         return store.bind(project, harness, args.role, args.session)
     if args.command == "status":
