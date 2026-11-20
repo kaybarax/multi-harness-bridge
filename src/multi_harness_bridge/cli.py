@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from itertools import permutations
 
 from . import config as settings
 from .store import Store
@@ -27,9 +28,13 @@ def build_parser():
     add = project.add_parser("add")
     add.add_argument("name")
     add.add_argument("roots", nargs="+", type=Path)
-    for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace"):
+    for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace", "pending"):
         cmd = commands.add_parser(name)
         cmd.add_argument("project")
+        if name == "pending":
+            cmd.add_argument("--harness")
+            cmd.add_argument("--limit", type=int, default=30)
+            continue
         if name == "trace":
             cmd.add_argument("id")
             continue
@@ -77,12 +82,13 @@ def self_test():
                 if not store.finish(project, harness, role, session, item["id"], item["lease"]):
                     raise RuntimeError("Delivery lease was lost")
         for project in ("orchard", "harbor"):
-            for worker in ("devin", "antigravity"):
-                request = store.send(project, "codex", worker, "Receipt check", f"request-{worker}")
-                deliver(project, worker, request["id"])
-                response = store.send(project, worker, "codex", "Received", "response", reply_to=request["id"])
-                deliver(project, "codex", response["id"])
-                checks.append({"project": project, "route": f"codex -> {worker} -> codex", "result": "ok"})
+            for origin, peer in permutations(("codex", "devin", "antigravity"), 2):
+                key = f"{origin}-{peer}"
+                request = store.send(project, origin, peer, "Receipt check", f"request-{key}")
+                deliver(project, peer, request["id"])
+                response = store.send(project, peer, origin, "Received", f"reply-{key}", reply_to=request["id"])
+                deliver(project, origin, response["id"])
+                checks.append({"project": project, "route": f"{origin} -> {peer} -> {origin}", "result": "ok"})
     return {"checks": checks}
 
 
@@ -127,6 +133,8 @@ def run(args):
         return {"credential_file": str(args.out.resolve()), "project": args.project, "role": args.role}
     project = config.require(args.project)
     store = Store(config.database)
+    if args.command == "pending":
+        return store.pending_overview(project, args.harness, args.limit)
     if args.command == "trace":
         return store.trace(project, args.id)
     harness = settings.identifier(args.harness)

@@ -17,13 +17,16 @@ class Store:
     def __init__(self, path):
         self.path = str(path)
         with closing(self._connect()) as db, db:
-            db.execute("PRAGMA journal_mode=WAL")
             version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version == SCHEMA_VERSION:
+                return
             if version > SCHEMA_VERSION:
                 raise RuntimeError(
                     f"Database schema {version} is newer than supported {SCHEMA_VERSION}"
                 )
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS bindings (
                     project TEXT NOT NULL, harness TEXT NOT NULL,
                     role TEXT NOT NULL CHECK(role IN ('coordinator','inbox')),

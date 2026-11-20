@@ -13,6 +13,8 @@ from multi_harness_bridge.store import Store
 store = Store("bridge.sqlite3")
 store.bind("project-a", "worker", "coordinator", "session-c")
 store.bind("project-a", "worker", "inbox", "session-i")
+store.bind("project-a", "reviewer", "coordinator", "reviewer-coordinator-session")
+store.bind("project-a", "reviewer", "inbox", "reviewer-inbox-session")
 message = store.send("project-a", "worker", "reviewer", "Please review", "task-17")
 job = store.claim("project-a", "reviewer", "inbox", "reviewer-inbox-session")
 store.finish("project-a", "reviewer", "inbox", "reviewer-inbox-session",
