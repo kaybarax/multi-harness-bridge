@@ -122,8 +122,11 @@ the bounded rejection attempt count.
 Inspect recent sends with `multi-harness-wake --project my-project
 --show-attempts`. After checking the exact native session, resolve an ambiguous
 attempt with `--reconcile NOTIFICATION_UUID --outcome sent` or
-`--outcome not-sent`. The latter permits only the remaining bounded retry; it
-does not change the mailbox item or acknowledge it.
+`--outcome not-sent`. If multiple role attempts for that ID are unresolved,
+also supply `--harness`, `--role`, and `--session` from the status output. An
+active send cannot be reconciled; wait for its 75 second maximum window to
+expire and inspect it again. `not-sent` permits only the remaining bounded
+retry; it does not change the mailbox item or acknowledge it.
 
 ## Duplicate and uncertain sends
 

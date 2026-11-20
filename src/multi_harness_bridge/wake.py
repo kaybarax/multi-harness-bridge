@@ -23,6 +23,7 @@ from .store import Store
 
 POLL_SECONDS = 4.0
 COMMAND_TIMEOUT = 8.0
+MAX_COMMAND_TIMEOUT = 60.0
 HARNESS_NAMES = {"codex", "claude", "devin", "antigravity"}
 ROLES = {"coordinator", "inbox"}
 WAKE_PROMPT = ("A new Multi Harness Bridge message is pending (notification {notification_id}). "
@@ -106,7 +107,13 @@ def _wake(entry, values):
 
 def _launch(entry, values):
     argv = _command_args(entry, "wake", values)
-    result = _run(argv, timeout=float(entry.get("timeout_seconds", COMMAND_TIMEOUT)))
+    try:
+        timeout = float(entry.get("timeout_seconds", COMMAND_TIMEOUT))
+    except (TypeError, ValueError):
+        raise WakeDeferred("Configured wake timeout is invalid") from None
+    if not 0 < timeout <= MAX_COMMAND_TIMEOUT:
+        raise WakeDeferred("Configured wake timeout must be between zero and sixty seconds")
+    result = _run(argv, timeout=timeout)
     if result.returncode != 0:
         if result.returncode in {2, 3}:
             raise WakeDeferred("Native launcher deferred before submitting the wake")
@@ -346,10 +353,13 @@ def list_attempts(store, project):
         db.close()
 
 
-def reconcile(store, project, notification_id, outcome):
+def reconcile(store, project, notification_id, outcome, *, harness=None, role=None, session=None):
     """Resolve one uncertain send after an operator checks the native session."""
     if outcome not in {"sent", "not-sent"}:
         raise ValueError("outcome must be sent or not-sent")
+    supplied = (harness is not None, role is not None, session is not None)
+    if any(supplied) and not all(supplied):
+        raise ValueError("provide harness, role, and session together to target a specific attempt")
     try:
         uuid.UUID(notification_id)
     except (ValueError, TypeError):
@@ -357,15 +367,23 @@ def reconcile(store, project, notification_id, outcome):
     db = _ledger(store.path)
     try:
         db.execute("BEGIN IMMEDIATE")
-        rows = db.execute("""SELECT harness,role,session,state,attempts
+        rows = db.execute("""SELECT harness,role,session,state,attempts,updated_at
             FROM mhb_wake_attempts WHERE project=? AND notification_id=?
-            AND state IN ('uncertain','retryable')""", (project, notification_id)).fetchall()
+            AND state IN ('uncertain','retryable','sending')""", (project, notification_id)).fetchall()
+        if all(supplied):
+            rows = [row for row in rows if (row[0], row[1], row[2]) == (harness, role, session)]
+        rows = [row for row in rows if row[3] != "sending" or time.time() - row[5] > MAX_COMMAND_TIMEOUT + 15]
         if not rows:
-            active = db.execute("""SELECT 1 FROM mhb_wake_attempts WHERE project=?
-                AND notification_id=? AND state='sending' LIMIT 1""",
-                (project, notification_id)).fetchone()
+            active_query = """SELECT 1 FROM mhb_wake_attempts WHERE project=?
+                AND notification_id=? AND state='sending'"""
+            params = [project, notification_id]
+            if all(supplied):
+                active_query += " AND harness=? AND role=? AND session=?"
+                params.extend((harness, role, session))
+            active_query += " LIMIT 1"
+            active = db.execute(active_query, params).fetchone()
             if active:
-                raise ValueError("wake attempt is active; wait for it to finish before reconciliation")
+                raise ValueError("wake attempt may still be active; wait for its bounded timeout before reconciliation")
             raise ValueError("no unresolved wake attempt matches this project and ID")
         if len(rows) != 1:
             raise ValueError("notification has multiple unresolved role attempts; reconcile the exact role first")
@@ -395,6 +413,7 @@ def main(argv=None):
                         help="reconcile an ambiguous wake after inspecting the native session")
     parser.add_argument("--outcome", choices=("sent", "not-sent"),
                         help="required with --reconcile; not-sent permits a bounded retry")
+    parser.add_argument("--session", help="exact native session for role-specific reconciliation")
     args = parser.parse_args(argv)
     if args.show_attempts or args.reconcile:
         cfg = config.load()
@@ -405,7 +424,8 @@ def main(argv=None):
             return 0
         if not args.outcome:
             parser.error("--reconcile requires --outcome")
-        print(json.dumps(reconcile(store, selected_project, args.reconcile, args.outcome),
+        print(json.dumps(reconcile(store, selected_project, args.reconcile, args.outcome,
+                                   harness=args.harness, role=args.role, session=args.session),
                           sort_keys=True), flush=True)
         return 0
     stopped = False

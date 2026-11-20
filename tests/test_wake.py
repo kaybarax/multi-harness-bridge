@@ -137,7 +137,7 @@ def test_safe_defer_refunds_attempt_budget(tmp_path, monkeypatch):
     assert (state, attempts) == ("retryable", 0)
 
 
-def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False):
+def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False, minimal=False):
     import json
     import time
     from multi_harness_bridge.store import Store
@@ -174,8 +174,10 @@ for line in sys.stdin:
  elif method=='session/load': result={}
  elif method=='session/prompt':
   if os.environ.get('MHB_FAKE_EOF')=='1': sys.exit(0)
-  call={'sessionUpdate':'tool_call','toolCallId':'call-1','title':'Calling pickup_notification from mhb_devin_sample',
-        'rawInput':{'notification_id':os.environ['MHB_NOTIFICATION_ID']}}
+  call={'sessionUpdate':'tool_call','toolCallId':'call-1'}
+  if os.environ.get('MHB_FAKE_MINIMAL')!='1':
+   call.update({'title':'Calling pickup_notification from mhb_devin_sample',
+                'rawInput':{'notification_id':os.environ['MHB_NOTIFICATION_ID']}})
   if os.environ.get('MHB_REFUSE_ARGS')=='1': call['rawInput']={'notification_id':'99999999-2222-4333-8444-555555555555'}
   print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'session-123','update':call}}),flush=True)
   print(json.dumps({'jsonrpc':'2.0','id':77,'method':'session/request_permission','params':{
@@ -193,6 +195,7 @@ for line in sys.stdin:
     monkeypatch.setenv("MHB_NOTIFICATION_ID", notification_id)
     monkeypatch.setenv("MHB_REFUSE_ARGS", "1" if refuse_args else "0")
     monkeypatch.setenv("MHB_FAKE_EOF", "1" if eof else "0")
+    monkeypatch.setenv("MHB_FAKE_MINIMAL", "1" if minimal else "0")
     return session_id, workspace, notification_id, native_db, capture
 
 
@@ -211,6 +214,13 @@ def test_devin_acp_exact_duplex_permission_and_id_only_prompt(tmp_path, monkeypa
     permission_reply = calls[3]
     assert permission_reply["id"] == 77
     assert permission_reply["result"]["outcome"] == {"outcome": "selected", "optionId": "allow-1"}
+
+
+def test_devin_acp_resolves_call_id_only_update_from_native_transcript(tmp_path, monkeypatch):
+    session, workspace, notification_id, native_db, _ = _fake_devin(tmp_path, monkeypatch, minimal=True)
+    result = devin_acp.wake("sample", "coordinator", session, notification_id,
+                            workspace, native_db=native_db)
+    assert result["stopReason"] == "end_turn"
 
 
 def test_devin_acp_cancels_mismatched_tool_args(tmp_path, monkeypatch):
@@ -298,3 +308,24 @@ def test_reconcile_requires_one_unresolved_nonactive_attempt(tmp_path):
     db.close()
     with pytest.raises(ValueError, match="multiple unresolved"):
         wake.reconcile(store, "sample", item_id, "sent")
+
+
+def test_reconcile_refuses_active_wake_and_recovers_stale_sending(tmp_path):
+    store = FakeStore(tmp_path / "store.sqlite")
+    item_id = store.message["id"]
+    db = wake._ledger(store.path)
+    now = wake.time.time()
+    with db:
+        db.execute("""INSERT INTO mhb_wake_attempts
+            (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+            VALUES(?,?,?,?,?,'sending',1,?,?)""",
+            (item_id, "sample", "devin", "coordinator", "session-a", now, now))
+    db.close()
+    with pytest.raises(ValueError, match="still be active"):
+        wake.reconcile(store, "sample", item_id, "not-sent")
+    db = wake._ledger(store.path)
+    with db:
+        db.execute("UPDATE mhb_wake_attempts SET updated_at=? WHERE notification_id=?",
+                   (now - wake.MAX_COMMAND_TIMEOUT - 20, item_id))
+    db.close()
+    assert wake.reconcile(store, "sample", item_id, "not-sent")["status"] == "retryable"

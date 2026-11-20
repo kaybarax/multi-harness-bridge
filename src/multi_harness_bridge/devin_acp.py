@@ -76,6 +76,32 @@ def _tool_and_args(call, server_name):
     return None, None
 
 
+def _call_conflicts(call, server_name):
+    """Return true only when supplied call identity contradicts our target."""
+    raw = call.get("rawInput", call.get("input")) if isinstance(call, dict) else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return True
+    if isinstance(raw, dict):
+        server = raw.get("server_name", raw.get("serverName"))
+        tool = raw.get("tool_name", raw.get("toolName", raw.get("name")))
+        if server is not None and server != server_name:
+            return True
+        if tool is not None and tool != "pickup_notification":
+            return True
+    title = call.get("title") if isinstance(call, dict) else None
+    if title is not None and title != f"Calling pickup_notification from {server_name}":
+        return True
+    name = call.get("name", call.get("toolName", call.get("tool_name"))) if isinstance(call, dict) else None
+    if name is not None and name not in {"mcp_call_tool", "pickup_notification",
+            f"{server_name}_pickup_notification", f"{server_name}__pickup_notification",
+            f"mcp__{server_name}__pickup_notification"}:
+        return True
+    return False
+
+
 def _native_call_matches(session, workspace, server_name, tool_call_id, expected_args,
                          *, native_db=None, now=None):
     """Prove the pending native assistant call behind an ACP permission ID."""
@@ -258,7 +284,11 @@ def _permission_handler(*, server_name, expected_session, workspace, notificatio
                 return {"outcome": {"outcome": "cancelled"}}
             tool, args = _tool_and_args(call, server_name)
             if tool is None:
-                return {"outcome": {"outcome": "cancelled"}}
+                if _call_conflicts(call, server_name):
+                    return {"outcome": {"outcome": "cancelled"}}
+                # Some ACP builds provide only the call ID in the session
+                # update. The native transcript check below proves the rest.
+                tool, args = "pickup_notification", expected_args
         else:
             # Permission-only envelopes can omit call details. Native transcript
             # lookup must bind this call ID to this exact server/tool/input.
