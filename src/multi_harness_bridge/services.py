@@ -27,11 +27,13 @@ def wake_argv(executable: str | Path, project: str) -> list[str]:
     return [_clean(executable, "Executable"), "-m", "multi_harness_bridge.wake", "--project", project]
 
 
-def _exec(argv: list[str]) -> str:
+def _exec(argv: list[str], *, expand_dollars=True) -> str:
     """Quote one systemd ExecStart argv without invoking a shell."""
     def quote(arg: str) -> str:
         arg = _clean(arg, "systemd argument")
-        arg = arg.replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
+        arg = arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+        if expand_dollars:
+            arg = arg.replace("$", "$$")
         return f'"{arg}"'
     return " ".join(quote(arg) for arg in argv)
 
@@ -40,12 +42,13 @@ def render_systemd(project: str, root: str | Path, executable: str | Path, state
     root = _clean(Path(root).resolve(), "Project root")
     state_home = _clean(Path(state_home).resolve(), "State directory")
     argv = wake_argv(executable, project)
+    working_directory = root.replace("%", "%%")
     return ("[Unit]\n"
             f"Description=Multi Harness Bridge native wake monitor ({project})\n"
-            "After=default.target\n\n"
+            "\n"
             "[Service]\nType=simple\n"
-            f"WorkingDirectory={_exec([root])}\n"
-            f"Environment={_exec(['MHB_HOME=' + state_home])}\n"
+            f"WorkingDirectory={working_directory}\n"
+            f"Environment={_exec(['MHB_HOME=' + state_home], expand_dollars=False)}\n"
             f"ExecStart={_exec(argv)}\nRestart=on-failure\nRestartSec=5\n\n"
             "[Install]\nWantedBy=default.target\n")
 
@@ -106,7 +109,6 @@ def render_task_xml(project: str, root: str | Path, executable: str | Path,
     actions = node(task, "Actions", attrs={"Context": "Author"})
     exec_action = node(actions, "Exec")
     node(exec_action, "Command", command)
-    node(exec_action, "WorkingDirectory", root)
     # Task Scheduler stores one Windows command line here. Use a Python -c
     # launcher because Task Scheduler actions have no environment-variable field.
     import subprocess
@@ -114,12 +116,13 @@ def render_task_xml(project: str, root: str | Path, executable: str | Path,
             "; sys.argv=['multi-harness-wake',*sys.argv[1:]]; "
             "runpy.run_module('multi_harness_bridge.wake',run_name='__main__')")
     node(exec_action, "Arguments", subprocess.list2cmdline(["-c", code, "--project", project]))
+    node(exec_action, "WorkingDirectory", root)
     return ET.tostring(task, encoding="utf-8", xml_declaration=True)
 
 
 def _current_executable() -> str:
     """Resolve the current install's Python, independent of service PATH."""
-    return str(Path(sys.executable).resolve())
+    return os.path.abspath(sys.executable)  # Preserve virtual environment symlinks.
 
 
 def _platform_name(value: str | None) -> str:

@@ -28,10 +28,9 @@ def test_renderers_escape_machine_specific_paths(tmp_path):
     assert plist["EnvironmentVariables"]["MHB_HOME"] == str(state)
 
     systemd = render_systemd(project, root, executable, state)
-    escaped_root = str(root).replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
-    assert f'WorkingDirectory="{escaped_root}"' in systemd
+    assert "WorkingDirectory=" + str(root).replace("%", "%%") in systemd
     assert '"--project" "demo_project"' in systemd
-    assert '"MHB_HOME=' in systemd and "$$" in systemd and "%%" in systemd
+    assert '"MHB_HOME=' in systemd and "state $ special" in systemd and "%%" in systemd
 
     xml = ET.fromstring(render_task_xml(project, root, executable, state, user="Local User"))
     assert xml.find(f"./{_ns('Principals')}/{_ns('Principal')}/{_ns('UserId')}").text == "Local User"
@@ -56,7 +55,7 @@ def test_generate_is_idempotent_and_uses_one_file_per_project(tmp_path):
     assert {path.name: path.read_bytes() for path in second} == contents
     assert sorted(path.name for path in first) == [
         "multi-harness-bridge-wake-alpha.service", "multi-harness-bridge-wake-beta.service"]
-    assert "WorkingDirectory=\"" + str(project_a) + "\"" in contents[first[0].name].decode()
+    assert "WorkingDirectory=" + str(project_a) in contents[first[0].name].decode()
 
 
 def test_rejects_control_characters_and_empty_registry(tmp_path):
@@ -76,3 +75,15 @@ def test_plist_passes_macos_linter(tmp_path):
     result = subprocess.run(["plutil", "-lint", str(path)], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr + result.stdout
 
+
+
+def test_service_preserves_virtualenv_interpreter_path(tmp_path, monkeypatch):
+    from multi_harness_bridge.services import _current_executable
+    executable = tmp_path / "venv" / "bin" / "python"
+    executable.parent.mkdir(parents=True)
+    try:
+        executable.symlink_to(sys.executable)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable: {exc}")
+    monkeypatch.setattr(sys, "executable", str(executable))
+    assert _current_executable() == str(executable)
