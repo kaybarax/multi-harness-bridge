@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from multi_harness_bridge.store import Store
+from multi_harness_bridge.store import SCHEMA_VERSION, Store
 
 
 def setup(path):
@@ -153,7 +153,7 @@ def test_previous_schema_is_migrated(tmp_path):
         """)
     Store(path)
     with sqlite3.connect(path) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
         assert "explicit" in {r[1] for r in db.execute("PRAGMA table_info(control)")}
         assert "updated" in {r[1] for r in db.execute("PRAGMA table_info(messages)")}
 

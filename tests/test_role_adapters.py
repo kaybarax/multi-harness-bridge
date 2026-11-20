@@ -45,7 +45,7 @@ def test_codex_picker_mention_uses_user_command_and_skips_selected_skill_instruc
     rollout = sessions / "thread.jsonl"
     rollout.write_text("\n".join(json.dumps(item) for item in (
         {"type": "response_item", "payload": {"role": "user", "content": [
-            {"type": "input_text", "text": "[$take-coordinator](/Users/kevin/workspace/tools/coordinator-bridge/skills/take-coordinator/SKILL.md) 'Picked title'"}]}},
+            {"type": "input_text", "text": "[$take-coordinator](/example/workspace/skills/take-coordinator/SKILL.md) 'Picked title'"}]}},
         {"type": "response_item", "payload": {"role": "user",
             "internal_chat_message_metadata_passthrough": {"content_item_kinds": ["skills.selected_skill_instructions"]},
             "content": [{"type": "input_text", "text": "Instructions for the selected skill"}]}})) + "\n")
@@ -130,6 +130,45 @@ def test_claude_hook_context_is_partitioned_by_session(tmp_path, monkeypatch):
     path = tmp_path / "bridge-home/native-context" / ("claude-" + __import__("hashlib").sha256(session.encode()).hexdigest()[:32] + ".json")
     assert json.loads(path.read_text())["session_id"] == session
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_claude_hook_explicit_project_home_overrides_ambient_environment(tmp_path, monkeypatch):
+    import shlex
+
+    from multi_harness_bridge import config
+
+    cfg_root = tmp_path / "private bridge state"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config.register("maple", (workspace,), cfg_root)
+    ambient = tmp_path / "different-home"
+    monkeypatch.setenv("MHB_HOME", str(ambient))
+    monkeypatch.setattr(adapters, "_native_claude_hook_payload", lambda payload: True)
+    settings = workspace / ".claude/settings.local.json"
+    settings.parent.mkdir()
+    old = {"matcher": "*", "hooks": [
+        {"type": "command", "command": "multi-harness-claude-hook", "timeout": 5},
+    ]}
+    unrelated = {"matcher": "custom", "hooks": [{"type": "command", "command": "/other/hook"}]}
+    settings.write_text(json.dumps({"hooks": {"UserPromptSubmit": [old, unrelated]}}))
+    assert adapters.install_claude_hook(workspace, state_home=cfg_root)["status"] == "installed"
+    active, generated = json.loads(settings.read_text())["hooks"]["UserPromptSubmit"]
+    assert active == unrelated
+    argv = shlex.split(generated["hooks"][0]["command"])
+    assert argv[1:] == ["--home", str(cfg_root)]
+    assert adapters.install_claude_hook(workspace, state_home=cfg_root)["status"] == "already-current"
+
+    session = "39b3a1ac-6a0d-46c2-a3b6-5404eb4c4e61"
+    payload = {"hook_event_name": "UserPromptSubmit", "session_id": session, "cwd": str(workspace)}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert adapters.claude_hook_cli(argv[1:]) == 0
+    assert len(list((cfg_root / "native-context").glob("*.json"))) == 1
+    assert not ambient.exists()
+    payload["cwd"] = str(tmp_path)
+    payload["session_id"] = "0963485c-9244-411d-b693-0ec90461ef64"
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+    assert adapters.claude_hook_cli(argv[1:]) == 0
+    assert len(list((cfg_root / "native-context").glob("*.json"))) == 1
 
 
 def test_claude_hook_ignores_foreign_host_transcript(tmp_path, monkeypatch):

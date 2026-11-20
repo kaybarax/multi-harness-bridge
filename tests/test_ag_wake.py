@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from multi_harness_bridge import ag_wake, config
+from multi_harness_bridge import ag_sidecar, ag_wake, config
 from multi_harness_bridge.store import Store
 
 
@@ -82,12 +82,135 @@ def test_verify_returns_exact_native_bridge_identity(native_fixture):
 
 def test_context_is_private_and_carries_only_verified_roles(native_fixture, tmp_path):
     cfg, summary_db, _, sessions, _ = native_fixture
-    target = ag_wake._write_ax_context(tmp_path, project="alpha", action="wake", role="inbox",
-        session=sessions["alpha"], notification_id=str(uuid.uuid4()), cfg=cfg, summary_db=summary_db)
+    target = ag_wake._write_ax_context(tmp_path, project="alpha", action="verify-bindings",
+        cfg=cfg, summary_db=summary_db)
     assert target.stat().st_mode & 0o777 == 0o600
     value = json.loads(target.read_text(encoding="utf-8"))
     assert value["roles"]["alpha"]["inbox"]["conversation"] == sessions["alpha"]
     assert "beta" in value["roles"]
+
+
+@pytest.mark.parametrize("change", [None, "stop", "handoff", "advance"])
+def test_sidecar_rechecks_pending_before_agentapi(native_fixture, monkeypatch, change):
+    from multi_harness_bridge.wake import WakeDeferred
+
+    cfg, summary_db, _, sessions, _ = native_fixture
+    project, role = "alpha", "inbox"
+    inbox = sessions[project]
+    store = Store(cfg.database)
+    store.bind(project, "antigravity", "coordinator", str(uuid.uuid4()))
+    notification = store.send(project, "codex", "antigravity", "message body", "test")["id"]
+    monkeypatch.setattr(ag_sidecar, "agentapi", lambda project: "/host/agentapi")
+    posted = []
+    verify = ag_wake.verify
+
+    def verify_and_change(*args, **kwargs):
+        identity = verify(*args, **kwargs)
+        if change == "stop":
+            store.set_enabled(project, "antigravity", False)
+        elif change == "handoff":
+            store.bind(project, "antigravity", role, str(uuid.uuid4()))
+        elif change == "advance":
+            claim = store.claim(project, "antigravity", role, inbox, message_id=notification)
+            assert store.finish(project, "antigravity", role, inbox, notification, claim["lease"])
+        return identity
+
+    def run(argv, **kwargs):
+        posted.append(argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(ag_wake, "verify", verify_and_change)
+    monkeypatch.setattr(ag_sidecar.subprocess, "run", run)
+    if change is None:
+        assert ag_wake.wake(project, role, inbox, notification, cfg=cfg, summary_db=summary_db)["status"] == "sent"
+        assert len(posted) == 1
+        assert posted[0][:3] == ["/host/agentapi", "send-message", inbox]
+        assert notification in posted[0][3]
+        assert "message body" not in posted[0][3]
+        assert store.pending(project, "antigravity", role, inbox, message_id=notification)
+    else:
+        with pytest.raises(WakeDeferred, match="pickup changed"):
+            ag_wake.wake(project, role, inbox, notification, cfg=cfg, summary_db=summary_db)
+        assert posted == []
+
+
+def test_sidecar_uses_only_matching_app_context(monkeypatch, tmp_path):
+    monkeypatch.setattr(ag_sidecar.Path, "home", classmethod(lambda _: tmp_path))
+    monkeypatch.setattr(ag_sidecar.shutil, "which", lambda _: "/host/agentapi")
+    monkeypatch.delenv("ANTIGRAVITY_EXECUTABLE_DATA_DIR", raising=False)
+    assert ag_sidecar.agentapi("alpha") is None
+    path = tmp_path / ".gemini/antigravity/sidecar_data/mhb-wake-alpha/data"
+    monkeypatch.setenv("ANTIGRAVITY_EXECUTABLE_DATA_DIR", str(path))
+    assert ag_sidecar.agentapi("beta") is None
+    assert ag_sidecar.agentapi("alpha") == "/host/agentapi"
+
+
+def test_sidecar_is_explicitly_enabled_and_preserves_app_settings(native_fixture, tmp_path, monkeypatch):
+    cfg, summary_db, _, _, _ = native_fixture
+    directory = tmp_path / "desktop-config"
+    directory.mkdir()
+    user_settings = directory / "config.json"
+    initial = {"sidecars": {"other": {"enabled": True}}, "userSettings": {"private": "preserve"}}
+    user_settings.write_text(json.dumps(initial))
+    monkeypatch.setenv("MHB_ANTIGRAVITY_SUMMARIES_DB", str(summary_db))
+
+    report = ag_sidecar.install(cfg, "alpha", directory=directory)
+    assert report["enabled"] is False
+    assert json.loads(user_settings.read_text()) == initial
+    manifest = Path(report["manifest"])
+    assert json.loads(manifest.read_text())["args"][-2:] == ["alpha", "run"]
+    assert ag_sidecar.install(cfg, "alpha", directory=directory, enable=True)["enabled"]
+    assert ag_sidecar.install(cfg, "alpha", directory=directory, enable=True)["enabled"]
+    enabled = json.loads(user_settings.read_text())
+    assert enabled["sidecars"].pop("mhb-wake-alpha") == {"enabled": True}
+    assert enabled == initial
+    manifest.unlink()
+    with pytest.raises(ValueError, match="--enable"):
+        ag_sidecar.install(cfg, "alpha", directory=directory)
+    assert not manifest.exists()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exit"])
+def test_launched_sidecar_failure_is_held_and_never_replayed(native_fixture, monkeypatch, failure):
+    from multi_harness_bridge import wake
+
+    cfg, summary_db, _, sessions, _ = native_fixture
+    monkeypatch.setenv("MHB_HOME", str(cfg.root))
+    monkeypatch.setenv("MHB_ANTIGRAVITY_SUMMARIES_DB", str(summary_db))
+    monkeypatch.setattr(ag_sidecar, "agentapi", lambda project: "/host/agentapi")
+    store = Store(cfg.database)
+    store.bind("alpha", "antigravity", "coordinator", str(uuid.uuid4()))
+    delivery = store.send("alpha", "codex", "antigravity", "body", "key")["id"]
+    launched = []
+
+    def run(argv, **kwargs):
+        launched.append(argv)
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return subprocess.CompletedProcess(argv, 2)
+
+    monkeypatch.setattr(ag_sidecar.subprocess, "run", run)
+    target = store, "alpha", "antigravity", "inbox", sessions["alpha"]
+    with pytest.raises(wake.WakeError):
+        wake.wake_one(*target)
+    assert wake.wake_one(*target) == {"id": delivery, "status": "uncertain"}
+    assert len(launched) == 1
+    assert store.trace("alpha", delivery)["attempts"] == 0
+
+
+def test_antigravity_generic_worker_cannot_launch_override(native_fixture, monkeypatch):
+    from multi_harness_bridge import wake
+
+    cfg, _, _, sessions, _ = native_fixture
+    monkeypatch.delenv("ANTIGRAVITY_EXECUTABLE_DATA_DIR", raising=False)
+    store = Store(cfg.database)
+    store.bind("alpha", "antigravity", "coordinator", str(uuid.uuid4()))
+    delivery = store.send("alpha", "codex", "antigravity", "body", "key")["id"]
+    override = {"antigravity": {"verify": ["existing"], "wake": ["existing"]}}
+    assert wake.wake_one(store, "alpha", "antigravity", "inbox", sessions["alpha"], commands=override) == {
+        "id": delivery, "status": "sidecar-managed",
+    }
+    assert wake.list_attempts(store, "alpha") == []
 
 
 def test_packaged_ax_helper_compiles_and_accepts_vetted_context_on_macos(native_fixture, tmp_path):
@@ -155,11 +278,52 @@ def test_desktop_hook_take_forward_and_receipt(native_fixture, monkeypatch, tmp_
         grant(sessions["alpha"], "set_pickup", {"enabled":False})
     directory = tmp_path/"host"
     directory.mkdir()
-    (directory/"mcp_config.json").write_text('{"mcpServers":{"unrelated":{"command":"existing"}}}')
+    old_server, old_hook = ag_inbox.installation_entries(cfg, "alpha", tools=ag_inbox._LEGACY_TOOLS)
+    (directory/"mcp_config.json").write_text(json.dumps({"mcpServers": {
+        "unrelated": {"command": "existing"}, "mhb_alpha": old_server}}))
+    (directory/"hooks.json").write_text(json.dumps({"mhb_alpha": old_hook, "unrelated": {"PreToolUse": []}}))
     for _ in range(2):
         ag_inbox.install(cfg,"alpha",directory)
     assert set(json.loads((directory/"mcp_config.json").read_text())["mcpServers"]) == {"unrelated","mhb_alpha"}
-    assert "PreToolUse" in json.loads((directory/"hooks.json").read_text())["mhb_alpha"]
+    hooks = json.loads((directory/"hooks.json").read_text())
+    assert "send_fanout" in hooks["mhb_alpha"]["PreToolUse"][0]["matcher"]
+    assert hooks["unrelated"] == {"PreToolUse": []}
     import asyncio
     pytest.importorskip("mcp")
     assert set(ag_inbox.TOOLS) == {t.name for t in asyncio.run(ag_inbox.make_server(cfg,"alpha").list_tools())}
+
+
+def test_fanout_desktop_grant_is_fenced_at_invoke_after_handoff(native_fixture, monkeypatch):
+    from multi_harness_bridge import ag_inbox
+
+    cfg, summary_db, roots, sessions, projects = native_fixture
+    monkeypatch.setenv("MHB_ANTIGRAVITY_SUMMARIES_DB", str(summary_db))
+    old, new = str(uuid.uuid4()), str(uuid.uuid4())
+    with sqlite3.connect(summary_db) as db:
+        for session in (old, new):
+            db.execute("INSERT INTO conversation_summaries VALUES (?,?,?,?,?)", (
+                session, "Coordinator", json.dumps([str(roots["alpha"])]), projects["alpha"], "antigravity"))
+    store = Store(cfg.database)
+    store.bind("alpha", "antigravity", "coordinator", old)
+    for harness in ("codex", "devin"):
+        for role in ("coordinator", "inbox"):
+            store.bind("alpha", harness, role, f"{harness}-{role}")
+
+    def grant(session):
+        event = {"toolCall": {"name": "mcp_mhb_alpha_send_fanout", "args": {
+            "recipients": ["codex", "devin"], "body": "こんにちは", "key": "test-fanout"}},
+            "conversationId": session, "workspacePaths": [str(roots["alpha"])],
+            "artifactDirectoryPath": str(summary_db.parent / "brain" / session)}
+        return ag_inbox.before_tool(cfg, "alpha", event)["overwrite"]["desktop_grant"]
+
+    with pytest.raises(PermissionError, match="does not own"):
+        grant(sessions["alpha"])
+    old_grant = grant(old)
+    store.bind("alpha", "antigravity", "coordinator", new)
+    with pytest.raises(PermissionError, match="no longer owns"):
+        ag_inbox.invoke(cfg, "alpha", "send_fanout", old_grant)
+    new_grant = grant(new)
+    result = ag_inbox.invoke(cfg, "alpha", "send_fanout", new_grant)
+    assert {delivery["recipient"] for delivery in result["deliveries"]} == {"codex", "devin"}
+    with pytest.raises(PermissionError, match="used"):
+        ag_inbox.invoke(cfg, "alpha", "send_fanout", new_grant)

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import queue
@@ -10,17 +12,19 @@ import shutil
 import signal
 import sqlite3
 import subprocess
-import sys
 import threading
 import time
 import uuid
 
 from . import config
-from .store import Store
-from .wake import WAKE_PROMPT, WakeDeferred, WakeError, WakeRejected
+from .wake import MAX_COMMAND_TIMEOUT, WakeDeferred, WakeError, WakeRejected
 
 NATIVE_DB = Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
 WAKE_TIMEOUT = 20.0
+ROUTED_COORDINATOR_TIMEOUT = 45.0
+WAKE_PREFIX = "Multi Harness Bridge native wake. "
+PICKUP_TOOL = "pickup_wake"
+FINISH_TOOL = "finish_wake"
 
 
 class ACPError(RuntimeError):
@@ -48,7 +52,7 @@ def _permission_call_id(params):
     return value if isinstance(value, str) and value else None
 
 
-def _tool_and_args(call, server_name):
+def _tool_and_args(call, server_name, tool):
     if not isinstance(call, dict):
         return None, None
     raw = call.get("rawInput", call.get("input"))
@@ -62,21 +66,21 @@ def _tool_and_args(call, server_name):
     nested_server = raw.get("server_name", raw.get("serverName"))
     nested_tool = raw.get("tool_name", raw.get("toolName", raw.get("name")))
     if nested_server is not None or nested_tool is not None:
-        if nested_server != server_name or nested_tool != "pickup_notification":
+        if nested_server != server_name or nested_tool != tool:
             return None, None
         args = raw.get("arguments", raw.get("args", raw.get("input")))
         return nested_tool, args if isinstance(args, dict) else None
     title = call.get("title")
-    if title == f"Calling pickup_notification from {server_name}":
-        return "pickup_notification", raw
+    if title == f"Calling {tool} from {server_name}":
+        return tool, raw
     name = call.get("name", call.get("toolName", call.get("tool_name")))
-    if name in {f"{server_name}_pickup_notification", f"{server_name}__pickup_notification",
-                f"mcp__{server_name}__pickup_notification"}:
-        return "pickup_notification", raw
+    if name in {None, "mcp_call_tool", tool, f"{server_name}_{tool}",
+                f"{server_name}__{tool}", f"mcp__{server_name}__{tool}"}:
+        return tool, raw
     return None, None
 
 
-def _call_conflicts(call, server_name):
+def _call_conflicts(call, server_name, expected_tool):
     """Return true only when supplied call identity contradicts our target."""
     raw = call.get("rawInput", call.get("input")) if isinstance(call, dict) else None
     if isinstance(raw, str):
@@ -89,77 +93,167 @@ def _call_conflicts(call, server_name):
         tool = raw.get("tool_name", raw.get("toolName", raw.get("name")))
         if server is not None and server != server_name:
             return True
-        if tool is not None and tool != "pickup_notification":
+        if tool is not None and tool != expected_tool:
             return True
     title = call.get("title") if isinstance(call, dict) else None
-    if title is not None and title != f"Calling pickup_notification from {server_name}":
+    if title is not None and title != f"Calling {expected_tool} from {server_name}":
         return True
     name = call.get("name", call.get("toolName", call.get("tool_name"))) if isinstance(call, dict) else None
-    if name is not None and name not in {"mcp_call_tool", "pickup_notification",
-            f"{server_name}_pickup_notification", f"{server_name}__pickup_notification",
-            f"mcp__{server_name}__pickup_notification"}:
+    if name is not None and name not in {"mcp_call_tool", expected_tool, f"{server_name}_{expected_tool}",
+            f"{server_name}__{expected_tool}", f"mcp__{server_name}__{expected_tool}"}:
         return True
     return False
 
 
-def _native_call_matches(session, workspace, server_name, tool_call_id, expected_args,
-                         *, native_db=None, now=None):
-    """Prove the pending native assistant call behind an ACP permission ID."""
-    db_path = Path(native_db or os.environ.get("MHB_DEVIN_SESSIONS_DB") or NATIVE_DB).expanduser()
-    now = time.time() if now is None else now
+def _native_message_time(message, fallback):
+    metadata = message.get("metadata")
+    created = metadata.get("created_at") if isinstance(metadata, dict) else None
+    if isinstance(created, str):
+        try:
+            timestamp = datetime.fromisoformat(created)
+            if timestamp.tzinfo is not None:
+                return timestamp.timestamp()
+        except ValueError:
+            pass
+    return fallback
+
+
+def _native_messages(session, workspace, since, native_db):
+    db_path = Path(native_db or os.environ.get("MHB_DEVIN_SESSIONS_DB") or NATIVE_DB).expanduser().resolve()
+    expected_native_id = session.removeprefix("acp/devin-cli/")
     try:
-        with closing(sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2)) as db:
+        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
             db.row_factory = sqlite3.Row
             columns = {row[1] for row in db.execute("PRAGMA table_info(message_nodes)")}
             required = {"row_id", "session_id", "chat_message", "created_at"}
             if not required <= columns:
-                return False
-            rows = db.execute("""SELECT session_id,row_id,chat_message FROM message_nodes
-                WHERE created_at>=? ORDER BY row_id DESC""", (now - 120,)).fetchall()
-            native_sessions = {r["id"]: r["working_directory"] for r in db.execute(
-                "SELECT id,working_directory FROM sessions")}
+                return []
+            sessions = db.execute("SELECT id,working_directory FROM sessions WHERE id IN (?,?)",
+                                  (expected_native_id, "acp/devin-cli/" + expected_native_id)).fetchall()
+            if len(sessions) != 1 or not isinstance(sessions[0][1], str):
+                return []
+            native_id, directory = sessions[0]
+            if Path(directory).resolve() != Path(workspace).resolve():
+                return []
+            rows = db.execute("""SELECT row_id,chat_message,created_at FROM message_nodes
+                WHERE session_id=? AND created_at>=? ORDER BY row_id""",
+                (native_id, math.floor(since))).fetchall()
     except (OSError, sqlite3.Error):
-        return False
-    expected_native_id = session.removeprefix("acp/devin-cli/")
-    if native_sessions.get(expected_native_id) is None:
-        return False
-    try:
-        if Path(native_sessions[expected_native_id]).resolve() != Path(workspace).resolve():
-            return False
-    except OSError:
-        return False
-    completed = set()
+        return []
     messages = []
     for row in rows:
         try:
             message = json.loads(row["chat_message"])
         except (TypeError, json.JSONDecodeError):
             continue
-        if not isinstance(message, dict):
-            continue
+        if isinstance(message, dict) and _native_message_time(message, row["created_at"]) >= since:
+            messages.append((row["row_id"], message))
+    return messages
+
+
+def _native_call_args(session, workspace, server_name, tool_call_id, tool, *,
+                      previous_call=None, native_db=None):
+    """Read one pending native call and, when required, prove the prior result was recorded."""
+    messages = _native_messages(session, workspace, time.time() - 120, native_db)
+    completed = {}
+    for row_id, message in messages:
         if message.get("role") == "tool" and isinstance(message.get("tool_call_id"), str):
-            completed.add((row["session_id"], message["tool_call_id"]))
-        if row["session_id"] == expected_native_id:
-            messages.append(message)
-    found = 0
-    for message in messages:
+            completed.setdefault(message["tool_call_id"], row_id)
+    if tool_call_id in completed or previous_call is not None and previous_call not in completed:
+        return None
+    matched = None
+    for row_id, message in messages:
+        if previous_call is not None and row_id <= completed[previous_call]:
+            continue
         if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
             continue
         for call in message["tool_calls"]:
             if not isinstance(call, dict) or call.get("name") != "mcp_call_tool":
                 continue
-            if call.get("id") != tool_call_id or (expected_native_id, tool_call_id) in completed:
+            if call.get("id") != tool_call_id:
                 continue
             args = call.get("arguments")
-            if not isinstance(args, dict) or args.get("server_name") != server_name or \
-                    args.get("tool_name") != "pickup_notification":
-                continue
+            if not isinstance(args, dict) or args.get("server_name") != server_name or args.get("tool_name") != tool:
+                return None
             native_args = args.get("arguments")
-            if not isinstance(native_args, dict):
-                native_args = {}
-            if _json_exact(native_args, expected_args):
-                found += 1
-    return found == 1
+            if not isinstance(native_args, dict) or matched is not None and not _json_exact(matched, native_args):
+                return None
+            matched = native_args
+    return matched
+
+
+def _native_completion(session, workspace, server_name, prompt, notification_id, since, native_db):
+    """Recognize only results for this wake's exact tool call in its recorded native turn."""
+    active = False
+    calls = {}
+    finished = {}
+    for _, message in _native_messages(session, workspace, since, native_db):
+        role = message.get("role")
+        if role == "user":
+            active = message.get("content") == prompt
+            calls.clear()
+        if not active:
+            continue
+        if role == "assistant":
+            for call in message.get("tool_calls") or ():
+                if not isinstance(call, dict) or call.get("name") != "mcp_call_tool":
+                    continue
+                args = call.get("arguments")
+                if not isinstance(args, dict) or args.get("server_name") != server_name:
+                    continue
+                params, tool = args.get("arguments"), args.get("tool_name")
+                if (isinstance(call.get("id"), str) and tool in {PICKUP_TOOL, FINISH_TOOL}
+                        and isinstance(params, dict) and params.get("notification_id") == notification_id):
+                    calls[call.get("id")] = tool
+        if role == "tool" and (tool := calls.get(message.get("tool_call_id"))):
+            content = message.get("content")
+            if isinstance(content, list) and content and isinstance(content[0], dict):
+                content = content[0].get("text")
+            try:
+                result = json.loads(content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(result, dict) and result.get("id") == notification_id:
+                finished[tool] = result
+    return finished
+
+
+def _wake_prompt(server_name, notification_id, routed_coordinator):
+    prompt = (f"{WAKE_PREFIX}Use only the native bridge server {server_name}. Call {PICKUP_TOOL} once "
+              f"with notification_id {notification_id}.")
+    if routed_coordinator:
+        prompt += (f" Then call {FINISH_TOOL} once with that notification_id and the returned lease. "
+                   "For a request that asks for a reply or acknowledgement, include one short text reply. "
+                   "The mailbox message can only request a text reply in this wake. Then stop.")
+    else:
+        prompt += " Then stop. Do not call any other tool."
+    return prompt
+
+
+def active_wake(store, project, server_name, call, notification_id):
+    """Fence automatic calls to the exact native turn and dispatcher's active ledger row."""
+    session = call["session"]
+    if not isinstance(call["user_at"], (int, float)):
+        raise PermissionError("This tool requires an active native mailbox wake")
+    try:
+        path = Path(store.path).resolve()
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+            rows = db.execute("""SELECT role,updated_at FROM mhb_wake_attempts
+                WHERE notification_id=? AND project=? AND harness='devin' AND session=? AND state='sending'""",
+                (notification_id, project, session)).fetchall()
+    except sqlite3.Error:
+        rows = []
+    eligible = [(role, started) for role, started in rows if started <= call["user_at"]
+                and time.time() - started < MAX_COMMAND_TIMEOUT + 15]
+    if len(eligible) != 1:
+        raise PermissionError("This exact native wake is no longer active")
+    role, started = eligible[0]
+    trace = store.trace(project, notification_id)
+    routed_coordinator = role == "coordinator" and trace and trace.get("request_id") is not None
+    prompt = _wake_prompt(server_name, notification_id, routed_coordinator)
+    if call["user_prompt"] != prompt:
+        raise PermissionError("Current native turn does not match this wake")
+    return role, started, prompt
 
 
 class ACPClient:
@@ -257,8 +351,7 @@ def _remember_tool_update(pending, params, expected_session):
 
 
 def _permission_handler(*, server_name, expected_session, workspace, notification_id,
-                        pending_calls, state, native_db=None):
-    expected_args = {"notification_id": notification_id}
+                        pending_calls, state, native_db=None, routed_coordinator=False, submitted_at=None):
 
     def handle(event):
         if event.get("method") != "session/request_permission":
@@ -270,7 +363,28 @@ def _permission_handler(*, server_name, expected_session, workspace, notificatio
         if not call_id or ("sessionId" in params and
                            not _same_session(params.get("sessionId"), expected_session)):
             return {"outcome": {"outcome": "cancelled"}}
-        tool, args = None, None
+        tool = PICKUP_TOOL
+        args = _native_call_args(expected_session, workspace, server_name, call_id, tool, native_db=native_db)
+        if args is None and routed_coordinator:
+            prior = state.get("pickup_call")
+            observed = submitted_at is not None and _native_completion(
+                expected_session, workspace, server_name, _wake_prompt(server_name, notification_id, True),
+                notification_id, submitted_at, native_db,
+            )
+            if prior or observed and PICKUP_TOOL in observed:
+                tool = FINISH_TOOL
+                args = _native_call_args(expected_session, workspace, server_name, call_id, tool,
+                                         previous_call=prior, native_db=native_db)
+        if tool in state.get("tools", ()):
+            return {"outcome": {"outcome": "cancelled"}}
+        if args is None or args.get("notification_id") != notification_id:
+            return {"outcome": {"outcome": "cancelled"}}
+        if tool == PICKUP_TOOL and set(args) != {"notification_id"}:
+            return {"outcome": {"outcome": "cancelled"}}
+        if tool == FINISH_TOOL and (set(args) - {"notification_id", "lease", "reply"}
+                or not isinstance(args.get("lease"), str) or not args["lease"]
+                or args.get("reply") is not None and not isinstance(args["reply"], str)):
+            return {"outcome": {"outcome": "cancelled"}}
         pending = pending_calls.pop(call_id, None)
         context = pending.get("call") if pending and _same_session(
             pending.get("session_id"), expected_session) else None
@@ -282,56 +396,22 @@ def _permission_handler(*, server_name, expected_session, workspace, notificatio
         if call is not None:
             if call.get("toolCallId", call_id) != call_id:
                 return {"outcome": {"outcome": "cancelled"}}
-            tool, args = _tool_and_args(call, server_name)
-            if tool is None:
-                if _call_conflicts(call, server_name):
-                    return {"outcome": {"outcome": "cancelled"}}
-                # Some ACP builds provide only the call ID in the session
-                # update. The native transcript check below proves the rest.
-                tool, args = "pickup_notification", expected_args
-        else:
-            # Permission-only envelopes can omit call details. Native transcript
-            # lookup must bind this call ID to this exact server/tool/input.
-            tool = "pickup_notification"
-            args = expected_args
-        if tool != "pickup_notification" or not _json_exact(args, expected_args):
-            return {"outcome": {"outcome": "cancelled"}}
-        if not _native_call_matches(expected_session, workspace, server_name, call_id,
-                                    expected_args, native_db=native_db):
-            return {"outcome": {"outcome": "cancelled"}}
+            if _call_conflicts(call, server_name, tool):
+                return {"outcome": {"outcome": "cancelled"}}
+            _, supplied_args = _tool_and_args(call, server_name, tool)
+            if supplied_args is not None and not _json_exact(supplied_args, args):
+                return {"outcome": {"outcome": "cancelled"}}
         options = params.get("options")
         allowed = [item.get("optionId") for item in options if isinstance(item, dict)
                    and item.get("kind") == "allow_once"] if isinstance(options, list) else []
         if len(allowed) != 1 or not isinstance(allowed[0], str) or not allowed[0]:
             return {"outcome": {"outcome": "cancelled"}}
-        if state["allowed"]:
-            return {"outcome": {"outcome": "cancelled"}}
+        if tool == PICKUP_TOOL:
+            state["pickup_call"] = call_id
+        state.setdefault("tools", set()).add(tool)
         state["allowed"] += 1
         return {"outcome": {"outcome": "selected", "optionId": allowed[0]}}
     return handle
-
-
-def _native_server(project, role, session, *, root=None, db_path=None):
-    cfg = config.load(root)
-    cfg.require(project)
-    if role not in {"inbox", "coordinator"}:
-        raise ValueError("Unsupported Devin role")
-    store = Store(db_path or cfg.database)
-    if store.roles(project, "devin").get(role) != session:
-        raise ValueError("Devin server session is no longer bound to this role")
-    server_name = f"mhb_devin_{project}"
-    try:
-        from mcp.server.fastmcp import FastMCP
-    except ImportError as exc:
-        raise RuntimeError("Install the MCP extra to start Devin's mailbox tool") from exc
-    server = FastMCP(server_name)
-
-    @server.tool()
-    def pickup_notification(notification_id: str) -> dict:
-        """Process only the exact pending notification this role was woken for."""
-        return _pickup_notification(store, project, role, session, notification_id)
-
-    server.run(transport="stdio")
 
 
 def _pickup_notification(store, project, role, session, notification_id):
@@ -345,22 +425,40 @@ def _pickup_notification(store, project, role, session, notification_id):
         raise PermissionError("This Devin role was rebound")
     if not store.status(project, "devin").get("enabled"):
         raise PermissionError("Devin mailbox pickup is stopped")
-    pending = store.pending(project, "devin", role, session)
-    if not pending or pending["id"] != notification_id:
-        raise ValueError("This notification is no longer the next pending item")
     item = store.claim(project, "devin", role, session, message_id=notification_id)
     if not item:
         raise ValueError("The exact notification could not be claimed")
     if item["id"] != notification_id:
         raise RuntimeError("Store returned a different notification ID")
+    route = {key: item[key] for key in ("request_id", "stage") if key in item}
     if role == "inbox":
         if not store.finish(project, "devin", role, session, notification_id, item["lease"]):
             raise RuntimeError("Inbox could not durably forward the notification")
-        return {"id": notification_id, "forwarded": True}
+        return {"id": notification_id, "forwarded": True, **route}
     receipt = {key: item[key] for key in ("id", "sender", "recipient", "body", "reply_to", "attempt")}
+    if "request_id" in route:
+        return {**receipt, **route, "lease": item["lease"]}
     if not store.finish(project, "devin", role, session, notification_id, item["lease"]):
         raise RuntimeError("Coordinator could not durably acknowledge the notification")
-    return {**receipt, "acknowledged": True}
+    return {**receipt, **route, "acknowledged": True}
+
+
+def _finish_notification(store, project, session, expected_id, receipt, notification_id, lease, reply):
+    if (not receipt or notification_id != expected_id or receipt.get("id") != notification_id
+            or not lease or receipt.get("lease") != lease or "request_id" not in receipt):
+        raise PermissionError("Finish must use this wake's exact notification ID and pickup lease")
+    if reply is not None and (receipt["reply_to"] is not None or not isinstance(reply, str) or not reply.strip()):
+        raise ValueError("Reply text is only available for an incoming free-text request")
+    result = {"id": notification_id, "request_id": receipt["request_id"], "acknowledged": True}
+    if reply is None:
+        finished = store.finish(project, "devin", "coordinator", session, notification_id, lease)
+    else:
+        finished = store.finish_and_reply(project, "devin", session, notification_id, lease, reply,
+                                          f"wake-reply:{notification_id}")
+        result["reply"] = finished
+    if not finished:
+        raise ValueError("The notification lease is stale or belongs to another coordinator")
+    return result
 
 
 def _start(executable, workspace):
@@ -399,22 +497,25 @@ def _stop_process(process):
 
 
 def wake(project, role, session, notification_id, workspace, *, before_prompt=None,
-         native_db=None, timeout=WAKE_TIMEOUT):
-    """Load exact Devin session; permit one verified pickup_notification call."""
+         native_db=None, timeout=None):
+    """Load one native Devin session and permit only the current delivery's operations."""
+    from .devin_tools import server_name
+
     executable = os.environ.get("MHB_DEVIN_BIN") or shutil.which("devin")
     if not executable:
         raise WakeRejected("Devin Local CLI is unavailable")
     cfg = config.load()
-    if cfg.require(project) != project or Store(cfg.database).roles(project, "devin").get(role) != session:
+    store = config.open_store(cfg)
+    if cfg.require(project) != project or store.roles(project, "devin").get(role) != session:
         raise WakeRejected("Devin role is not the current project binding")
     notification_id = str(uuid.UUID(notification_id))
-    server_name = f"mhb_devin_{project}"
-    server = {"name": server_name, "command": sys.executable,
-              "args": ["-m", "multi_harness_bridge.devin_acp", "serve", "--home",
-                       str(cfg.root), project, role, session],
-              "env": []}
+    item = store.pending(project, "devin", role, session, message_id=notification_id)
+    routed_coordinator = role == "coordinator" and item is not None and "request_id" in item
+    native_server = server_name(project)
     native_session = session.removeprefix("acp/devin-cli/")
     proc = _start(executable, workspace)
+    if timeout is None:
+        timeout = ROUTED_COORDINATOR_TIMEOUT if routed_coordinator else WAKE_TIMEOUT
     client = ACPClient(proc, timeout=timeout)
     try:
         try:
@@ -423,20 +524,20 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
                 raise WakeRejected("Installed Devin ACP cannot load an existing bound session")
             client.call("session/load", {"sessionId": native_session,
                                          "cwd": str(Path(workspace).resolve()),
-                                         "mcpServers": [server]})
+                                         "mcpServers": []})
         except WakeRejected:
             raise
         except Exception as exc:
             raise WakeDeferred(f"Devin rejected the bound session before prompt submission ({type(exc).__name__})") from None
         if before_prompt is not None and not before_prompt():
             raise WakeDeferred("Devin wake was stopped or rebound before prompt submission")
-        prompt = ("Use only the configured native bridge tool "
-                  f"{server_name}. Call pickup_notification exactly once with "
-                  f"notification_id {notification_id}, then stop. Do not call any other tool.")
+        prompt = _wake_prompt(native_server, notification_id, routed_coordinator)
         state, pending = {"allowed": 0}, {}
-        handler = _permission_handler(server_name=server_name, expected_session=native_session,
+        submitted_at = time.time()
+        handler = _permission_handler(server_name=native_server, expected_session=native_session,
                                       workspace=workspace, notification_id=notification_id,
-                                      pending_calls=pending, state=state, native_db=native_db)
+                                      pending_calls=pending, state=state, native_db=native_db,
+                                      routed_coordinator=routed_coordinator, submitted_at=submitted_at)
         try:
             result = client.call("session/prompt", {"sessionId": native_session,
                 "prompt": [{"type": "text", "text": prompt}]}, server_request=handler,
@@ -449,7 +550,20 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
             if state["allowed"]:
                 raise TimeoutError("Devin ACP failed after allowing the exact mailbox tool") from None
             raise WakeDeferred("Devin ACP refused the exact mailbox prompt") from None
-        if state["allowed"] != 1:
+        if item is not None:
+            observed = _native_completion(native_session, workspace, native_server, prompt,
+                                          notification_id, submitted_at, native_db)
+            expected_tools = {PICKUP_TOOL, FINISH_TOOL} if routed_coordinator else {PICKUP_TOOL}
+            prior = item.get("stage", role)
+            current = (store.trace(project, notification_id) or {}).get("stage")
+            stages = ("outbound", "inbox", "coordinator", "done")
+            advanced = current in stages[stages.index(prior) + 1:]
+            if expected_tools.issubset(observed) and advanced:
+                return result
+            if observed or advanced or state["allowed"]:
+                raise WakeError("Devin mailbox completion could not be confirmed in the native chat and queue")
+            raise WakeRejected("Devin did not complete the exact mailbox pickup")
+        if not state["allowed"]:
             raise WakeRejected("Devin did not request the one authorized mailbox notification tool")
         return result
     finally:
@@ -487,23 +601,3 @@ def rename(session, workspace, title, *, native_db=None, timeout=15.0):
     if not after or Path(after[0]).resolve() != Path(workspace).resolve() or after[1] != title:
         raise RuntimeError("Devin rename was not confirmed by the native session database")
     return title
-
-
-def main(argv=None):
-    import argparse
-    parser = argparse.ArgumentParser(description=__doc__)
-    sub = parser.add_subparsers(dest="command", required=True)
-    server = sub.add_parser("serve", help="start the bound one-tool Devin mailbox server")
-    server.add_argument("--home", type=Path)
-    server.add_argument("project")
-    server.add_argument("role", choices=("inbox", "coordinator"))
-    server.add_argument("session")
-    args = parser.parse_args(argv)
-    if args.command == "serve":
-        _native_server(args.project, args.role, args.session, root=args.home)
-        return 0
-    return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

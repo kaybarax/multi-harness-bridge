@@ -7,8 +7,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import identifier
-from .store import Store
+from .config import identifier, open_store
 
 
 @dataclass(frozen=True)
@@ -41,7 +40,7 @@ def issue(config, principal, output):
     identifier(principal.harness)
     if principal.role not in ("inbox", "coordinator"):
         raise ValueError("Unknown role")
-    verify_role(Store(config.database), principal)
+    verify_role(open_store(config), principal)
     token = secrets.token_urlsafe(32)
     output = Path(output).expanduser()
     fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -81,20 +80,22 @@ def dispatch(config, token, command):
         raise ValueError("Expected a JSON object")
     owner = authenticate(config, token)
     project, harness, session = owner.project, owner.harness, owner.session
-    store = Store(config.database)
+    store = open_store(config)
     verify_role(store, owner)
     op = command.get("op")
-    fields = {"status": (), "claim": (), "finish": ("id", "lease"), "send": ("recipient", "body", "key", "reply_to"),
-              "stop": (), "resume": ()}
-    if not isinstance(op, str) or op not in fields or set(command) - {"op", *fields[op]}:
+    required = {"status": (), "claim": (), "finish": ("id", "lease"), "send": ("recipient", "body", "key"),
+                "send_fanout": ("recipients", "body", "key"), "reply_free_text": ("reply_to", "body", "key"),
+                "stop": (), "resume": ()}
+    optional = {"claim": ("notification_id",), "send": ("reply_to",)}
+    if not isinstance(op, str) or op not in required or set(command) - {"op", *required[op], *optional.get(op, ())}:
         raise ValueError("Unknown operation or unexpected arguments")
-    for key in fields[op]:
-        if key != "reply_to" and key not in command:
+    for key in required[op]:
+        if key not in command:
             raise ValueError(f"Missing {key}")
     if op == "status":
         return store.status(project, harness)
     if op == "claim":
-        return {"message": store.claim(project, harness, owner.role, session)}
+        return {"message": store.claim(project, harness, owner.role, session, message_id=command.get("notification_id"))}
     if op == "finish":
         return {"result": store.finish(project, harness, owner.role, session, command["id"], command["lease"])}
     if owner.role != "coordinator":
@@ -102,6 +103,12 @@ def dispatch(config, token, command):
     if op == "send":
         return store.send(project, harness, command["recipient"], command["body"], command["key"],
                           reply_to=command.get("reply_to"), session=session)
+    if op == "send_fanout":
+        return store.send_fanout(project, harness, command["recipients"], command["body"], command["key"],
+                                 session=session)
+    if op == "reply_free_text":
+        return store.reply_free_text(project, harness, command["reply_to"], command["body"], command["key"],
+                                     session=session)
     return {"result": store.set_enabled(project, harness, op == "resume", session=session)}
 
 
@@ -122,9 +129,9 @@ def serve_mcp(config, credential):
         return run("status")
 
     @server.tool()
-    def receive_message() -> dict:
-        """Lease the next message addressed to this inbox or coordinator."""
-        return run("claim")
+    def receive_message(notification_id: str | None = None) -> dict:
+        """Lease this role's pending message. Pass the exact notification ID when woken."""
+        return run("claim", notification_id=notification_id)
 
     @server.tool()
     def finish_message(id: str, lease: str) -> dict:
@@ -135,6 +142,16 @@ def serve_mcp(config, credential):
     def send_message(recipient: str, body: str, key: str, reply_to: str | None = None) -> dict:
         """Send through this coordinator's project bridge using a stable idempotency key."""
         return run("send", recipient=recipient, body=body, key=key, reply_to=reply_to)
+
+    @server.tool()
+    def send_fanout(recipients: list[str], body: str, key: str) -> dict:
+        """Send one free-text request to all named peer harnesses in this project. Reuse the key on retry."""
+        return run("send_fanout", recipients=recipients, body=body, key=key)
+
+    @server.tool()
+    def reply_free_text(reply_to: str, body: str, key: str) -> dict:
+        """Send a correlated reply using the received request's delivery ID. Reuse the reply key on retry."""
+        return run("reply_free_text", reply_to=reply_to, body=body, key=key)
 
     @server.tool()
     def set_pickup(enabled: bool) -> dict:

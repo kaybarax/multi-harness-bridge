@@ -75,7 +75,7 @@ def test_harness_identity_must_be_adapter_supplied(monkeypatch):
         skills.invoking_harness()
 
 
-def test_mailbox_uses_bound_native_session_and_private_lease(tmp_path, monkeypatch):
+def test_mailbox_uses_bound_native_session_and_exact_lease(tmp_path, monkeypatch):
     from multi_harness_bridge import role_adapters
     from multi_harness_bridge.store import Store
 
@@ -94,17 +94,116 @@ def test_mailbox_uses_bound_native_session_and_private_lease(tmp_path, monkeypat
     original = store.send("sample", "other", "codex", "queued work", "stable-id")["id"]
     inbound = store.claim("sample", "codex", "inbox", "f158aa0f-aaf9-41d3-a589-fbb43793a1ea")
     store.finish("sample", "codex", "inbox", "f158aa0f-aaf9-41d3-a589-fbb43793a1ea", inbound["id"], inbound["lease"])
-    args = SimpleNamespace(project=None, mailbox="claim", message_id=None, recipient=None,
-                           body=None, key=None, reply_to=None)
+    args = SimpleNamespace(project=None, mailbox="claim", message_id=None, lease=None, recipient=None,
+                           body=None, body_file=None, key=None, reply_to=None)
     result = skills._mailbox(args, "codex", cfg)
     assert result["message"]["body"] == "queued work"
-    assert "lease" not in result["message"]
     args.mailbox = "finish"
     args.message_id = result["message"]["id"]
+    args.lease = result["message"]["lease"]
     assert skills._mailbox(args, "codex", cfg)["finished"] is True
     args.mailbox = "send"
-    args.recipient, args.body, args.key, args.reply_to = "other", "reply", "reply-key", original
+    args.recipient, args.body, args.key, args.reply_to = ["other"], "reply", "reply-key", original
     sent = skills._mailbox(args, "codex", cfg)
     with store._connect() as connection:
         row = connection.execute("SELECT sender,recipient,key,reply_to FROM messages WHERE id=?", (sent["id"],)).fetchone()
     assert tuple(row) == ("codex", "other", "reply-key", original)
+
+
+@pytest.mark.parametrize("host", ["codex", "claude"])
+def test_native_mailbox_finish_rejects_stale_attempt(tmp_path, monkeypatch, capsys, host):
+    from multi_harness_bridge import role_adapters
+    from multi_harness_bridge.store import Store
+
+    cfg = Config(tmp_path, {"sample": (tmp_path,)})
+    session = f"{host}-inbox"
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setattr(skills, "invoking_harness", lambda: host)
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint: role_adapters.Invocation(
+        "sample", host, session, "", tmp_path, proof="fixture-native"))
+    store = Store(cfg.database)
+    for harness in (host, "devin"):
+        for role in ("inbox", "coordinator"):
+            store.bind("sample", harness, role, f"{harness}-{role}")
+    request = store.send_fanout("sample", host, ["devin"], "dry run", "request", session=f"{host}-coordinator")
+    message_id = request["deliveries"][0]["id"]
+
+    def claim():
+        skills.main(["--mailbox", "claim", "--message-id", message_id])
+        return json.loads(capsys.readouterr().out)["message"]
+
+    def finish(lease):
+        skills.main(["--mailbox", "finish", "--message-id", message_id, f"--lease={lease}"])
+        return json.loads(capsys.readouterr().out)["finished"]
+
+    first = claim()
+    with store._connect() as db:
+        db.execute("UPDATE messages SET deadline=0 WHERE id=?", (message_id,))
+    second = claim()
+    assert second["attempt"] == first["attempt"] + 1
+    assert second["lease"] != first["lease"]
+    with pytest.raises(SystemExit):
+        skills.main(["--mailbox", "finish", "--message-id", message_id])
+    assert "--lease from the claim result is required" in capsys.readouterr().err
+    assert finish(first["lease"]) is False
+    assert finish(second["lease"]) is True
+    assert store.trace("sample", message_id)["stage"] == "inbox"
+
+
+def test_native_mailbox_can_finish_a_claim_cached_before_upgrade(tmp_path, monkeypatch):
+    import hashlib
+
+    from multi_harness_bridge import role_adapters
+    from multi_harness_bridge.store import Store
+
+    cfg = Config(tmp_path, {"sample": (tmp_path,)})
+    session = "codex-inbox"
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint: role_adapters.Invocation(
+        "sample", host, session, "", tmp_path, proof="fixture-native"))
+    store = Store(cfg.database)
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "codex", "inbox", session)
+    message_id = store.send("sample", "devin", "codex", "existing work", "request")["id"]
+    item = store.claim("sample", "codex", "inbox", session, message_id=message_id)
+    scope = "\0".join(("sample", "codex", "inbox", session, message_id))
+    previous_claim = cfg.root / "leases" / (hashlib.sha256(scope.encode()).hexdigest() + ".json")
+    previous_claim.parent.mkdir()
+    previous_claim.write_text(json.dumps({"id": message_id, "lease": item["lease"]}))
+    args = SimpleNamespace(project=None, mailbox="finish", message_id=message_id, lease=None)
+    assert skills._mailbox(args, "codex", cfg)["finished"] is True
+    assert not previous_claim.exists()
+
+
+def test_native_cli_multiline_fanout_and_reply(tmp_path, monkeypatch, capsys):
+    import io
+    import sys
+
+    from multi_harness_bridge import role_adapters
+    from multi_harness_bridge.store import Store
+
+    cfg = Config(tmp_path, {"sample": (tmp_path,)})
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setattr(skills, "invoking_harness", lambda: "codex")
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint: role_adapters.Invocation(
+        "sample", host, f"{host}-coordinator", "", tmp_path, proof="fixture-native"))
+    store = Store(cfg.database)
+    for harness in ("codex", "claude", "devin"):
+        for role in ("inbox", "coordinator"):
+            store.bind("sample", harness, role, f"{harness}-{role}")
+    body = "Exact ‘quoted’ text\r\n$literal\n"
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(body.encode("utf-8"))))
+    skills.main(["--mailbox", "send-fanout", "--recipient", "claude", "--recipient", "devin",
+                 "--body-file", "-", "--key", "request-key"])
+    request = json.loads(capsys.readouterr().out)
+    assert request["project"] == "sample"
+    delivery = next(item for item in request["deliveries"] if item["recipient"] == "claude")
+    for harness, role in (("codex", "inbox"), ("claude", "inbox"), ("claude", "coordinator")):
+        session = f"{harness}-{role}"
+        item = store.claim("sample", harness, role, session, message_id=delivery["id"])
+        assert item["body"] == body
+        assert store.finish("sample", harness, role, session, item["id"], item["lease"])
+    monkeypatch.setattr(skills, "invoking_harness", lambda: "claude")
+    skills.main(["--mailbox", "reply", "--reply-to", delivery["id"], "--body", "Received",
+                 "--key", "reply-key"])
+    reply = json.loads(capsys.readouterr().out)
+    assert reply["request_id"] == request["request_id"]

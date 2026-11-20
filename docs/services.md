@@ -29,7 +29,11 @@ definition, enable it, disable it, or reload a running service. Replace
 ## macOS
 
 The generated plist is already in LaunchAgents. Enable and load it for the
-logged-in user:
+logged-in user. LaunchAgents use the launchd environment. If Codex or Devin
+Local is installed outside its default `PATH`, configure the service's `PATH`
+or supply an absolute executable through the [native adapter settings](native.md).
+The plist's `MHB_HOME` should match the state directory used by the desktop
+clients.
 
 ```sh
 launchctl enable "gui/$(id -u)/org.multi-harness-bridge.wake.<project>"

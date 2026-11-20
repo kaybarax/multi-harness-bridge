@@ -1,73 +1,87 @@
 # Antigravity Desktop adapter
 
-The `antigravity` adapter targets the already-bound conversation in Google
-Antigravity Desktop on macOS. It reads `~/.gemini/antigravity/conversation_summaries.db`
-in read-only mode and requires the conversation's native project ID and full
-workspace-root set to match exactly one project in the MHB registry. Every
-registered project with a native Antigravity ID is checked for ID collisions;
-bound conversation UUIDs must also be canonical and unique across projects.
+Multi Harness Bridge uses an Antigravity App sidecar for automatic wakes.
+The sidecar calls the documented `agentapi send-message` command to submit
+an ID-only notice to the existing, bound Desktop conversation. It runs in
+the background and leaves Desktop windows, focus, and drafts alone. See the
+[Antigravity sidecar documentation](https://antigravity.google/docs/sidecars/#agentapi).
 
-The public adapter operations are:
+The adapter reads the Desktop conversation summary database in read-only
+mode. It verifies the exact bound role and conversation UUID, the native
+project ID, the registered workspace roots, and the notification's current
+pickup eligibility before submission. The regular mailbox tool claims and
+forwards or acknowledges the delivery when the recipient processes it.
 
-```python
-from multi_harness_bridge import ag_wake
+## Install and enable
 
-ag_wake.verify(project, role, session)
-ag_wake.wake(project, role, session, notification_id)
-ag_wake.rename(project, role, session, title)
-```
-
-`verify` checks the SQLite role binding and native Antigravity summary. `wake`
-then uses the macOS Accessibility helper to select the exact UUID sidebar link
-and submit a fixed notice containing the notification ID. It never includes the
-mailbox body or changes queue state. The recipient remains responsible for
-using its installed MHB mailbox tools to inspect and process one pending item.
-`rename` changes the title in Antigravity's native interface only after checking
-the exact bound role and visible conversation.
-
-## Install on macOS
-
-Install the package with its packaged Swift source, then compile and sign the
-helper with:
+Install the package with the MCP extra. Open the registered Desktop project
+and configure its scoped mailbox server and PreToolUse hook with the native
+installation command. Enable the project sidecar using the same Python and
+MHB state directory as its mailbox server.
 
 ```sh
-python -m multi_harness_bridge.ag_wake install
+multi-harness-skills --project my-project --to antigravity --install-native
+python -m multi_harness_bridge.ag_sidecar my-project install --enable
 ```
 
-The helper is written to the private MHB configuration directory under
-`native/antigravity-ax`. The installer compiles it with `swiftc` and applies a
-stable ad-hoc code signature. To authorize its native UI access, open **System
-Settings → Privacy & Security → Accessibility**, add or enable
-`antigravity-ax` (under the MHB configuration directory), and approve the
-system prompt. If macOS does not list the helper after installation, use the
-add button to select that executable. Reinstalling after a helper update may
-require granting access again.
+The native installer prepares the sidecar definition. The separate `--enable`
+command enables that one sidecar in Antigravity's user configuration. The
+Antigravity App manages its lifecycle and supplies `agentapi`. Open the App
+with its normal account and permissions. The generic MHB wake worker leaves
+Antigravity wakes to this sidecar and continues to handle other harnesses.
 
-For an initial check, leave Antigravity running with one window on either
-bound conversation in the registered project and run:
+On upgrade, stop or refresh older MHB wake processes that include the former
+Accessibility-based notification worker before enabling the sidecar. The
+sidecar shares the existing wake ledger. It preserves confirmed attempts
+and holds ambiguous submissions for reconciliation. Review the native
+conversation before reconciling an unresolved notification.
 
-```sh
-multi-harness-wake --project my-project --harness antigravity --once
-```
+## Verify delivery and recover a held notice
 
-The helper refuses to send if there is not exactly one Antigravity app and
-matching project window, the requested UUID sidebar link is missing or
-ambiguous, the app is busy, a dialog is open, the composer has a draft, or
-recent keyboard or mouse input indicates active use. It preserves the current
-composer draft and avoids switching conversations while the app is generating.
-An ambiguous send is treated as uncertain and is not automatically retried.
+Follow the notification ID through the App's sidecar logs, the exact bound
+native conversation, and `mhb trace PROJECT ID`.
 
-## Other operating systems
+| Evidence | What it establishes |
+| --- | --- |
+| Sidecar reports `sent` and the official App event records acceptance | The App accepted submission of the wake notice. |
+| The exact notification ID appears in a committed native turn | The target conversation received the notice. |
+| The durable trace records `inbox-claimed` and `forwarded` | The bound Inbox forwarded the existing delivery. |
+| The trace records `coordinator-claimed` and `acknowledged` | The bound Coordinator acquired a lease and recorded receipt. |
+| The correlated reply reaches the original Coordinator | The substantive round trip finished. |
 
-This native driver uses AppKit, ApplicationServices, launchctl, and macOS
-Accessibility permissions. It does not automate Antigravity on Windows or
-Linux. Those systems need their own native adapter implementing the MHB
-`verify` and `wake` contract; they must verify the exact registered workspace
-and bound conversation before submitting a prompt. The package does not fall
-back to coordinate clicking or a guessed Antigravity command-line interface.
+The model can encounter a provider error after the App has committed a wake
+or even after a role has claimed the delivery. For HTTP 429, record the
+provider's reset time with its timezone and hold provider calls until that
+time. Preserve the submitted wake record and the original notification,
+request, and reply identities.
 
-## Connect a native inbox and coordinator
+After the reset, confirm the current binding, pending stage, lease, and
+existing replies for the exact notification. An active lease takes
+precedence. If an existing native turn can continue, let it finish using
+the same notification. When an operator authorizes a separate recovery
+notice, submit it once through the same scoped App sidecar and record its
+own outcome alongside the original. The bound native MCP tools still claim
+and acknowledge the original delivery. Use its existing reply reference
+and stable reply key. Arrange a receipt-only disposition for a delivery the
+sender has superseded, and route the correction under its own identity.
 
-From the registered workspace, run `python -m multi_harness_bridge.ag_inbox PROJECT install` with the MCP extra installed. This registers a project-specific stdio server and a matching native PreToolUse hook in Antigravity's configuration. The installer merges its entries and preserves unrelated servers. Reload that server in Desktop so the active processes have the current code.
+If a scoped recovery worker temporarily owns dispatch, account for the
+reply's outbound Inbox hop. Forward that exact reply under the same
+authority, or restore the normal sidecar once all receipt-only deliveries
+are terminal. Keep the ordinary dispatcher paused while a superseded item
+still needs its explicit receipt-only notice.
 
-A fresh chat can invoke the project server's `take_coordinator` or `take_bridge` after the user's matching command. The hook verifies the current user input, Desktop conversation ID, native summary, workspace roots and artifact/transcript location. It supplies a short-lived, single-use grant associated with the actual call and arguments. The coordinator may send messages and change pickup. Both roles can call `pickup_notification` for the supplied wake ID. For an inbox this forwards the message durably. For a coordinator it returns the message and lease; the coordinator calls `acknowledge` after receiving it. Using a quoted title applies that title to the native window and reports any separate rename failure. The hook and the MCP server take no session IDs from the user.
+## Native role changes
+
+A fresh chat can invoke the scoped `take_coordinator` or `take_bridge` tool
+after the user's matching command. The hook verifies the current input,
+Desktop conversation, registered roots, and native artifact or transcript
+location. It supplies a short-lived, single-use grant for the actual call
+and arguments. The coordinator can send, reply, and change pickup. Both
+roles can process the exact notification assigned to them. The Inbox
+forwards it durably. The Coordinator receives an exact lease and uses
+`acknowledge` to record receipt.
+
+An explicit takeover with a quoted title can use the optional macOS
+Accessibility helper to rename the verified conversation. The sidecar and
+mailbox delivery require no Accessibility permissions.

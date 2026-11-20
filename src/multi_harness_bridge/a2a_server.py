@@ -4,7 +4,7 @@ import json
 from contextvars import ContextVar
 
 from .transport import authenticate, dispatch, verify_role
-from .store import Store
+from .config import open_store
 
 
 def application(config, port):
@@ -43,7 +43,7 @@ def application(config, port):
         security_schemes={"roleBearer": SecurityScheme(
             http_auth_security_scheme=HTTPAuthSecurityScheme(scheme="Bearer"))},
         security_requirements=[SecurityRequirement(schemes={"roleBearer": {"list": []}})],
-        skills=[AgentSkill(id="mailbox", name="Mailbox", description="send, claim, finish, status, stop, resume",
+        skills=[AgentSkill(id="mailbox", name="Mailbox", description="send, send_fanout, reply_free_text, claim, finish, status, stop, resume",
                            tags=["coordination"])])
     handler = DefaultRequestHandler(agent_executor=Executor(), task_store=InMemoryTaskStore(), agent_card=card)
 
@@ -66,7 +66,7 @@ def application(config, port):
         try:
             if scheme.lower() != "bearer":
                 raise PermissionError()
-            verify_role(Store(config.database), authenticate(config, token))
+            verify_role(open_store(config), authenticate(config, token))
         except (PermissionError, ValueError):
             return await JSONResponse({"error": "Unauthorized"}, 401)(scope, receive, send)
         total = bytearray()

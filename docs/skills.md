@@ -2,14 +2,14 @@
 
 A verified Take Bridge resumes pickup for this project and harness once both roles are assigned. Either role can be assigned first. Take Coordinator alone preserves an explicit stop.
 
-Setup provisions three user-wide skills. Open a fresh chat in your registered project and use the composer for your app.
+Setup provisions four user-wide skills. Open a chat in your registered project and use the composer for your app.
 
-| App | Coordinator | Bridge Inbox | Propagation |
-| --- | --- | --- | --- |
-| Codex | `$take-coordinator` | `$take-bridge` | `$propagate-skills` |
-| Devin Desktop Local (select a project folder first) | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
-| Antigravity Desktop | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
-| Claude Code | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+| App | Coordinator | Bridge Inbox | Propagation | Mailbox |
+| --- | --- | --- | --- | --- |
+| Codex | `$take-coordinator` | `$take-bridge` | `$propagate-skills` | `$bridge-mailbox` |
+| Devin Desktop Local (select a project folder first) | `/take-coordinator` | `/take-bridge` | `/propagate-skills` | `/bridge-mailbox` |
+| Antigravity Desktop | `/take-coordinator` | `/take-bridge` | `/propagate-skills` | `/bridge-mailbox` |
+| Claude Code | `/take-coordinator` | `/take-bridge` | `/propagate-skills` | `/bridge-mailbox` |
 
 In Devin Desktop, select **Local**, choose the project in **Session folder**, then type `/take` in the composer to see both role skills. Type `/propagate` to find the third. An unscoped Local composer can show an empty picker. The standalone Devin CLI lists the same slash commands. Selecting a role skill and sending the request performs the handoff. Append a quoted title to request a sidebar rename.
 
@@ -23,16 +23,22 @@ To enable native role operations for a registered project, run `multi-harness-sk
 multi-harness-skills --bootstrap
 ```
 
-This installs `take-coordinator`, `take-bridge`, and `propagate-skills` in the
+This installs `take-coordinator`, `take-bridge`, `propagate-skills`, and `bridge-mailbox` in the
 invoking harness's project-local skills directory and applies supported host
 setup. Run `multi-harness-skills --install-native` to repeat host setup.
-Claude receives a project-local `UserPromptSubmit` hook in
-`.claude/settings.local.json`; existing settings are preserved. Devin registers
-`mhb_roles_<project>` in `.devin/mcp_config.local.json`, preserving existing
-servers. Antigravity installs project MCP grants and its signed native helper.
+Claude receives a `UserPromptSubmit` hook in `.claude/settings.local.json` in
+each registered root. Devin registers `mhb_roles_<project>` in
+`.devin/mcp_config.local.json` in each root. Both preserve existing entries.
+Antigravity installs project MCP grants and prepares the App sidecar.
+Enable the sidecar separately for automatic pickup. The signed native helper
+supports optional sidebar titles on macOS. See [Antigravity setup](antigravity.md).
 Codex needs no project configuration edits for native session verification.
-Install the package with the `mcp` extra before loading the Devin server, then
-reload the project MCP configuration in Devin Desktop.
+Install the package with the `mcp` extra for the Devin and Antigravity servers.
+After an upgrade, reload the project MCP server in each Desktop app and check
+that `send_fanout` and `reply_free_text` appear in the existing coordinator
+chat. If the app still shows an old schema after reload, restart it and reopen
+the same conversation. The tools verify the role against the current binding
+on every call.
 
 For an initial shell-based setup where no native caller context is available,
 select the target explicitly with `multi-harness-skills --bootstrap --to devin`
@@ -75,12 +81,31 @@ project MCP server and PreToolUse hook, which grant tools only to the verified
 native conversation. Stale or ambiguous evidence fails closed.
 
 Codex and Claude mailbox operations use `--mailbox status`, `claim`, `finish`,
-`send`, `stop`, and `resume`. Devin and Antigravity use MCP tools
-`bridge_status`, `pickup_notification`, `acknowledge`, `send_message`, and
-`set_pickup`. Each derives the current bound session and role. Inbox finishing
-relays work to its Coordinator; only the Coordinator sends outbound messages
-or changes pickup state. Replies use `reply_to`, and retries must reuse a stable
-explicit idempotency `key`.
+`send`, `send-fanout`, `reply`, `stop`, and `resume`. Devin and Antigravity use
+`bridge_status`, `pickup_notification`, `acknowledge`, `send_message`,
+`send_fanout`, `reply_free_text`, and `set_pickup`. Each derives the current
+native session and role. Coordinators send or change pickup state. Inbox
+sessions advance an outbound delivery to its destination Inbox, or an inbound
+delivery to their own Coordinator.
+
+For Codex and Claude, finish requires the exact lease from that claim, passed
+as `--mailbox finish --message-id <id> --lease=<lease>`.
+
+Ask a bound Coordinator to send one message to named peer harnesses. Use
+`codex` for Codex, `claude` for Claude Code, `devin` for Devin Local, and
+`antigravity` for Antigravity Desktop in the recipient list. In Codex or
+Claude Code, the mailbox skill uses
+`multi-harness-skills --mailbox send-fanout --recipient devin --recipient antigravity --body-file - --key <key>`
+with the message on standard input. In Devin or Antigravity, it calls
+`send_fanout(recipients, body, key)` once. Reuse the key and message on retry.
+The returned `request_id` ties together a delivery ID for each recipient.
+
+A Coordinator records receipt by finishing the delivery's lease. To send a
+substantive reply, use `--mailbox reply --reply-to <delivery-id>` with a body
+and reply key, or `reply_free_text(reply_to, body, key)` in MCP. The reply
+travels through both Inboxes and carries the same `request_id` plus the original
+delivery ID in `reply_to`. Each recipient can send one substantive reply for
+its delivery. Reuse that reply's key on retry.
 
 Native paths can be configured with `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
 `MHB_DEVIN_SESSIONS_DB`, and `MHB_ANTIGRAVITY_SUMMARIES_DB`. Claude hook context

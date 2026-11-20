@@ -51,6 +51,30 @@ def test_credentials_stay_in_project_and_retire(lane):
         invoke("codex-coordinator", op="status")
 
 
+def test_fanout_and_reply_require_bound_coordinator_credentials(lane):
+    config, store, files = lane
+
+    def invoke(actor, **command):
+        return dispatch(config, files[actor].read_text().strip(), command)
+
+    args = {"op": "send_fanout", "recipients": ["devin"], "body": "Request", "key": "request"}
+    with pytest.raises(PermissionError):
+        invoke("codex-inbox", **args)
+    with pytest.raises(ValueError, match="unexpected"):
+        invoke("codex-coordinator", **args, session="devin-coordinator")
+    request = invoke("codex-coordinator", **args)
+    delivery_id = request["deliveries"][0]["id"]
+    for actor in ("codex-inbox", "devin-inbox", "devin-coordinator"):
+        item = invoke(actor, op="claim", notification_id=delivery_id)["message"]
+        assert item["request_id"] == request["request_id"]
+        assert invoke(actor, op="finish", id=item["id"], lease=item["lease"])["result"]
+    reply = invoke("devin-coordinator", op="reply_free_text", reply_to=delivery_id, body="Acknowledged", key="reply")
+    assert reply["request_id"] == request["request_id"]
+    store.bind("orchard", "devin", "coordinator", "replacement")
+    with pytest.raises(PermissionError, match="retired"):
+        invoke("devin-coordinator", op="reply_free_text", reply_to=delivery_id, body="Acknowledged", key="reply")
+
+
 def test_a2a_v1_discovery_send_and_host_guard(lane):
     pytest.importorskip("a2a")
     from starlette.testclient import TestClient
@@ -85,7 +109,8 @@ def test_real_stdio_mcp_session(lane):
             "--credential", str(files["codex-coordinator"])], env={**os.environ, "MHB_HOME": str(config.root)})
         async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
             await session.initialize()
-            assert "receive_message" in {tool.name for tool in (await session.list_tools()).tools}
+            assert {"receive_message", "send_fanout", "reply_free_text"} <= {
+                tool.name for tool in (await session.list_tools()).tools}
             result = await session.call_tool("send_message", {"recipient": "devin", "body": "hello", "key": "mcp"})
             assert not result.isError and "id" in json.loads(result.content[0].text)
     asyncio.run(scenario())

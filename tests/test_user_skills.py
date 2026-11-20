@@ -3,7 +3,7 @@ from multi_harness_bridge.user_skills import install
 
 def test_fresh_user_and_rerun(tmp_path):
     first = list(install(tmp_path, {}))
-    assert len(first) == 12
+    assert len(first) == 16
     for _, target, status in first:
         assert status == "installed"
         assert f"name: {target.name}" in (target / "SKILL.md").read_text()

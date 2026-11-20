@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 
 from . import config
@@ -49,13 +50,10 @@ def _native_invocation(host, project_hint=None, *, requested_role=None):
         if requested_role is not None and time.time() - float(context.get("captured_at", 0)) > 120:
             raise ValueError("Claude native prompt context is stale; submit a fresh user turn")
         return role_adapters.claude_invocation(requested_role, context, project_hint=project_hint,
-                                               expected_session=caller_session)
+                                               cwd=Path.cwd(), expected_session=caller_session)
     if host == "devin":
         raise ValueError("Use this project's mhb_roles_<slug> native ACP tools for Devin role and mailbox operations")
-    event_path = os.environ.get("MHB_ANTIGRAVITY_EVENT")
-    if not event_path:
-        raise ValueError("Antigravity requires current native event context")
-    return role_adapters.antigravity_native_invocation(None, json.loads(Path(event_path).read_text()), project_hint=project_hint)
+    raise ValueError("Use this project's mhb_<slug> native Desktop MCP tools for Antigravity role and mailbox operations")
 
 
 def cfg_context_path(host, session=None):
@@ -70,14 +68,18 @@ def cfg_context_path(host, session=None):
 def install_native(project, host, cfg):
     """Install only host-owned project hooks/helpers; preserve existing config."""
     cfg.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    from .store import Store
-    Store(cfg.database)
+    config.open_store(cfg)
     if host == "claude":
         from .role_adapters import install_claude_hook
-        return install_claude_hook(cfg.projects[project][0])
+        with config.registry_writer(cfg.root):
+            results = [install_claude_hook(workspace, state_home=cfg.root) for workspace in cfg.projects[project]]
+        installed = any(result["status"] == "installed" for result in results)
+        return {**results[0], "status": "installed" if installed else "already-current",
+                "settings_files": [result["settings"] for result in results]}
     if host == "antigravity":
-        from . import ag_inbox, ag_wake
+        from . import ag_inbox, ag_sidecar, ag_wake
         result = ag_inbox.install(cfg, project)
+        result["wake_sidecar"] = ag_sidecar.install(cfg, project)
         try:
             result["accessibility_helper"] = str(ag_wake.install_helper(cfg))
             result["helper_status"] = "installed"
@@ -95,12 +97,11 @@ def install_native(project, host, cfg):
 
 
 def _mailbox(args, host, cfg):
-    from .store import Store
     invocation = _native_invocation(host, args.project)
     project = cfg.resolve(invocation.workspace, args.project)
     if project != invocation.project:
         raise ValueError("Native workspace and project selection disagree")
-    store = Store(cfg.database)
+    store = config.open_store(cfg)
     roles = store.roles(project, host)
     role = next((name for name in ("coordinator", "inbox") if roles[name] == invocation.session), None)
     if role is None:
@@ -109,32 +110,53 @@ def _mailbox(args, host, cfg):
         result = {"project": project, "harness": host, "role": role, "session": invocation.session,
                   "roles": roles, "queue": store.status(project, host)}
     elif args.mailbox == "claim":
-        message = store.claim(project, host, role, invocation.session)
-        if message:
-            lease_dir = cfg.root / "leases"
-            lease_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            lease_path = lease_dir / (hashlib.sha256("\0".join((project,host,role,invocation.session,message["id"])).encode()).hexdigest() + ".json")
-            config.atomic_json(lease_path, {"id": message["id"], "lease": message["lease"], "expires": time.time()+30})
-            message.pop("lease", None)
+        message = store.claim(project, host, role, invocation.session, message_id=args.message_id)
         result = {"project": project, "harness": host, "role": role, "message": message}
     elif args.mailbox == "finish":
         if not args.message_id:
             raise ValueError("--message-id is required for finish")
-        lease_dir = cfg.root / "leases"
-        path = lease_dir / (hashlib.sha256("\0".join((project,host,role,invocation.session,args.message_id)).encode()).hexdigest() + ".json")
-        record = json.loads(path.read_text())
-        finished = store.finish(project, host, role, invocation.session, args.message_id, record["lease"])
-        if finished:
-            path.unlink(missing_ok=True)
+        lease = args.lease
+        previous_claim = None
+        if lease is None:
+            # A claim made before the upgrade may still have an active cached lease.
+            scope = "\0".join((project, host, role, invocation.session, args.message_id))
+            previous_claim = cfg.root / "leases" / (hashlib.sha256(scope.encode()).hexdigest() + ".json")
+            try:
+                lease = json.loads(previous_claim.read_text())["lease"]
+            except FileNotFoundError:
+                raise ValueError("--lease from the claim result is required for finish") from None
+        finished = store.finish(project, host, role, invocation.session, args.message_id, lease)
+        if finished and previous_claim is not None:
+            previous_claim.unlink(missing_ok=True)
         result = {"project": project, "role": role, "message_id": args.message_id, "finished": finished}
-    elif args.mailbox == "send":
-        if not args.recipient or args.body is None:
-            raise ValueError("--recipient and --body are required for send")
-        if not args.key:
-            raise ValueError("--key is required so retries are idempotent")
-        result = {"project": project, "id": store.send(project, host, args.recipient, args.body,
-                                                           args.key, reply_to=args.reply_to,
-                                                           session=invocation.session)["id"]}
+    elif args.mailbox in {"send", "send-fanout", "reply"}:
+        if role != "coordinator":
+            raise PermissionError("Coordinator ownership is required for sending and replying")
+        body = args.body
+        if args.body_file == "-":
+            body = sys.stdin.buffer.read().decode("utf-8")
+        elif args.body_file is not None:
+            body = Path(args.body_file).read_bytes().decode("utf-8")
+        if body is None or not args.key:
+            raise ValueError("A message body and a stable --key are required")
+        recipients = args.recipient or []
+        if args.mailbox == "send":
+            if len(recipients) != 1:
+                raise ValueError("send takes exactly one --recipient")
+            message = store.send(project, host, recipients[0], body, args.key,
+                                 reply_to=args.reply_to, session=invocation.session)
+            result = {"id": message["id"]}
+        elif args.mailbox == "send-fanout":
+            if not recipients or args.reply_to is not None:
+                raise ValueError("send-fanout requires --recipient for each destination")
+            result = store.send_fanout(project, host, recipients, body, args.key,
+                                       session=invocation.session)
+        else:
+            if recipients or not args.reply_to:
+                raise ValueError("reply requires only --reply-to to identify the original delivery")
+            result = store.reply_free_text(project, host, args.reply_to, body, args.key,
+                                          session=invocation.session)
+        result = {"project": project, **result}
     elif args.mailbox in {"stop", "resume"}:
         enabled = args.mailbox == "resume"
         store.set_enabled(project, host, enabled, session=invocation.session)
@@ -153,10 +175,13 @@ def main(argv=None):
     parser.add_argument("--install-native", action="store_true", help="Install supported host-local hook/helper")
     parser.add_argument("--take", choices=("coordinator", "bridge"), help="Transfer the current verified native chat to this role")
     parser.add_argument("--hint", help="Disambiguate a project matching the current native workspace")
-    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
+    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
     parser.add_argument("--message-id")
-    parser.add_argument("--recipient")
-    parser.add_argument("--body")
+    parser.add_argument("--lease", help="Exact lease returned by the claim being finished")
+    parser.add_argument("--recipient", action="append", help="Destination harness, repeat for send-fanout")
+    body = parser.add_mutually_exclusive_group()
+    body.add_argument("--body")
+    body.add_argument("--body-file", help="Read the message as UTF-8, or use - for standard input")
     parser.add_argument("--key")
     parser.add_argument("--reply-to")
     args = parser.parse_args(argv)
@@ -195,10 +220,10 @@ def main(argv=None):
                 raise ValueError(f"Use this project's native {host} MCP role tools for the takeover")
             if cfg.resolve(invocation.workspace, args.project or args.hint) != invocation.project:
                 raise ValueError("Native workspace does not match project selection")
-            from .store import Store
-            outcome = role_adapters.bind(Store(cfg.database), invocation)
+            store = config.open_store(cfg)
+            outcome = role_adapters.bind(store, invocation)
             if role == "coordinator":
-                outcome["pending"] = Store(cfg.database).pending(invocation.project, host, role, invocation.session)
+                outcome["pending"] = store.pending(invocation.project, host, role, invocation.session)
             outcome["title"] = role_adapters.apply_native_title(invocation)
             print(json.dumps(outcome, indent=2))
             return

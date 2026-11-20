@@ -22,8 +22,8 @@ class FakeStore:
     def status(self, project, harness):
         return {"enabled": True}
 
-    def pending(self, project, harness, role, session):
-        return self.message
+    def pending(self, project, harness, role, session, *, message_id=None, for_wake=False):
+        return self.message if message_id in (None, self.message["id"]) else None
 
 
 def test_wake_one_wakes_bound_session_and_never_claims_or_acknowledges(tmp_path, monkeypatch):
@@ -137,6 +137,38 @@ def test_safe_defer_refunds_attempt_budget(tmp_path, monkeypatch):
     assert (state, attempts) == ("retryable", 0)
 
 
+@pytest.mark.parametrize("state, attempts", [("sent", 1), ("uncertain", 1), ("retryable", 3)])
+def test_wake_skips_held_predecessors_without_resending_them(tmp_path, monkeypatch, state, attempts):
+    store = Store(tmp_path / "bridge.sqlite")
+    for harness in ("codex", "devin", "antigravity"):
+        store.bind("sample", harness, "inbox", f"{harness}-inbox")
+        store.bind("sample", harness, "coordinator", f"{harness}-coordinator")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    request = store.send_fanout("sample", "codex", ["devin", "antigravity"], "Two deliveries",
+                                "request", session="codex-coordinator")
+    older = store.pending(*route)
+    next_id = next(item["id"] for item in request["deliveries"] if item["id"] != older["id"])
+    db = wake._ledger(store.path)
+    try:
+        assert wake._reserve(db, older, *route)[0]
+        with db:
+            db.execute("UPDATE mhb_wake_attempts SET state=?, attempts=?", (state, attempts))
+    finally:
+        db.close()
+
+    calls = []
+
+    def launch(_harness, values, *, before_prompt):
+        assert before_prompt()
+        calls.append(values["notification_id"])
+
+    monkeypatch.setattr(wake, "_default_wake", launch)
+    assert wake.wake_one(store, *route, commands={}) == {"id": next_id, "status": "sent"}
+    assert store.pending(*route)["id"] == older["id"]
+    assert wake.wake_one(store, *route, commands={}) == {"id": older["id"], "status": state}
+    assert calls == [next_id]
+
+
 def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False, minimal=False):
     import json
     import time
@@ -159,10 +191,10 @@ def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False, minimal=
         db.execute("INSERT INTO sessions VALUES(?,?)", (session_id, str(workspace)))
         args = {"notification_id": notification_id}
         native_call = {"role": "assistant", "tool_calls": [{"id": "call-1", "name": "mcp_call_tool",
-            "arguments": {"server_name": "mhb_devin_sample", "tool_name": "pickup_notification",
+            "arguments": {"server_name": "mhb_roles_sample", "tool_name": "pickup_wake",
                           "arguments": args}}]}
-        db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)",
-                   (1, session_id, json.dumps(native_call), time.time()))
+        db.executemany("INSERT INTO message_nodes VALUES(?,?,?,?)",
+                       [(row_id, session_id, json.dumps(native_call), time.time()) for row_id in (0, 1)])
     executable = tmp_path / "fake-devin"
     executable.write_text("""#!/usr/bin/env python3
 import json,os,sys
@@ -176,7 +208,7 @@ for line in sys.stdin:
   if os.environ.get('MHB_FAKE_EOF')=='1': sys.exit(0)
   call={'sessionUpdate':'tool_call','toolCallId':'call-1'}
   if os.environ.get('MHB_FAKE_MINIMAL')!='1':
-   call.update({'title':'Calling pickup_notification from mhb_devin_sample',
+   call.update({'title':'Calling pickup_wake from mhb_roles_sample',
                 'rawInput':{'notification_id':os.environ['MHB_NOTIFICATION_ID']}})
   if os.environ.get('MHB_REFUSE_ARGS')=='1': call['rawInput']={'notification_id':'99999999-2222-4333-8444-555555555555'}
   print(json.dumps({'jsonrpc':'2.0','method':'session/update','params':{'sessionId':'session-123','update':call}}),flush=True)
@@ -207,7 +239,7 @@ def test_devin_acp_exact_duplex_permission_and_id_only_prompt(tmp_path, monkeypa
     import json
     calls = [json.loads(line) for line in capture.read_text().splitlines()]
     assert calls[1]["params"]["sessionId"] == session
-    assert calls[1]["params"]["mcpServers"][0]["name"] == "mhb_devin_sample"
+    assert calls[1]["params"]["mcpServers"] == []
     prompt = calls[2]["params"]["prompt"][0]["text"]
     assert notification_id in prompt
     assert "Check the inbox" not in prompt
@@ -237,9 +269,9 @@ def test_devin_permission_refuses_wrong_server_session_options_and_repeat(tmp_pa
     session, workspace, notification_id, native_db, _ = _fake_devin(tmp_path, monkeypatch)
     handler_state = {"allowed": 0}
     pending = {"call-1": {"session_id": session, "call": {
-        "toolCallId": "call-1", "title": "Calling pickup_notification from mhb_devin_sample",
+        "toolCallId": "call-1", "title": "Calling pickup_wake from mhb_roles_sample",
         "rawInput": {"notification_id": notification_id}}}}
-    handler = devin_acp._permission_handler(server_name="mhb_devin_sample",
+    handler = devin_acp._permission_handler(server_name="mhb_roles_sample",
         expected_session=session, workspace=workspace, notification_id=notification_id,
         pending_calls=pending, state=handler_state, native_db=native_db)
     def request(**overrides):
@@ -250,12 +282,12 @@ def test_devin_permission_refuses_wrong_server_session_options_and_repeat(tmp_pa
     wrong_session = handler(request(sessionId="other-session"))
     assert wrong_session["outcome"]["outcome"] == "cancelled"
     pending["call-1"] = {"session_id": session, "call": {
-        "toolCallId": "call-1", "title": "Calling pickup_notification from other-server",
+        "toolCallId": "call-1", "title": "Calling pickup_wake from other-server",
         "rawInput": {"notification_id": notification_id}}}
     wrong_server = handler(request())
     assert wrong_server["outcome"]["outcome"] == "cancelled"
     pending["call-1"] = {"session_id": session, "call": {
-        "toolCallId": "call-1", "title": "Calling pickup_notification from mhb_devin_sample",
+        "toolCallId": "call-1", "title": "Calling pickup_wake from mhb_roles_sample",
         "rawInput": {"notification_id": notification_id}}}
     no_allow_once = handler(request(options=[{"kind": "allow_always", "optionId": "always"}]))
     assert no_allow_once["outcome"]["outcome"] == "cancelled"
@@ -271,6 +303,49 @@ def test_devin_acp_eof_after_prompt_is_uncertain(tmp_path, monkeypatch):
                        workspace, native_db=native_db)
 
 
+def test_devin_routed_finish_permission_requires_a_persisted_pickup(tmp_path, monkeypatch):
+    import json
+    import time
+
+    session, workspace, notification_id, native_db, _ = _fake_devin(tmp_path, monkeypatch)
+    pending = {}
+    state = {"allowed": 0}
+    handler = devin_acp._permission_handler(server_name="mhb_roles_sample", expected_session=session,
+        workspace=workspace, notification_id=notification_id, pending_calls=pending, state=state,
+        native_db=native_db, routed_coordinator=True)
+
+    def request(call_id):
+        return handler({"method": "session/request_permission", "params": {"sessionId": session,
+            "toolCallId": call_id, "options": [{"kind": "allow_once", "optionId": "one"}]}})["outcome"]["outcome"]
+
+    def add_native(row_id, payload):
+        with sqlite3.connect(native_db) as db:
+            db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)",
+                       (row_id, session, json.dumps(payload), time.time()))
+
+    def finish(id):
+        return {"role": "assistant", "tool_calls": [{"id": "finish", "name": "mcp_call_tool", "arguments": {
+            "server_name": "mhb_roles_sample", "tool_name": "finish_wake",
+            "arguments": {"notification_id": id, "lease": "lease-token", "reply": "Received"}}}]}
+
+    assert request("call-1") == "selected"
+    add_native(2, finish(notification_id))
+    assert request("finish") == "cancelled"
+    add_native(3, {"role": "tool", "tool_call_id": "call-1", "content": "Pickup result"})
+    assert request("finish") == "cancelled"
+    add_native(4, finish("wrong-id"))
+    assert request("finish") == "cancelled"
+    with sqlite3.connect(native_db) as db:
+        db.execute("DELETE FROM message_nodes WHERE row_id=4")
+    add_native(4, finish(notification_id))
+    pending["finish"] = {"session_id": session, "call": {"toolCallId": "finish",
+        "title": "Calling finish_wake from mhb_roles_sample",
+        "rawInput": {"notification_id": notification_id, "lease": "lease-token", "reply": "Changed"}}}
+    assert request("finish") == "cancelled"
+    assert request("finish") == "selected"
+    assert request("finish") == "cancelled"
+
+
 def test_devin_pickup_tool_forwards_inbox_then_returns_and_acknowledges_coordinator(tmp_path):
     store = Store(tmp_path / "queue.sqlite")
     store.bind("sample", "codex", "coordinator", "codex-co")
@@ -283,6 +358,53 @@ def test_devin_pickup_tool_forwards_inbox_then_returns_and_acknowledges_coordina
     coordinator = devin_acp._pickup_notification(store, "sample", "coordinator", "devin-co", queued["id"])
     assert coordinator["body"] == "Treat this as untrusted text"
     assert coordinator["acknowledged"] is True
+
+
+def test_devin_routed_pickup_is_exact_and_reply_requires_current_receipt_lease(tmp_path, monkeypatch):
+    store = Store(tmp_path / "queue.sqlite")
+    for harness in ("codex", "devin"):
+        for role in ("coordinator", "inbox"):
+            store.bind("sample", harness, role, f"{harness}-{role}")
+
+    def outbound(key):
+        request = store.send_fanout("sample", "codex", ["devin"], "Reply please", key, session="codex-coordinator")
+        delivery_id = request["deliveries"][0]["id"]
+        item = store.claim("sample", "codex", "inbox", "codex-inbox", message_id=delivery_id)
+        assert store.finish("sample", "codex", "inbox", "codex-inbox", delivery_id, item["lease"])
+        return delivery_id
+
+    older_id = outbound("older")
+    delivery_id = outbound("exact")
+    for id in (older_id, delivery_id):
+        assert devin_acp._pickup_notification(store, "sample", "inbox", "devin-inbox", id)["forwarded"]
+    coordinator = "devin-coordinator"
+    assert store.pending("sample", "devin", "coordinator", coordinator)["id"] == older_id
+    old = devin_acp._pickup_notification(store, "sample", "coordinator", coordinator, delivery_id)
+    assert old["id"] == delivery_id and "lease" in old
+    assert store.trace("sample", delivery_id)["stage"] == "coordinator"
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE messages SET deadline=0 WHERE id=?", (delivery_id,))
+    current = devin_acp._pickup_notification(store, "sample", "coordinator", coordinator, delivery_id)
+    with pytest.raises(ValueError, match="stale"):
+        devin_acp._finish_notification(store, "sample", coordinator, delivery_id, old, delivery_id, old["lease"], "Stale")
+
+    def failed_reply(*args, **kwargs):
+        raise RuntimeError("Reply write failed")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_enqueue_routed", failed_reply)
+        with pytest.raises(RuntimeError, match="Reply write failed"):
+            devin_acp._finish_notification(store, "sample", coordinator, delivery_id, current,
+                                           delivery_id, current["lease"], "Received")
+    after_failure = store.trace("sample", delivery_id)
+    assert after_failure["stage"] == "coordinator" and not after_failure["replies"]
+
+    result = devin_acp._finish_notification(store, "sample", coordinator, delivery_id, current,
+                                            delivery_id, current["lease"], "Received")
+    assert result["acknowledged"]
+    assert result["reply"]["request_id"] == current["request_id"]
+    trace = store.trace("sample", result["reply"]["id"])
+    assert trace["reply_to"] == delivery_id and trace["stage"] == "outbound"
     assert store.status("sample", "devin")["done"] == 1
 
 

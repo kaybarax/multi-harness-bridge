@@ -5,6 +5,7 @@ The common operation never accepts a target session ID from a skill/tool input.
 """
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
 import json
 import hashlib
@@ -13,9 +14,10 @@ from pathlib import Path
 import re
 import sqlite3
 import select
+import shlex
 import shutil
 import subprocess
-import time
+import sys
 import time
 import uuid
 
@@ -260,9 +262,8 @@ def claude_invocation(role, hook_context, *, project_hint=None, cwd=None, expect
     return Invocation(project, "claude", session, role or "", workspace, _parse(prompt, role), "claude-user-prompt-submit")
 
 
-def claude_hook_main():
+def claude_hook_main(state_home=None):
     """Claude UserPromptSubmit hook: persist short-lived native caller context."""
-    import sys
     try:
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict) or payload.get("hook_event_name") != "UserPromptSubmit":
@@ -272,8 +273,14 @@ def claude_hook_main():
         # the same transcript/session before using this short-lived context.
         if not _native_claude_hook_payload(payload):
             return 0
+        cfg = config.load(state_home)
+        if state_home is not None:
+            try:
+                cfg.resolve(payload["cwd"])
+            except ValueError:
+                return 0
         identity = hashlib.sha256(payload["session_id"].encode("utf-8")).hexdigest()[:32]
-        path = config.home() / "native-context" / f"claude-{identity}.json"
+        path = cfg.root / "native-context" / f"claude-{identity}.json"
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         config.atomic_json(path, {**payload, "captured_at": time.time()})
         os.chmod(path, 0o600)
@@ -306,7 +313,37 @@ def _native_claude_hook_payload(payload):
         return False
 
 
-def install_claude_hook(workspace: Path):
+def claude_hook_cli(argv=None):
+    parser = argparse.ArgumentParser(description=claude_hook_main.__doc__)
+    parser.add_argument("--home", type=Path)
+    return claude_hook_main(parser.parse_args(argv).home)
+
+
+def _claude_hook_entry(command):
+    return {"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 5}]}
+
+
+def _is_previous_claude_hook(entry, state_home):
+    if not isinstance(entry, dict):
+        return False
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list) or len(hooks) != 1 or not isinstance(hooks[0], dict):
+        return False
+    command = hooks[0].get("command")
+    if not isinstance(command, str) or entry != _claude_hook_entry(command):
+        return False
+    try:
+        argv = [item.strip('"') for item in shlex.split(command, posix=os.name != "nt")]
+    except ValueError:
+        return False
+    name = "multi-harness-claude-hook" + (".exe" if os.name == "nt" else "")
+    if not argv or Path(argv[0]).name != name:
+        return False
+    return len(argv) == 1 or (len(argv) == 3 and argv[1] == "--home"
+                              and Path(argv[2]).resolve() == state_home)
+
+
+def install_claude_hook(workspace: Path, *, state_home=None):
     """Register the native context hook in project-local Claude settings."""
     settings = workspace / ".claude" / "settings.local.json"
     settings.parent.mkdir(parents=True, exist_ok=True)
@@ -322,11 +359,17 @@ def install_claude_hook(workspace: Path):
     events = hooks.setdefault("UserPromptSubmit", [])
     if not isinstance(events, list):
         raise ValueError("Claude UserPromptSubmit hooks must be a list")
-    command = shutil.which("multi-harness-claude-hook") or "multi-harness-claude-hook"
-    desired = {"matcher": "*", "hooks": [{"type": "command", "command": command, "timeout": 5}]}
-    current = desired in events
+    state_home = config.load(state_home).root
+    name = "multi-harness-claude-hook" + (".exe" if os.name == "nt" else "")
+    executable = Path(sys.executable).with_name(name)
+    argv = [str(executable), "--home", str(state_home)]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    desired = _claude_hook_entry(command)
+    replacements = [event for event in events if not _is_previous_claude_hook(event, state_home)]
+    replacements.append(desired)
+    current = events == replacements
     if not current:
-        events.append(desired)
+        hooks["UserPromptSubmit"] = replacements
         config.atomic_json(settings, data)
     return {"host": "claude", "status": "already-current" if current else "installed",
             "settings": str(settings)}

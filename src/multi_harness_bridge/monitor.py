@@ -9,15 +9,14 @@ def subscribe(config, store, project, harness, role, session, *, output, interva
     if interval <= 0 or interval > 5:
         raise ValueError("Monitor interval must be greater than zero and at most five seconds")
     config.resolve(Path.cwd(), project)
-    last = None
+    seen = set()
     while True:
         if store.roles(project, harness).get(role) != session or not store.status(project, harness)["enabled"]:
             return
-        item = store.pending(project, harness, role, session)
-        if item:
-            marker = (item["id"], item["attempt"])
-            if marker != last:
-                line = {"project": project, "harness": harness, "role": role, "session": session, "id": item["id"]}
+        available = store.pending_notifications(project, harness, role, session)
+        for message_id, attempt in available:
+            if (message_id, attempt) not in seen:
+                line = {"project": project, "harness": harness, "role": role, "session": session, "id": message_id}
                 print(json.dumps(line), file=output, flush=True)
-                last = marker
+        seen = set(available)
         wait(interval)

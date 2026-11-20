@@ -115,3 +115,12 @@ def register(name, paths, root=None):
         atomic_json(directory / "projects.json", {"version": 1, "projects": {
             k: [str(v) for v in values] for k, values in sorted(projects.items())}})
     return load(directory)
+
+
+def open_store(cfg):
+    """Open the configured queue and use live legacy bindings when declared."""
+    from . import legacy
+    from .store import Store
+
+    provider = legacy.load(cfg)
+    return Store(cfg.database, **({"bindings_provider": provider} if provider else {}))

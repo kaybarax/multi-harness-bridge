@@ -34,6 +34,8 @@ To shut down service processes, stop the Telegram consumer and native wake monit
 4. For a possible external submission, match a native receipt or provider message ID before recovery. A lost HTTP response can follow a successful Telegram send. Blindly repeating it can duplicate the message.
 5. Confirm the return path, the exact reply reference and the final recipient acknowledgement. Record which step was observed when reporting a failure.
 
+For Antigravity, keep the App event, committed native turn, mailbox receipt, and correlated reply as separate evidence. A provider quota error can leave a committed turn at the Inbox or Coordinator stage. Record the precise reset time and preserve the wake history, leases, and original delivery IDs while waiting. See the [Antigravity recovery procedure](antigravity.md#verify-delivery-and-recover-a-held-notice).
+
 When the final recipient is a person, complete the machine delivery once the provider receipt has been persisted. A reply hours later creates a new, correlated message. A human response time never determines a queue lease duration.
 
 ## State, upgrades and moving machines

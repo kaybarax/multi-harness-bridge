@@ -15,9 +15,11 @@ Register `mhb` as the MCP executable with arguments `["mcp","--credential","<abs
 | MCP tool | Operation |
 |---|---|
 | `bridge_status` | Inspect the bound route and queue counts |
-| `receive_message` | Claim one delivery for this role; an empty inbox returns a null message |
+| `receive_message` | Claim one delivery for this role, optionally by exact notification ID |
 | `finish_message` | Submit the message ID and current lease to forward or acknowledge |
 | `send_message` | Coordinator sends to a recipient harness in its project; optional `reply_to` is a bridge ID |
+| `send_fanout` | Coordinator sends one free-text request to `recipients` using `body` and `key`. Returns `request_id` and the per-recipient delivery IDs. |
+| `reply_free_text` | Recipient Coordinator sends a correlated `body` using `reply_to` and `key`. Returns the original `request_id` and the reply ID. |
 | `set_pickup` | Coordinator stops or resumes this harness in its project |
 
 A daemon checks the current role when using a token. Rotation invalidates the former session's access. Keep credential files private, including in backups. To revoke one, use `mhb credential revoke --file <private-token-file>`. Local queue and credential files are trusted to the logged-in OS user. Use that user's filesystem protections if sharing the computer. On Windows keep state and credential files in a user-private directory with suitable NTFS permissions.
@@ -41,7 +43,7 @@ Install the `a2a` extra and start `mhb serve`. Discovery is at `http://127.0.0.1
 }
 ```
 
-The result's message text contains the bridge response as JSON. Check HTTP status, JSON-RPC errors and the returned text's `error` field. Allowed commands are `status`, `send`, `claim`, `finish`, `stop` and `resume`. A retry of the same logical send must reuse its bridge key. The JSON-RPC request ID identifies the RPC exchange. The A2A message ID identifies its transport envelope. Only the bridge message ID belongs in a later bridge `reply_to`.
+The result's message text contains the bridge response as JSON. Check HTTP status, JSON-RPC errors and the returned text's `error` field. Allowed commands are `status`, `send`, `send_fanout`, `reply_free_text`, `claim`, `finish`, `stop` and `resume`. The command fields for `send_fanout` and `reply_free_text` match the MCP tool arguments. A retry of the same logical send must reuse its bridge key. Use the per-recipient bridge delivery ID in `reply_to`. The JSON-RPC request ID identifies the RPC exchange. The A2A message ID identifies its transport envelope.
 
 ## Trust and external effects
 

@@ -13,40 +13,43 @@ import time
 from contextlib import closing
 
 from . import config
-from .store import Store
 
 
 def server_name(project):
     return "mhb_roles_" + config.identifier(project)
 
 
+def installation_entry(cfg, project, *, executable=None):
+    return {"command": str(executable or sys.executable),
+            "args": ["-m", "multi_harness_bridge.devin_tools", "--home", str(cfg.root), project, "serve-roles"]}
+
+
 def install(cfg=None, project=None):
     cfg = cfg or config.load()
     project = cfg.require(project)
-    root = cfg.projects[project][0]
-    directory = root / ".devin"
-    directory.mkdir(parents=True, exist_ok=True)
-    manifest = directory / "mcp_config.local.json"
-    try:
-        value = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
-    except json.JSONDecodeError as exc:
-        raise ValueError("Devin local MCP manifest is invalid JSON; preserving it") from exc
-    if not isinstance(value, dict):
-        raise ValueError("Devin local MCP manifest must be a JSON object")
-    servers = value.setdefault("mcpServers", {})
-    if not isinstance(servers, dict):
-        raise ValueError("Devin mcpServers must be a JSON object")
     name = server_name(project)
-    entry = {"command": sys.executable,
-             "args": ["-m", "multi_harness_bridge.devin_tools", "--home", str(cfg.root), project, "serve-roles"]}
-    existing = servers.get(name)
-    if existing not in (None, entry):
-        raise ValueError(f"Conflicting Devin MCP entry for {name}; preserving existing configuration")
-    if existing == entry:
-        return {"host": "devin", "status": "already-current", "server": name, "config": str(manifest)}
-    servers[name] = entry
-    config.atomic_json(manifest, value)
-    return {"host": "devin", "status": "installed", "server": name, "config": str(manifest)}
+    entry = installation_entry(cfg, project)
+    paths = [root / ".devin/mcp_config.local.json" for root in cfg.projects[project]]
+    changes = {}
+    with config.registry_writer(cfg.root):
+        for path in paths:
+            try:
+                value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid Devin MCP JSON in {path}") from exc
+            if not isinstance(value, dict) or not isinstance(value.setdefault("mcpServers", {}), dict):
+                raise ValueError(f"Invalid Devin MCP configuration in {path}")
+            servers = value["mcpServers"]
+            if name in servers and servers[name] != entry:
+                raise ValueError(f"Conflicting Devin MCP entry for {name} in {path}")
+            if name not in servers:
+                servers[name] = entry
+                changes[path] = value
+        for path, value in changes.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            config.atomic_json(path, value)
+    return {"host": "devin", "status": "installed" if changes else "already-current", "server": name,
+            "config": str(paths[0]), "configs": [str(path) for path in paths]}
 
 
 def _native_db():
@@ -76,11 +79,17 @@ def _devin_user_command(message):
     if any(not isinstance(block, dict) or block.get("type") != "text"
            or not isinstance(block.get("text"), str) for block in blocks):
         return ""
-    return "".join(block["text"] for block in blocks)
+    command = "".join(block["text"] for block in blocks).lstrip()
+    namespace, separator, skill = command.partition(":")
+    if separator and namespace in {"/devin", "/agents"}:
+        return "/" + skill
+    return command
 
 
 def _native_call(project, tool, expected_args=None, *, role_command=None, freshness=180):
     """Resolve exactly one fresh, uncompleted native ACP call for this server."""
+    from .devin_acp import _native_message_time
+
     db_path = _native_db()
     cutoff = time.time() - freshness
     try:
@@ -89,7 +98,7 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             if not {"sessions", "message_nodes"} <= tables:
                 raise ValueError("Unsupported Devin native session database")
-            rows = db.execute("SELECT session_id,row_id,chat_message FROM message_nodes WHERE created_at>=? ORDER BY row_id ASC", (cutoff,)).fetchall()
+            rows = db.execute("SELECT session_id,row_id,chat_message,created_at FROM message_nodes WHERE created_at>=? ORDER BY row_id ASC", (cutoff,)).fetchall()
             sessions = {row["id"]: row for row in db.execute("SELECT id,working_directory,workspace_dirs,title FROM sessions WHERE hidden=0")}
     except sqlite3.Error as exc:
         raise ValueError(f"Devin native ACP evidence unavailable ({type(exc).__name__})") from None
@@ -100,15 +109,17 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(message, dict):
-            by_session.setdefault(row["session_id"], []).append((row["row_id"], message))
+            at = _native_message_time(message, row["created_at"])
+            by_session.setdefault(row["session_id"], []).append((row["row_id"], at, message))
     expected_server = server_name(project)
-    matches = []
+    matches = {}
+    conflicts = set()
     for sid, messages in by_session.items():
         session = sessions.get(sid)
         if not session:
             continue
-        completed = {item.get("tool_call_id") for _, item in messages if item.get("role") == "tool"}
-        for index, (row_id, message) in enumerate(messages):
+        completed = {item.get("tool_call_id") for _, _, item in messages if item.get("role") == "tool"}
+        for index, (row_id, _, message) in enumerate(messages):
             if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
                 continue
             for call in message["tool_calls"]:
@@ -122,11 +133,9 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                 actual = args.get("arguments") or {}
                 if not isinstance(actual, dict):
                     continue
-                expected = expected_args or {}
-                if any(actual.get(key) != value for key, value in expected.items()):
-                    continue
-                prior = [item for prior_id, item in messages[:index] if prior_id < row_id]
-                user = next((_devin_user_command(item) for item in reversed(prior) if item.get("role") == "user"), None)
+                user_turn = next(((at, _devin_user_command(item)) for prior_id, at, item in reversed(messages[:index])
+                                  if prior_id < row_id and item.get("role") == "user"), (None, None))
+                user_at, user = user_turn
                 if role_command:
                     from .role_adapters import _parse
                     try:
@@ -135,19 +144,26 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                         continue
                 else:
                     title = None
-                workspace = Path(session["working_directory"]).expanduser().resolve(strict=True)
                 try:
+                    workspace = Path(session["working_directory"]).expanduser().resolve(strict=True)
                     if config.load().resolve(workspace) != project:
                         continue
-                except ValueError:
+                except (OSError, ValueError):
                     continue
                 session_id = sid if sid.startswith("acp/devin-cli/") else f"acp/devin-cli/{sid}"
-                matches.append({"session": session_id, "workspace": workspace, "title": title,
-                                "actual_args": actual, "call_id": call_id})
+                key = (session_id, call_id)
+                candidate = {"session": session_id, "workspace": workspace, "title": title,
+                             "actual_args": actual, "call_id": call_id, "user_prompt": user, "user_at": user_at}
+                if key in matches and matches[key] != candidate:
+                    conflicts.add(key)
+                matches[key] = candidate
     # A matching call must be unique across all fresh native sessions.
-    if len(matches) != 1:
+    expected = expected_args or {}
+    candidates = [match for key, match in matches.items() if key not in conflicts
+                  and all(match["actual_args"].get(name) == value for name, value in expected.items())]
+    if len(candidates) != 1:
         raise PermissionError("Devin tool call did not resolve to one fresh native caller")
-    return matches[0]
+    return candidates[0]
 
 
 def make_role_server(cfg, project):
@@ -157,11 +173,16 @@ def make_role_server(cfg, project):
         "Takeover requires an exact direct user request, prepare_role_handoff, then the matching take tool in the same turn."
     ))
     cfg.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    store = Store(cfg.database)
+    store = config.open_store(cfg)
     role_values = {"coordinator": "coordinator", "bridge": "inbox"}
 
     def current(tool, args=None):
-        return _native_call(project, tool, args)
+        from .devin_acp import WAKE_PREFIX, FINISH_TOOL, PICKUP_TOOL
+
+        call = _native_call(project, tool, args)
+        if (call["user_prompt"] or "").startswith(WAKE_PREFIX) and tool not in {PICKUP_TOOL, FINISH_TOOL}:
+            raise PermissionError("This native wake is scoped to its notification tools")
+        return call
 
     @server.tool()
     def prepare_role_handoff() -> dict:
@@ -247,6 +268,35 @@ def make_role_server(cfg, project):
         return {"message":item}
 
     @server.tool()
+    def pickup_wake(notification_id: str) -> dict:
+        """Pick up only the exact notification in the current automatic native wake."""
+        from . import devin_acp
+
+        call = current(devin_acp.PICKUP_TOOL, {"notification_id": notification_id})
+        if set(call["actual_args"]) != {"notification_id"}:
+            raise PermissionError("Wake pickup must match the exact native tool inputs")
+        role, _, _ = devin_acp.active_wake(store, project, server_name(project), call, notification_id)
+        return devin_acp._pickup_notification(store, project, role, call["session"], notification_id)
+
+    @server.tool()
+    def finish_wake(notification_id: str, lease: str, reply: str | None = None) -> dict:
+        """Complete the exact automatic notification with its pickup lease and optional text reply."""
+        from . import devin_acp
+
+        args = {"notification_id": notification_id, "lease": lease, "reply": reply}
+        call = current(devin_acp.FINISH_TOOL, args)
+        if set(call["actual_args"]) - set(args):
+            raise PermissionError("Wake finish must match the exact native tool inputs")
+        name = server_name(project)
+        role, started, prompt = devin_acp.active_wake(store, project, name, call, notification_id)
+        if role != "coordinator":
+            raise PermissionError("Only the woken coordinator can complete this notification")
+        observed = devin_acp._native_completion(call["session"], call["workspace"], name, prompt,
+                                                notification_id, started, _native_db())
+        return devin_acp._finish_notification(store, project, call["session"], notification_id,
+                                              observed.get(devin_acp.PICKUP_TOOL), notification_id, lease, reply)
+
+    @server.tool()
     def acknowledge(id: str, lease: str) -> dict:
         call=current("acknowledge",{"id":id,"lease":lease})
         role=next((r for r,v in store.roles(project,"devin").items() if v==call["session"]),None)
@@ -259,6 +309,20 @@ def make_role_server(cfg, project):
         if reply_to is not None:args["reply_to"]=reply_to
         call=current("send_message",args)
         return store.send(project,"devin",recipient,body,key,reply_to=reply_to,session=call["session"])
+
+    @server.tool()
+    def send_fanout(recipients: list[str], body: str, key: str) -> dict:
+        """Send one free-text request to all named peer harnesses in this project. Reuse the key on retry."""
+        args = {"recipients": recipients, "body": body, "key": key}
+        call = current("send_fanout", args)
+        return store.send_fanout(project, "devin", recipients, body, key, session=call["session"])
+
+    @server.tool()
+    def reply_free_text(reply_to: str, body: str, key: str) -> dict:
+        """Send a correlated reply to a received request. Use its delivery ID and reuse the reply key on retry."""
+        args = {"reply_to": reply_to, "body": body, "key": key}
+        call = current("reply_free_text", args)
+        return store.reply_free_text(project, "devin", reply_to, body, key, session=call["session"])
 
     @server.tool()
     def set_pickup(enabled: bool) -> dict:

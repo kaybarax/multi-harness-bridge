@@ -1,8 +1,4 @@
-"""Verified macOS Antigravity Desktop role checks, wakes, and title changes.
-
-The helper sends only a fixed mailbox wake notice containing the notification ID.
-It never reads or submits mailbox content, claims work, or acknowledges it.
-"""
+"""Antigravity Desktop role checks, passive wakes, and explicit title changes."""
 from __future__ import annotations
 
 import argparse
@@ -21,7 +17,6 @@ import time
 import uuid
 
 from . import config
-from .store import Store
 
 HARNESS = "antigravity"
 SUMMARY_DB = Path.home() / ".gemini" / "antigravity" / "conversation_summaries.db"
@@ -147,7 +142,7 @@ def _native_role_snapshot(cfg=None, *, summary_db=None):
     """Validate native role bindings and collision-free project identity mappings."""
     cfg = cfg or config.load()
     project_ids = _project_ids(cfg, summary_db)
-    store = Store(cfg.database)
+    store = config.open_store(cfg)
     snapshot = {}
     seen = set()
     for project in sorted(cfg.projects):
@@ -174,9 +169,9 @@ def _native_role_snapshot(cfg=None, *, summary_db=None):
 
 
 def _write_ax_context(directory, *, project, action, role=None, session=None,
-                      title=None, notification_id=None, cfg=None, summary_db=None):
+                      title=None, cfg=None, summary_db=None):
     """Write short-lived owner-only role context consumed by the native helper."""
-    if action not in {"verify-bindings", "wake", "rename-project"}:
+    if action not in {"verify-bindings", "rename-project"}:
         raise ValueError("Unsupported Antigravity Accessibility operation")
     snapshot = _native_role_snapshot(cfg, summary_db=summary_db)
     if project not in snapshot:
@@ -190,12 +185,9 @@ def _write_ax_context(directory, *, project, action, role=None, session=None,
     if action == "rename-project" and (not isinstance(title, str) or not title.strip()
             or len(title) > 240 or any(ord(char) < 32 for char in title)):
         raise ValueError("Requested Antigravity title is invalid")
-    if action == "wake":
-        notification_id = _uuid(notification_id, "Notification ID")
-    payload = {"schema": "antigravity-native-roles/v1", "created_at": time.time(),
+    payload = {"schema": "antigravity-native-roles/v2", "created_at": time.time(),
         "project_key": project, "action": action, "role": role, "conversation": session,
-        "requested_title": title, "operation_identity": notification_id if action == "wake" else session,
-        "operation_argument": session if action == "wake" else title,
+        "requested_title": title, "operation_identity": session, "operation_argument": title,
         "roles": snapshot}
     directory = Path(directory)
     target, temporary = directory / "native-role-context.json", directory / ".native-role-context.tmp"
@@ -247,7 +239,7 @@ def install_helper(cfg=None):
     return helper
 
 
-def _run_helper(project, role, session, action, argument, *, title=None, cfg=None, summary_db=None):
+def _run_helper(project, role, session, action, *, title=None, cfg=None, summary_db=None):
     if sys.platform != "darwin":
         raise ValueError("Antigravity Desktop Accessibility automation is macOS-only")
     cfg = cfg or config.load()
@@ -258,14 +250,13 @@ def _run_helper(project, role, session, action, argument, *, title=None, cfg=Non
     with tempfile.TemporaryDirectory(prefix="ag-wake-", dir=helper.parent) as directory:
         root = Path(directory)
         context = _write_ax_context(root, project=project, action=action, role=role,
-            session=session, title=title, notification_id=argument if action == "wake" else None,
-            cfg=cfg, summary_db=summary_db)
+            session=session, title=title, cfg=cfg, summary_db=summary_db)
         stdout, stderr = root / "stdout", root / "stderr"
         label = f"{SERVER_LABEL}.{project}.{role or 'verify'}"
         plist_path = root / "job.plist"
         argv = [str(helper), action]
         if action != "verify-bindings":
-            argv.extend([project, role, session, argument if action == "wake" else title])
+            argv.extend([project, role, session, title])
         with plist_path.open("wb") as stream:
             plistlib.dump({"Label": label, "ProgramArguments": argv, "RunAtLoad": True,
                 "Umask": 63, "StandardOutPath": str(stdout), "StandardErrorPath": str(stderr),
@@ -284,12 +275,6 @@ def _run_helper(project, role, session, action, argument, *, title=None, cfg=Non
                 if match:
                     code = int(match.group(1))
                     detail = " ".join(path.read_text(encoding="utf-8") for path in (stdout, stderr) if path.exists()).strip()
-                    if code in (2, 3) and action == "wake":
-                        from .wake import WakeDeferred, WakeRejected
-                        if any(phrase in detail for phrase in ("recent user input", "contains a draft",
-                                "already working", "active dialog", "Leave one Antigravity window")):
-                            raise WakeDeferred(detail)
-                        raise WakeRejected(detail or "Desktop refused the wake before submission")
                     if code:
                         raise _error(detail or "Antigravity AX helper rejected the operation")
                     return detail
@@ -305,7 +290,7 @@ def verify(project, role, session, *, cfg=None, summary_db=None):
     cfg = cfg or config.load()
     cfg.require(project)
     session = _uuid(session, "Antigravity session")
-    roles = Store(cfg.database).roles(project, HARNESS)
+    roles = config.open_store(cfg).roles(project, HARNESS)
     if roles.get(role) != session or role not in {"coordinator", "inbox"}:
         raise _error("Antigravity session is not the exact bound role")
     native = _desktop_summary(project, session, cfg=cfg, db_path=summary_db)
@@ -315,19 +300,16 @@ def verify(project, role, session, *, cfg=None, summary_db=None):
 
 
 def wake(project, role, session, notification_id, *, cfg=None, summary_db=None):
-    """Send one ID-only wake prompt to the exact bound Desktop conversation."""
-    identity = verify(project, role, session, cfg=cfg, summary_db=summary_db)
-    notification_id = _uuid(notification_id, "Notification ID")
-    _run_helper(project, role, session, "wake", notification_id, cfg=cfg, summary_db=summary_db)
-    # Check again after the native send; caller marks any uncertainty permanent.
-    verify(project, role, session, cfg=cfg, summary_db=summary_db)
-    return {**identity, "notification_id": notification_id, "status": "sent"}
+    """Send one ID-only wake through Antigravity's App-managed sidecar."""
+    from . import ag_sidecar
+
+    return ag_sidecar.send(project, role, session, notification_id, cfg=cfg, summary_db=summary_db)
 
 
 def rename(project, role, session, title, *, cfg=None, summary_db=None):
     """Rename the exact active bound conversation through Antigravity's native UI."""
     verify(project, role, session, cfg=cfg, summary_db=summary_db)
-    _run_helper(project, role, session, "rename-project", session, title=title,
+    _run_helper(project, role, session, "rename-project", title=title,
                 cfg=cfg, summary_db=summary_db)
     verify(project, role, session, cfg=cfg, summary_db=summary_db)
     return title
@@ -336,12 +318,12 @@ def rename(project, role, session, title, *, cfg=None, summary_db=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    commands.add_parser("install", help="Compile and sign the macOS Accessibility helper")
+    commands.add_parser("install", help="Install the optional macOS helper for explicit title changes")
     args = parser.parse_args(argv)
     if args.command == "install":
         path = install_helper()
         print(f"Installed signed Antigravity Accessibility helper: {path}")
-        print("Grant Accessibility access in System Settings → Privacy & Security → Accessibility, then run `multi-harness-wake --harness antigravity --once`.")
+        print("Grant Accessibility access if you want explicit native title changes.")
         return 0
     return 2
 

@@ -7,6 +7,7 @@ claiming, reading, and acknowledgement stay with that session's assistant.
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -19,7 +20,6 @@ import time
 import uuid
 
 from . import config
-from .store import Store
 
 POLL_SECONDS = 4.0
 COMMAND_TIMEOUT = 8.0
@@ -120,6 +120,25 @@ def _launch(entry, values):
         raise WakeError("Native launcher failed after invocation; wake outcome is uncertain")
 
 
+def _devin_workspace(cfg, project, session):
+    from .devin_tools import _native_db
+
+    native_id = session.removeprefix("acp/devin-cli/")
+    try:
+        path = _native_db().expanduser().resolve(strict=True)
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
+            rows = db.execute("""
+                SELECT working_directory FROM sessions WHERE id IN (?,?) AND hidden=0
+                """, (native_id, "acp/devin-cli/" + native_id)).fetchall()
+        if len(rows) == 1:
+            workspace = Path(rows[0][0]).expanduser().resolve(strict=True)
+            if cfg.resolve(workspace, project) == project:
+                return workspace
+    except (OSError, ValueError, TypeError, sqlite3.Error):
+        pass
+    raise WakeDeferred("Devin bound session has no verified working directory in the project")
+
+
 def _default_wake(harness, values, *, before_prompt=None):
     """Use a supported host CLI where one is available on PATH."""
     prompt = WAKE_PROMPT.format(notification_id=values["notification_id"])
@@ -138,11 +157,9 @@ def _default_wake(harness, values, *, before_prompt=None):
     elif harness == "devin":
         from . import devin_acp
         cfg = config.load()
-        roots = cfg.projects.get(values["project"])
-        if not roots:
-            raise WakeError("Registered project workspace is unavailable")
+        workspace = _devin_workspace(cfg, values["project"], values["session"])
         devin_acp.wake(values["project"], values["role"], values["session"],
-                       values["notification_id"], roots[0], before_prompt=before_prompt)
+                       values["notification_id"], workspace, before_prompt=before_prompt)
         return
     elif harness == "antigravity":
         from . import ag_wake
@@ -199,6 +216,13 @@ def _reserve(db, item, project, harness, role, session):
     return False, notification_id
 
 
+def _attempt_status(db, notification_id, project, harness, role, session):
+    row = db.execute("""SELECT state FROM mhb_wake_attempts
+        WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?""",
+        (notification_id, project, harness, role, session)).fetchone()
+    return {"id": notification_id, "status": row[0]} if row else None
+
+
 def wake_one(store, project, harness, role, session, *, commands=None):
     """Nudge one pending notification for the exact active native role.
 
@@ -217,12 +241,23 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     item = store.pending(project, harness, role, session)
     if not item:
         return None
-    entry = (commands if commands is not None else _read_commands()).get(harness)
+    if harness == "antigravity":
+        from . import ag_sidecar
+        if not ag_sidecar.agentapi(project):
+            return {"status": "sidecar-managed", "id": item["id"]}
+        entry = None
+    else:
+        entry = (commands if commands is not None else _read_commands()).get(harness)
     if harness == "claude" and not isinstance(entry, dict) and \
             os.environ.get("MHB_CLAUDE_DETACHED_WAKE") != "1":
         # The in-session `mhb monitor` delivers read-only notification hints.
         # Do not start a detached Claude turn or record a duplicate external wake.
         return {"status": "subscription-managed", "id": item.get("id")}
+    with closing(_ledger(store.path)) as db:
+        candidate = store.pending(project, harness, role, session, for_wake=True)
+        if not candidate:
+            return _attempt_status(db, item["id"], project, harness, role, session)
+    item = candidate
     values = {"project": project, "harness": harness, "role": role,
               "session": session, "notification_id": str(item.get("id", "")),
               # Never forward the mailbox body into a prompt, argv, or GUI.
@@ -242,9 +277,6 @@ def wake_one(store, project, harness, role, session, *, commands=None):
         # conversation before this notification reserves a one-shot wake.
         from . import ag_wake
         ag_wake.verify(project, role, session)
-    elif harness in {"devin", "antigravity"} and not isinstance(entry, dict):
-        # ACP session/load and AG's native preflight verify before submission.
-        pass
     db = _ledger(store.path)
     reserved = False
     refund_attempt = False
@@ -252,17 +284,14 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     try:
         reserved, notification_id = _reserve(db, item, project, harness, role, session)
         if not reserved:
-            row = db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
-                             (notification_id, project, harness, role, session)).fetchone()
-            return {"id": notification_id, "status": row[0] if row else "uncertain"}
+            return _attempt_status(db, notification_id, project, harness, role, session)
         # Recheck stop, role, and the same still-pending item after acquiring
         # the durable send guard. A stop or role handoff during preflight wins.
         if store.roles(project, harness).get(role) != session or not store.status(project, harness).get("enabled"):
             state = "retryable"
             refund_attempt = True
             return {"id": notification_id, "status": "stopped"}
-        latest = store.pending(project, harness, role, session)
-        if not latest or latest.get("id") != notification_id:
+        if not store.pending(project, harness, role, session, message_id=notification_id):
             state = "retryable"
             refund_attempt = True
             return {"id": notification_id, "status": "held", "reason": "notification-no-longer-pending"}
@@ -282,7 +311,7 @@ def wake_one(store, project, harness, role, session, *, commands=None):
                 def before_prompt():
                     return (store.roles(project, harness).get(role) == session
                             and store.status(project, harness).get("enabled")
-                            and (store.pending(project, harness, role, session) or {}).get("id") == notification_id)
+                            and store.pending(project, harness, role, session, message_id=notification_id) is not None)
                 _default_wake(harness, values, before_prompt=before_prompt)
         except WakeDeferred:
             state = "retryable"
@@ -300,6 +329,8 @@ def wake_one(store, project, harness, role, session, *, commands=None):
             state = "uncertain"
             raise WakeError(f"Native wake failed ({type(exc).__name__}); reconcile before retrying") from None
         state = "sent"
+        if harness == "antigravity":
+            return {"id": notification_id, "status": state, "mechanism": "agentapi", "session": session}
         return {"id": notification_id, "status": "sent"}
     finally:
         if reserved:
@@ -312,15 +343,25 @@ def wake_one(store, project, harness, role, session, *, commands=None):
 
 def cycle(project=None, harness=None, role=None):
     cfg = config.load()
-    store = Store(cfg.database)
+    store = config.open_store(cfg)
     selected_project = cfg.resolve(Path.cwd(), project)
-    roles = store.roles(selected_project, harness) if harness else None
     reports = []
     targets = [harness] if harness else sorted(HARNESS_NAMES)
     for actor in targets:
         if actor not in HARNESS_NAMES:
             raise ValueError(f"Unknown harness: {actor}")
-        binding = roles if roles is not None else store.roles(selected_project, actor)
+        if actor == "antigravity":
+            from . import ag_sidecar
+            if not ag_sidecar.agentapi(selected_project):
+                if harness:
+                    reports.append({"project": selected_project, "harness": actor, "status": "sidecar-managed"})
+                continue
+        try:
+            binding = store.roles(selected_project, actor)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            reports.append({"project": selected_project, "harness": actor,
+                            "status": "held", "reason": str(exc)})
+            continue
         selected_roles = [role] if role else [r for r in ("inbox", "coordinator") if binding.get(r)]
         for target_role in selected_roles:
             session = binding.get(target_role)
@@ -334,7 +375,7 @@ def cycle(project=None, harness=None, role=None):
                     reports.append({"project": selected_project, "harness": actor,
                                     "role": target_role, "status": "retryable",
                                     "reason": str(exc)})
-                except (WakeError, ValueError, sqlite3.Error) as exc:
+                except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
                     reports.append({"project": selected_project, "harness": actor,
                                     "role": target_role, "status": "held",
                                     "reason": str(exc)})
@@ -418,7 +459,7 @@ def main(argv=None):
     if args.show_attempts or args.reconcile:
         cfg = config.load()
         selected_project = cfg.resolve(Path.cwd(), args.project)
-        store = Store(cfg.database)
+        store = config.open_store(cfg)
         if args.show_attempts:
             print(json.dumps(list_attempts(store, selected_project), sort_keys=True), flush=True)
             return 0
@@ -442,7 +483,7 @@ def main(argv=None):
                 print(json.dumps(report, sort_keys=True), flush=True)
         except WakeRejected as exc:
             print(json.dumps({"status": "retryable", "reason": str(exc)}), flush=True)
-        except (WakeError, ValueError, sqlite3.Error) as exc:
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             print(json.dumps({"status": "held", "reason": str(exc)}), flush=True)
         if args.once:
             return 0

@@ -10,8 +10,8 @@ SIGINT and SIGTERM stop the polling loop.
 ## Adapter contract
 
 Codex, Claude Code Monitor, Devin ACP, and Antigravity Desktop have built-in
-drivers. `MHB_WAKE_CONFIG` is an optional per-harness override or fallback for
-another host or operating system. There are no project names, session IDs, or
+drivers. `MHB_WAKE_CONFIG` is an optional override for the Codex, Claude, and
+Devin drivers. There are no project names, session IDs, or
 credentials compiled into this package. Each configured adapter has `verify`
 and `wake` argv arrays and an optional `timeout_seconds` value:
 
@@ -23,8 +23,7 @@ and `wake` argv arrays and an optional `timeout_seconds` value:
     "timeout_seconds": 8
   },
   "claude": {"verify": ["/path/to/verify", "{session}"], "wake": ["/path/to/wake", "{session}", "{body}"]},
-  "devin": {"verify": ["/path/to/verify", "{session}"], "wake": ["/path/to/wake", "{session}", "{body}"]},
-  "antigravity": {"verify": ["/path/to/verify", "{session}"], "wake": ["/path/to/wake", "{session}", "{body}"]}
+  "devin": {"verify": ["/path/to/verify", "{session}"], "wake": ["/path/to/wake", "{session}", "{body}"]}
 }
 ```
 
@@ -70,25 +69,38 @@ JSON hints for the bound session and never invokes a detached model turn. A
 detached `claude --resume SESSION --print PROMPT` wake is available only when
 explicitly enabled with `MHB_CLAUDE_DETACHED_WAKE=1`; it runs in a separate
 process and does not wake a desktop window. Devin Local uses ACP `session/load`
-and submits a fixed ID-only `session/prompt` to the exact bound session. Its
-temporary server is named `mhb_devin_<project>` and exposes only
-`pickup_notification(notification_id)`. The ACP client approves that call only
-when the exact native session, uncompleted native tool-call ID, server, tool,
-and UUID argument all match. Unknown calls and shell permissions are
-cancelled. The Inbox tool durably forwards the exact notification to the bound
-Coordinator; the Coordinator tool returns the message and records its
-receipt. Message content is never included in the wake prompt or process argv.
-Antigravity Desktop uses the packaged macOS native adapter and accessibility
-helper. Each driver validates the current Store role and stop state first.
+and submits a fixed ID-only `session/prompt` to the exact bound session. The
+resumed Desktop session uses the installed `mhb_roles_<project>` server. Its
+`pickup_wake(notification_id)` and `finish_wake` tools require a matching
+active dispatch record for the current native turn, role, and notification.
+The ACP client checks the native session, pending tool-call ID, server, tool,
+and exact notification ID for permission requests. It checks native tool
+results and the durable queue even when Devin handles approval internally.
+Inbox pickup forwards the notification. For a free-text Coordinator wake,
+pickup returns the message, shared `request_id`, and lease. Once the native
+transcript records that result, a second scoped call can record receipt using
+the lease and send one correlated reply if the request asks for one. The
+coordinator's regular project MCP server also exposes `reply_free_text` for a
+reply in the bound Local chat. Message content stays in the tool result and
+mailbox. The wake prompt and process arguments carry the notification ID.
+Antigravity Desktop uses an App-managed sidecar and its documented
+`agentapi send-message` command. Enable it as described in the
+[Antigravity adapter guide](antigravity.md). The sidecar verifies the exact
+pending notification, workspace, and role before sending a prompt to the
+bound conversation. An accepted submission records a wake. The native
+mailbox tool records pickup when the assistant calls it. If the model fails,
+inspect the native turn and process the same notification from its bound chat
+after the App recovers.
+For a free-text request or reply, the wake sequence is the sender's Inbox,
+then the recipient's Inbox, then the recipient's Coordinator. Each wake
+provides the delivery ID to process using the `bridge-mailbox` skill.
 
-The Antigravity AX helper is macOS-only. Other operating systems should
-configure a native host executable that implements the same verifier/launcher
-contract; this package does not automate GUI input with coordinates or keyboard
-shortcuts.
+Keep native tool approvals scoped to the project, role and operation.
 
-Install the optional MCP dependency (`multi-harness-bridge[mcp]`) to run the
-temporary Devin server. Configure executable overrides only when a built-in
-driver does not cover the host installation.
+Install the optional MCP dependency (`multi-harness-bridge[mcp]`) and the
+project's native Devin server before running automatic wake. Refresh the
+server in the existing Desktop chat after an upgrade. Configure executable
+overrides when a built-in driver does not cover the host installation.
 
 ## Installation and monitoring
 
@@ -134,5 +146,8 @@ Before dispatch the wake driver records a durable per-notification attempt in
 the Store database. A confirmed send is not repeated. A verified pre-submit
 refusal can be retried at most three times. If a host call times out or returns
 an ambiguous result after it may have submitted the prompt, the attempt is
-marked `uncertain` and is not automatically retried; inspect the native
-session and reconcile manually. Each wake record identifies the exact project, harness, role and native session. A replacement chat can receive a new wake for pending work. The durable queue validates the current binding and lease before advancing the message.
+marked `uncertain` and requires manual reconciliation. Later deliveries for the
+same role remain eligible for a wake. Each wake record identifies the exact
+project, harness, role, and native session. A replacement chat can receive a
+new wake for pending work. The durable queue validates the current binding and
+lease before advancing the message.

@@ -15,9 +15,11 @@ import sys
 import time
 
 from . import ag_wake, config
-from .store import Store
 
-TOOLS = ("take_coordinator", "take_bridge", "pickup_notification", "acknowledge", "send_message", "set_pickup", "bridge_status", "propagate_skills")
+COORDINATOR_TOOLS = {"send_message", "send_fanout", "reply_free_text", "set_pickup"}
+_LEGACY_TOOLS = ("take_coordinator", "take_bridge", "pickup_notification", "acknowledge",
+                 "send_message", "set_pickup", "bridge_status", "propagate_skills")
+TOOLS = (*_LEGACY_TOOLS, "send_fanout", "reply_free_text")
 
 
 def server_name(project):
@@ -89,8 +91,8 @@ def before_tool(cfg, project, event):
                 or supplied != sources):
             raise PermissionError("Tool skill sources must exactly match the current user request")
     else:
-        roles = Store(cfg.database).roles(project, "antigravity")
-        if session not in roles.values() or tool in {"send_message", "set_pickup"} and session != roles["coordinator"]:
+        roles = config.open_store(cfg).roles(project, "antigravity")
+        if session not in roles.values() or tool in COORDINATOR_TOOLS and session != roles["coordinator"]:
             raise PermissionError("Current Desktop chat does not own this role")
     token = secrets.token_urlsafe(32)
     with closing(_db(cfg)) as db, db:
@@ -114,7 +116,7 @@ def invoke(cfg, project, tool, grant):
         db.execute("DELETE FROM ag_hook_grants WHERE digest=?", (fingerprint,))
     session, data, title = row
     args = json.loads(data)
-    store = Store(cfg.database)
+    store = config.open_store(cfg)
     if not ag_wake._desktop_summary(project, session, cfg=cfg):
         raise PermissionError("Desktop session changed during tool call")
     if tool == "propagate_skills":
@@ -147,8 +149,11 @@ def invoke(cfg, project, tool, grant):
             return {"message":None}
         if role == "inbox":
             ok = store.finish(project,"antigravity",role,session,item["id"],item["lease"])
-            return {"message_id":item["id"],"forwarded":ok}
-        return {"message":item, "next":"Call acknowledge after recording receipt. Use send_message for a reply."}
+            result = {"message_id": item["id"], "forwarded": ok}
+            if "request_id" in item:
+                result.update(request_id=item["request_id"], stage=item["stage"])
+            return result
+        return {"message":item, "next":"Call acknowledge after recording receipt. Use reply_free_text for a request with a request_id."}
     if tool == "acknowledge":
         return {"finished":store.finish(project,"antigravity",role,session,args["id"],args["lease"])}
     if role != "coordinator":
@@ -160,6 +165,12 @@ def invoke(cfg, project, tool, grant):
     if tool == "send_message":
         return store.send(project,"antigravity",args["recipient"],args["body"],args["key"],
                           reply_to=args.get("reply_to"),session=session)
+    if tool == "send_fanout":
+        return store.send_fanout(project, "antigravity", args["recipients"], args["body"], args["key"],
+                                 session=session)
+    if tool == "reply_free_text":
+        return store.reply_free_text(project, "antigravity", args["reply_to"], args["body"], args["key"],
+                                     session=session)
     raise ValueError("Unknown operation")
 
 
@@ -191,6 +202,16 @@ def make_server(cfg, project):
         return invoke(cfg, project, "send_message", desktop_grant)
 
     @server.tool()
+    def send_fanout(recipients: list[str], body: str, key: str, desktop_grant: str = "") -> dict:
+        """Send one free-text request to all named peer harnesses in this project. Reuse the key on retry."""
+        return invoke(cfg, project, "send_fanout", desktop_grant)
+
+    @server.tool()
+    def reply_free_text(reply_to: str, body: str, key: str, desktop_grant: str = "") -> dict:
+        """Send a correlated reply to a received request. Use its delivery ID and reuse the reply key on retry."""
+        return invoke(cfg, project, "reply_free_text", desktop_grant)
+
+    @server.tool()
     def set_pickup(enabled: bool, desktop_grant: str = "") -> dict:
         """Stop or resume the bound project and harness."""
         return invoke(cfg, project, "set_pickup", desktop_grant)
@@ -202,18 +223,29 @@ def make_server(cfg, project):
     return server
 
 
+def installation_entries(cfg, project, *, executable=None, tools=TOOLS):
+    """Build the managed server and matching one-use grant hook registrations."""
+    executable = str(executable or sys.executable)
+
+    def invocation(action):
+        return [executable, "-m", "multi_harness_bridge.ag_inbox", "--home", str(cfg.root), project, action]
+
+    cli = invocation("hook")
+    shell_command = subprocess.list2cmdline(cli) if os.name == "nt" else shlex.join(cli)
+    server = {"command":executable, "args":invocation("serve")[1:], "tools":{t:{"eager":True} for t in tools}}
+    hook = {"PreToolUse":[{"matcher":".*(?:"+"|".join(tools)+")$",
+                           "hooks":[{"type":"command","command":shell_command,"timeout":5}]}]}
+    return server, hook
+
+
 def install(cfg, project, directory=None):
     cfg.require(project)
     root = Path(directory or Path.home()/".gemini/config")
     root.mkdir(parents=True, exist_ok=True)
     name = server_name(project)
-    def invocation(action):
-        return [sys.executable, "-m", "multi_harness_bridge.ag_inbox", "--home", str(cfg.root), project, action]
-    cli = invocation("hook")
-    shell_command = subprocess.list2cmdline(cli) if os.name == "nt" else shlex.join(cli)
-    server = {"command":sys.executable, "args":invocation("serve")[1:], "tools":{t:{"eager":True} for t in TOOLS}}
-    hook = {"PreToolUse":[{"matcher":".*(?:"+"|".join(TOOLS)+")$",
-                           "hooks":[{"type":"command","command":shell_command,"timeout":5}]}]}
+    server, hook = installation_entries(cfg, project)
+    prior_server, prior_hook = installation_entries(cfg, project, tools=_LEGACY_TOOLS)
+
     def read(filename):
         p = root/filename
         data = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -226,7 +258,7 @@ def install(cfg, project, directory=None):
         entries = mcp.setdefault("mcpServers", {})
         if not isinstance(entries,dict):
             raise ValueError("Invalid Antigravity server configuration")
-        if entries.get(name) not in (None,server) or hooks.get(name) not in (None,hook):
+        if entries.get(name) not in (None, server, prior_server) or hooks.get(name) not in (None, hook, prior_hook):
             raise ValueError("Conflicting native bridge entry. Review the existing configuration.")
         if entries.get(name) != server:
             entries[name] = server

@@ -2,9 +2,9 @@
 
 ## Why SQLite
 
-The bridge is designed for concurrent local processes on one user's machine. SQLite serializes writers. The bridge uses a short immediate transaction to select one eligible message, attach a time-limited random lease and commit before invoking any external service. WAL allows readers to continue while the queue changes. A failed consumer can be retried after lease expiry. See the [queue contract](queue.md) for transaction and state details.
+The bridge is designed for concurrent local processes on one user's machine. Separate stdio FastMCP processes, the native wake worker, and command-line clients share the portable queue for their registered project. Point each client at the same `MHB_HOME`. Project and native role verification scope every mailbox operation. Use dedicated state when deploying alongside an existing legacy mailbox. See the [local MCP setup](protocol.md) and [legacy deployment guide](deployment-reconciliation.md).
 
-A Postgres installation and row-level skip-locked queries are unnecessary for this local deployment. Aggregate traffic, shared-network disk use, multi-user authentication or cross-machine delivery would require a new deployment and storage design. A claim can complete well before the native model starts reasoning. A four-second polling interval is a pickup target, not a promise about total model or Telegram latency.
+SQLite serializes writers. A short `BEGIN IMMEDIATE` transaction selects an eligible message, attaches a time-limited lease, and commits before an external service call. Schema constraints and transaction boundaries keep one delivery per recipient per request and one substantive reply per delivery. WAL lets readers continue while a write commits. It persists at the database level. Each Store connection waits up to ten seconds on contention and can still report a lock error. Base storage changes on measured writer contention, storage topology, or a need for cross-machine or multi-user authentication. See the [queue contract](queue.md) for transaction and recovery details.
 
 ## State and authority
 
@@ -18,6 +18,8 @@ A Postgres installation and row-level skip-locked queries are unnecessary for th
 | Telegram conduit | Authorized bot and chat, external message ID, linked queue message, final recipient and ambiguous provider outcomes |
 
 The coordinator and inbox are two distinct roles even when both are visible under the same native project window. A queued wake carries routing metadata so that a model reads the mailbox through the scoped tool. The caller never needs to paste the body of a peer message into another desktop composer's prompt. A delivery receipt proves the indicated stage only.
+
+For replies, keep the shared `request_id` and each recipient's delivery ID from the send result. The origin processes replies through its usual mailbox tools, using `reply_to` to match each reply to a recipient delivery. If an assistant needs to wait, the in-session monitor and native wake worker report available messages while the database holds the durable state. Claiming grants a lease. Finishing records receipt, and a failed consumer leaves work available after lease expiry. The [native wake guide](native.md) covers notification deduplication and recovery when a submitted prompt has an uncertain outcome.
 
 ## Isolation and recovery checks
 

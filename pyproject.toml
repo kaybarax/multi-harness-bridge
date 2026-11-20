@@ -25,7 +25,7 @@ multi-harness-wake = "multi_harness_bridge.wake:main"
 multi-harness-telegram = "multi_harness_bridge.telegram:main"
 multi-harness-service = "multi_harness_bridge.services:main"
 multi-harness-skills = "multi_harness_bridge.skills:main"
-multi-harness-claude-hook = "multi_harness_bridge.role_adapters:claude_hook_main"
+multi-harness-claude-hook = "multi_harness_bridge.role_adapters:claude_hook_cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]

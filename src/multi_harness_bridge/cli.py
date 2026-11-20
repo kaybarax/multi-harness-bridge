@@ -107,7 +107,7 @@ def run(args):
                 "commands_on_path": {name: shutil.which(name) for name in (*HOSTS, "hermes")}}
     if args.command == "init":
         config.root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        Store(config.database)
+        settings.open_store(config)
         return {"home": str(config.root), "database": str(config.database)}
     if not config.database.exists():
         raise ValueError("Initialize the bridge with mhb init")
@@ -132,7 +132,7 @@ def run(args):
         issue(config, principal, args.out)
         return {"credential_file": str(args.out.resolve()), "project": args.project, "role": args.role}
     project = config.require(args.project)
-    store = Store(config.database)
+    store = settings.open_store(config)
     if args.command == "pending":
         return store.pending_overview(project, args.harness, args.limit)
     if args.command == "trace":
