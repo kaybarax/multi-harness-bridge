@@ -194,14 +194,19 @@ if arguments == [arguments[0], "verify-bindings"] {
 
 guard AXIsProcessTrusted() else { fail("macOS Accessibility authorization is required.", 3) }
 let applications = NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.antigravity")
-guard applications.count == 1, let application = applications.first else {
-    fail("Exactly one running Antigravity Desktop app is required.")
+// Production and disposable profiles may be separate processes with the same bundle ID.
+var candidates: [(NSRunningApplication, AXUIElement, AXUIElement)] = []
+for app in applications {
+    let root = AXUIElementCreateApplication(app.processIdentifier)
+    AXUIElementSetMessagingTimeout(root, 0.5)
+    guard let windows: [AXUIElement] = value(root, kAXWindowsAttribute) else {
+        fail("Unable to inspect every running Antigravity Desktop profile.")
+    }
+    for window in windows where page(window) != nil {
+        candidates.append((app, root, window))
+    }
 }
-let ax = AXUIElementCreateApplication(application.processIdentifier)
-AXUIElementSetMessagingTimeout(ax, 0.5)
-let windows: [AXUIElement] = value(ax, kAXWindowsAttribute) ?? []
-let candidates = windows.filter { page($0) != nil }
-guard candidates.count == 1, let window = candidates.first,
+guard candidates.count == 1, let (application, ax, window) = candidates.first,
       let current = page(window), let currentID = linkID(current),
       boundConversationIDs.contains(currentID) else {
     fail("Leave one Antigravity window on a bound chat for this registered project.")

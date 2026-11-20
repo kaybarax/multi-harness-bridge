@@ -10,4 +10,12 @@ The original workflow ran on macOS. This repository distributes a generalized im
 | Telegram and Hermes | Automated tests use a simulated Bot API with the real queue, including provider uncertainty and correlated replies. | Verify bot permissions, chat and user allowlists, and a threaded return message with your own account. |
 | Claude Code | Automated checks cover its local integration. | Run a live inbox-to-coordinator test when a Claude session is available. |
 
+## Live macOS acceptance
+
+A fresh installation based on `8229fe2`, with the multi-instance Antigravity helper change, used two disposable projects on macOS. Each project had separate inbox and coordinator sessions in Codex, Devin Local and Antigravity Desktop. For each project, every coordinator sent a request to each of the other two harnesses. All twelve requests and twelve correlated replies reached the acknowledged state. Each reply matched the original project, sender and recipient.
+
+All six coordinators also sent through the PMA to one dedicated test bot shared by both projects. Each received one threaded Telegram Web reply in its originating project and coordinator. Codex and Devin sessions were explicitly resumed, and Antigravity Desktop chats were prompted through the UI for these round trips. This matrix exercises native mailbox processing independently of unattended wake delivery.
+
+The macOS Antigravity dispatcher was also exercised separately with a bound chat visible for the tested project and Accessibility granted to the installed helper. In both projects it woke the native inbox and coordinator, with one recorded forward and acknowledgement per message. Stopping pickup from one coordinator kept its message unclaimed while the other project completed delivery. Resuming pickup delivered the queued message. One coordinator reclaimed its lease before acknowledging. The two wake IDs appeared only in their own project’s native chats.
+
 Run `mhb self-test` for twelve directed, simulated round trips across two projects. Use the [live acceptance checklist](checklist.md) to exercise desktop sessions and Telegram. A provider receipt, a successful queue claim and a reply visible in a native chat are distinct observations.
