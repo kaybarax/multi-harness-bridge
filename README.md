@@ -28,7 +28,17 @@ The default state directory is `~/.multi-harness-bridge`. Set `MHB_HOME` before 
 ## Connect a project
 
 1. **Register its workspace.** From the project's folder, run `mhb project add orchard .`. Supply more paths in the same command when one project spans several repositories. Repeat with a different project slug for another workspace.
-2. **Connect the chat commands.** Setup provisions the three skills for the current user. In Codex type `$take-coordinator`; in Devin Desktop select **Local**, choose the **Session folder**, then type `/take-coordinator`; in Claude Code and Antigravity type `/take-coordinator`. Run `multi-harness-skills --help` and follow the [host setup guide](docs/skills.md) to enable the project’s native integration for each app. Use the local Desktop surface for a desktop-visible chat. An unrelated cloud session has a different identity.
+2. **Connect the chat commands.** Setup provisions three skills for the current user. Open a chat in the registered project. In **Devin Desktop**, first select **Local** as the environment and point Devin to the **project folder**. Then type the command for your app.
+
+   | App | Take coordinator | Take bridge | Propagate skills |
+   | --- | --- | --- | --- |
+   | Codex | `$take-coordinator` | `$take-bridge` | `$propagate-skills` |
+   | Devin Desktop (Local) | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+   | Google Antigravity | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+   | Claude Code | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+
+   Run `multi-harness-skills --help` and follow the [host setup guide](docs/skills.md) to enable the project’s native integration for each app. Use the local Desktop surface for a desktop-visible chat. An unrelated cloud session has a different identity.
+
 3. **Assign the roles.** In one project chat enter `take coordinator "Orchard Coordinator"`. In another enter `take bridge "Orchard Bridge Inbox"`. The title is optional. The native chat identity and registered workspace determine the binding.
 4. **Enable pickup.** Follow the [native wake guide](docs/native.md). Check the project with `mhb status orchard codex`. For automatic startup, generate a [user service definition](docs/services.md). Send a short test to the destination's inbox, inspect the coordinator's receipt, then send a correlated reply. The sender and recipient can belong to different harnesses.
 5. **Connect Telegram if desired.** Choose a shared bot or dedicated bots, configure the authorized chat and users, and select who owns the Telegram connection. A threaded reply returns through the PMA to the originating harness and project. See [Telegram and Hermes](docs/telegram.md).
