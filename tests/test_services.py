@@ -1,4 +1,6 @@
 import plistlib
+import shutil
+import sys
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -16,7 +18,6 @@ def _ns(tag):
 
 def test_renderers_escape_machine_specific_paths(tmp_path):
     root = tmp_path / 'work space' / 'project "quoted" & $100%'
-    root.mkdir(parents=True)
     state = tmp_path / 'state $ special%'
     executable = tmp_path / 'venv with space' / 'python "local"'
     project = "demo_project"
@@ -27,7 +28,8 @@ def test_renderers_escape_machine_specific_paths(tmp_path):
     assert plist["EnvironmentVariables"]["MHB_HOME"] == str(state)
 
     systemd = render_systemd(project, root, executable, state)
-    assert f'WorkingDirectory="{str(root).replace("$", "$$").replace("%", "%%").replace("\\", "\\\\").replace(chr(34), chr(92)+chr(34))}"' in systemd
+    escaped_root = str(root).replace("\\", "\\\\").replace('"', '\\"').replace("$", "$$").replace("%", "%%")
+    assert f'WorkingDirectory="{escaped_root}"' in systemd
     assert '"--project" "demo_project"' in systemd
     assert '"MHB_HOME=' in systemd and "$$" in systemd and "%%" in systemd
 
@@ -64,6 +66,7 @@ def test_rejects_control_characters_and_empty_registry(tmp_path):
         generate(platform_name="linux", output_dir=tmp_path, state=Config(tmp_path, {}))
 
 
+@pytest.mark.skipif(sys.platform != "darwin" or not shutil.which("plutil"), reason="requires macOS plutil")
 def test_plist_passes_macos_linter(tmp_path):
     root = tmp_path / "project"
     root.mkdir()
@@ -71,7 +74,5 @@ def test_plist_passes_macos_linter(tmp_path):
     path.write_bytes(render_launchd("demo", root, "/usr/bin/python3", tmp_path / "state"))
     import subprocess
     result = subprocess.run(["plutil", "-lint", str(path)], capture_output=True, text=True)
-    if result.returncode == 127:
-        pytest.skip("plutil is unavailable")
     assert result.returncode == 0, result.stderr + result.stdout
 
