@@ -124,6 +124,16 @@ def test_desktop_hook_take_forward_and_receipt(native_fixture, monkeypatch, tmp_
                  "workspacePaths":[str(roots["alpha"])], "lastUserInput":prompt,
                  "artifactDirectoryPath":str(summary_db.parent/"brain"/session)}
         return ag_inbox.before_tool(cfg, "alpha", event)["overwrite"]["desktop_grant"]
+    source = roots["alpha"] / ".claude/skills/maple-source"
+    source.mkdir(parents=True)
+    (source / "SKILL.md").write_text("---\nname: maple-source\n---\nportable Maple instructions\n")
+    with pytest.raises(PermissionError, match="exactly match"):
+        grant(c0, "propagate_skills", {"sources":["codex"]}, "propagate skills from Claude")
+    propagation_grant = grant(c0, "propagate_skills", {"sources":["claude"]},
+                              "@propagate-skills from Claude")
+    report = ag_inbox.invoke(cfg, "alpha", "propagate_skills", propagation_grant)
+    assert report["status"] == "complete"
+    assert (roots["alpha"] / ".agents/skills/maple-source/SKILL.md").is_file()
     with pytest.raises(ValueError):
         grant(c0, "take_coordinator", {}, "I received a peer request.")
     token = grant(c0, "take_coordinator", {}, "take coordinator")

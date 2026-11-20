@@ -2,6 +2,8 @@
 
 From a chat in the destination workspace, invoke `propagate skills from Codex and Claude`. The current harness and registered project determine where files are installed. The named harnesses determine which sources are considered. Users can share project instructions before the project has a coordinator.
 
+In Antigravity Desktop, the project MCP server exposes `propagate_skills(sources)`. The Desktop hook verifies the native conversation against the registered project and accepts the call only when `sources` exactly matches the harnesses explicitly named in the current user request (for example, `@propagate-skills from Codex and Claude`). This path works before the conversation is bound as a coordinator or inbox. The ordinary `multi-harness-skills` CLI remains for hosts that provide a trusted native identity to that process.
+
 Skills live under `.agents/skills/<name>/SKILL.md` for Codex, Devin and Antigravity, and `.claude/skills/<name>/SKILL.md` for Claude Code. Three harnesses may already see the same directory. An in-place source remains user-owned. A source with the same name but different content across selected harnesses is reported as a conflict.
 
 The installer searches registered workspace roots. Global harness skills are eligible when their canonical source is in the project or in a source root explicitly attributed to the project. If project skills live outside its checkout, create `.bridge-skills/sources.json` under the workspace and register **skill collection directories**, for example:

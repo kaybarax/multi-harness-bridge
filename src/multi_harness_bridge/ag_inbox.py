@@ -17,7 +17,7 @@ import time
 from . import ag_wake, config
 from .store import Store
 
-TOOLS = ("take_coordinator", "take_bridge", "pickup_notification", "acknowledge", "send_message", "set_pickup", "bridge_status")
+TOOLS = ("take_coordinator", "take_bridge", "pickup_notification", "acknowledge", "send_message", "set_pickup", "bridge_status", "propagate_skills")
 
 
 def server_name(project):
@@ -29,6 +29,27 @@ def _db(cfg):
     db.execute("""CREATE TABLE IF NOT EXISTS ag_hook_grants(
         digest TEXT PRIMARY KEY,project TEXT,session TEXT,tool TEXT,parameters TEXT,title TEXT,expires REAL)""")
     return db
+
+
+def _explicit_skill_sources(prompt):
+    """Read an explicit source list from this direct Desktop user turn."""
+    import re
+    if not isinstance(prompt, str):
+        raise PermissionError("Name the skill sources in the current user request")
+    match = re.fullmatch(
+        r"\s*(?:please\s+)?(?:@|/)?propagate(?:[ -]skills)\s+from\s+(.+?)\s*[.!]?\s*",
+        prompt, re.IGNORECASE,
+    )
+    if not match:
+        raise PermissionError("The current user request must explicitly name skill sources")
+    allowed = "codex|claude|devin|antigravity"
+    if not re.fullmatch(rf"\s*(?:{allowed})(?:\s*(?:,|and|\+)\s*(?:{allowed}))*\s*",
+                        match.group(1), re.IGNORECASE):
+        raise PermissionError("Skill source list must name supported harnesses explicitly")
+    sources = [item.lower() for item in re.findall(allowed, match.group(1), re.IGNORECASE)]
+    if len(sources) != len(set(sources)):
+        raise PermissionError("Duplicate skill sources are not allowed")
+    return sources
 
 
 def before_tool(cfg, project, event):
@@ -60,7 +81,13 @@ def before_tool(cfg, project, event):
     title = None
     if tool in {"take_bridge", "take_coordinator"}:
         from .role_adapters import _parse
-        title = _parse(event.get("lastUserInput"), "inbox" if tool == "take_bridge" else "coordinator")
+        title = _parse((event.get("lastUserInput") or "").removeprefix("@"), "inbox" if tool == "take_bridge" else "coordinator")
+    elif tool == "propagate_skills":
+        sources = _explicit_skill_sources(event.get("lastUserInput"))
+        supplied = args.get("sources")
+        if (not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied)
+                or supplied != sources):
+            raise PermissionError("Tool skill sources must exactly match the current user request")
     else:
         roles = Store(cfg.database).roles(project, "antigravity")
         if session not in roles.values() or tool in {"send_message", "set_pickup"} and session != roles["coordinator"]:
@@ -90,6 +117,9 @@ def invoke(cfg, project, tool, grant):
     store = Store(cfg.database)
     if not ag_wake._desktop_summary(project, session, cfg=cfg):
         raise PermissionError("Desktop session changed during tool call")
+    if tool == "propagate_skills":
+        from .propagation import install
+        return install(project, args["sources"], "antigravity", cfg=cfg)
     roles = store.roles(project, "antigravity")
     if tool in {"take_coordinator", "take_bridge"}:
         role = "coordinator" if tool == "take_coordinator" else "inbox"
@@ -164,6 +194,11 @@ def make_server(cfg, project):
     def set_pickup(enabled: bool, desktop_grant: str = "") -> dict:
         """Stop or resume the bound project and harness."""
         return invoke(cfg, project, "set_pickup", desktop_grant)
+
+    @server.tool()
+    def propagate_skills(sources: list[str], desktop_grant: str = "") -> dict:
+        """Copy named project skills to Antigravity after the Desktop hook verifies this user turn."""
+        return invoke(cfg, project, "propagate_skills", desktop_grant)
     return server
 
 

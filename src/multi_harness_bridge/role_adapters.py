@@ -171,6 +171,15 @@ def apply_native_title(invocation: Invocation, *, codex_home=None):
     return {"status": "verified", "title": invocation.title} if row and row[0] == invocation.title else {"status": "verification-failed"}
 
 
+def _codex_skill_text(text):
+    """Normalize a standalone Codex picker mention, preserving an optional title."""
+    match = re.fullmatch(
+        r'\[\$(take-(?:bridge|coordinator))\]\((?:[^\n]+[/\\])?\1[/\\]SKILL\.md\)([ \t]+.*)?',
+        text.strip(),
+    )
+    return match[1] + (match[2] or "") if match else text
+
+
 def codex_invocation(role=None, *, thread_id=None, home=None, cwd=None, project_hint=None):
     """Verify the current Codex top-level thread and latest direct user command."""
     thread_id = thread_id or os.environ.get("CODEX_THREAD_ID")
@@ -203,12 +212,15 @@ def codex_invocation(role=None, *, thread_id=None, home=None, cwd=None, project_
                     continue
                 payload = item.get("payload", {})
                 if item.get("type") == "response_item" and isinstance(payload, dict) and payload.get("role") == "user":
+                    metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+                    if metadata.get("content_item_kinds") == ["skills.selected_skill_instructions"]:
+                        continue
                     content = payload.get("content", "")
                     if isinstance(content, str):
                         latest = content
                     elif isinstance(content, list):
                         latest = "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
-        title = _parse(latest, role)
+        title = _parse(_codex_skill_text(latest), role)
         project, _ = _resolve(workspace, project_hint)
         return Invocation(project, "codex", thread_id, role or "", workspace, title, "codex-current-user-turn")
     except (OSError, sqlite3.Error, KeyError, TypeError) as exc:
@@ -255,10 +267,11 @@ def claude_hook_main():
         payload = json.load(sys.stdin)
         if not isinstance(payload, dict) or payload.get("hook_event_name") != "UserPromptSubmit":
             return 0
-        # Validate before persisting; this file is short-lived context, not a
-        # role authorization by itself. The CLI re-verifies transcript/session.
-        if not payload.get("session_id") or not payload.get("transcript_path") or not payload.get("cwd") or not isinstance(payload.get("prompt"), str):
-            raise ValueError("Incomplete native Claude hook payload")
+        # User-level hooks can be inherited by other hosts. Ignore payloads
+        # without Claude Code's native transcript identity; the CLI re-verifies
+        # the same transcript/session before using this short-lived context.
+        if not _native_claude_hook_payload(payload):
+            return 0
         identity = hashlib.sha256(payload["session_id"].encode("utf-8")).hexdigest()[:32]
         path = config.home() / "native-context" / f"claude-{identity}.json"
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -267,6 +280,30 @@ def claude_hook_main():
         return 0
     except (OSError, ValueError, json.JSONDecodeError):
         return 2
+
+
+def _native_claude_hook_payload(payload):
+    if (payload.get("hook_event_name") != "UserPromptSubmit"
+            or not isinstance(payload.get("session_id"), str)
+            or not isinstance(payload.get("prompt"), str)):
+        return False
+    try:
+        uuid.UUID(payload["session_id"])
+        from claude_agent_sdk import project_key_for_directory
+        workspace = Path(payload.get("cwd", "")).expanduser().resolve(strict=True)
+        transcript = Path(payload.get("transcript_path", "")).expanduser().resolve(strict=True)
+        config_root = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser().resolve()
+        projects = (config_root / "projects").resolve(strict=True)
+        expected_parent = projects / project_key_for_directory(workspace)
+        if (not transcript.is_file() or not transcript.is_relative_to(projects)
+                or transcript.parent != expected_parent
+                or transcript.name != payload["session_id"] + ".jsonl"):
+            return False
+        with transcript.open(encoding="utf-8") as stream:
+            return any(json.loads(line).get("sessionId") == payload["session_id"]
+                       for line in stream if line.strip())
+    except (ImportError, AttributeError, OSError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def install_claude_hook(workspace: Path):
@@ -369,7 +406,7 @@ def antigravity_invocation(role, event, *, resolve_native_conversation, project_
     """Check Desktop event against the host's native conversation resolver."""
     if not isinstance(event, dict):
         raise ValueError("Antigravity native event is required")
-    title = _parse(event.get("lastUserInput"), role)
+    title = _parse((event.get("lastUserInput") or "").removeprefix("@"), role)
     conversation = event.get("conversationId")
     if not isinstance(conversation, str) or not conversation:
         raise ValueError("Antigravity current conversation identity is unavailable")
@@ -385,7 +422,7 @@ def antigravity_native_invocation(role, event, *, summaries_db=None, project_hin
     """Resolve an Antigravity conversation from its local native summary DB."""
     if not isinstance(event, dict):
         raise ValueError("Antigravity native event is required")
-    title = _parse(event.get("lastUserInput"), role)
+    title = _parse((event.get("lastUserInput") or "").removeprefix("@"), role)
     conversation = event.get("conversationId")
     if not isinstance(conversation, str) or not conversation:
         raise ValueError("Antigravity current conversation identity is unavailable")

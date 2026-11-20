@@ -25,6 +25,26 @@ import urllib.request
 from .store import Store
 
 logger = logging.getLogger("multi_harness_bridge.telegram")
+BRIDGE_HEADING = "Mhb: Bridge Message"
+
+
+def _bridge_message(text, project, harness):
+    """Replace only a leading bridge heading and retain every other body byte."""
+    text = str(text)
+    heading_prefix = BRIDGE_HEADING + "\n"
+    legacy_prefix = "Bridge test message\n"
+    while text.startswith(heading_prefix):
+        text = text[len(heading_prefix):]
+    if text.startswith(legacy_prefix):
+        text = text[len(legacy_prefix):]
+    route = f"[{project}/{harness}]"
+    body = text if text.startswith(route) else f"{route} {text}"
+    return f"{BRIDGE_HEADING}\n{body}"
+
+
+def _canonical_bridge_message(text, project, harness):
+    """Normalize legacy and current forms for idempotency comparisons."""
+    return _bridge_message(text, project, harness)
 
 
 @dataclass(frozen=True)
@@ -342,8 +362,9 @@ class TelegramBridge:
                              (project, sender, recipient, key)).fetchone()
         if old:
             route_harness = old["route_harness"]
-            visible_body = body if body.startswith(f"[{project}/{route_harness}]") else f"[{project}/{route_harness}] {body}"
-            if (old["body"], old["source_queue_id"], old["reply_queue_id"]) != (
+            visible_body = _bridge_message(body, project, route_harness)
+            if (_canonical_bridge_message(old["body"], project, route_harness),
+                    old["source_queue_id"], old["reply_queue_id"]) != (
                     visible_body, source_queue_id, reply_to):
                 raise ValueError("Telegram send key was reused with different content or provenance")
             if old["state"] != "unsent":
@@ -381,7 +402,7 @@ class TelegramBridge:
                 route = persisted_route
             else:
                 raise ValueError("No unique Telegram destination is configured for this project and harness")
-            visible_body = body if body.startswith(f"[{project}/{route_harness}]") else f"[{project}/{route_harness}] {body}"
+            visible_body = _bridge_message(body, project, route_harness)
             bot, chat, api = route.bot, route.chat, self.apis[route.bot]
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")

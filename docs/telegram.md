@@ -3,7 +3,8 @@
 `multi-harness-telegram` joins allowlisted Telegram chats to the shared SQLite
 project queue. Its PMA worker consumes both PMA queue stages without a
 human-held lease. Harness messages addressed to `pma` appear in Telegram with
-their project and harness label. Telegram messages enter the PMA inbox and are
+the exact first line `Mhb: Bridge Message`, followed by their project and
+harness label. Telegram messages enter the PMA inbox and are
 forwarded to the selected harness. A reply to a bot message returns to the
 original harness with the originating queue UUID in `reply_to`.
 

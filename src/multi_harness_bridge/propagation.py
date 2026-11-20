@@ -125,8 +125,8 @@ def _replace(source, dest):
     return backup
 
 
-def _install(project, harnesses, target_host, project_roots, builtin):
-    cfg = config.load()
+def _install(project, harnesses, target_host, project_roots, builtin, cfg=None):
+    cfg = cfg or config.load()
     cfg.require(project)
     if target_host not in HARNESS_DIRS or (not builtin and (not harnesses or set(harnesses)-set(HARNESS_DIRS))):
         raise ValueError("Unknown or empty harness selection")
@@ -217,9 +217,9 @@ def _install(project, harnesses, target_host, project_roots, builtin):
         return report
 
 
-def install(project, source_harnesses, target_harness, *, project_roots=None):
-    return _install(project, tuple(dict.fromkeys(source_harnesses)), target_harness, project_roots, False)
+def install(project, source_harnesses, target_harness, *, project_roots=None, cfg=None):
+    return _install(project, tuple(dict.fromkeys(source_harnesses)), target_harness, project_roots, False, cfg)
 
 
-def bootstrap(project, target_harness, *, project_roots=None):
-    return _install(project, (), target_harness, project_roots, True)
+def bootstrap(project, target_harness, *, project_roots=None, cfg=None):
+    return _install(project, (), target_harness, project_roots, True, cfg)

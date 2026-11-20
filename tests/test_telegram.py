@@ -72,7 +72,7 @@ def test_queue_pma_bot_user_reply_returns_to_origin_harness_with_same_queue_uuid
     # and coordinator stages, then sends the routed notification to Telegram.
     original = store.send("alpha", "codex", "pma", "Build finished", "harness-result")
     assert bridge.deliver_pending("alpha") == 1
-    assert api.sent == [("-1001", "[alpha/codex] Build finished", None)]
+    assert api.sent == [("-1001", "Mhb: Bridge Message\n[alpha/codex] Build finished", None)]
 
     # A native Telegram reply to that provider message is recognized by its
     # stored bot/chat/message -> project/harness/queue provenance.
@@ -95,9 +95,52 @@ def test_fresh_user_input_routes_to_selected_project_harness_without_human_lease
     store.send("beta", "antigravity", "pma", "Review complete", "harness-followup",
                reply_to=delivered["id"])
     assert bridge.deliver_pending("beta") == 1
-    assert bridge.apis["shared"].sent[-1] == ("-1001", "[beta/antigravity] Review complete", 70)
+    assert bridge.apis["shared"].sent[-1] == ("-1001", "Mhb: Bridge Message\n[beta/antigravity] Review complete", 70)
     assert store.status("beta", "pma")["inbox"] == 0
     assert store.status("beta", "pma")["coordinator"] == 0
+
+
+def test_outbound_heading_replaces_only_leading_heading_and_preserves_body(tmp_path):
+    bridge, store, api = setup(tmp_path)
+    body = "Project: Beta\nHarness: Codex\nReference: keep-me\nMhb: Bridge Message inside content"
+    store.send("beta", "codex", "pma", body, "heading-replacement")
+    assert bridge.deliver_pending("beta") == 1
+    sent = api.sent[-1][1]
+    assert sent == "Mhb: Bridge Message\n[beta/codex] Project: Beta\nHarness: Codex\nReference: keep-me\nMhb: Bridge Message inside content"
+    assert sent.splitlines()[0] == "Mhb: Bridge Message"
+    assert sent.count("Mhb: Bridge Message") == 2  # only the caller's interior line remains
+
+
+@pytest.mark.parametrize("body", [
+    "Bridge test message\nProject: Beta\nReference: ref-1",
+    "Mhb: Bridge Message\nBridge test message\nProject: Beta\nReference: ref-1",
+    "Mhb: Bridge Message\nProject: Beta\nReference: ref-1",
+])
+def test_legacy_double_and_new_heading_forms_normalize_without_body_loss(tmp_path, body):
+    from multi_harness_bridge.telegram import _bridge_message
+    assert _bridge_message(body, "beta", "codex") == (
+        "Mhb: Bridge Message\n[beta/codex] Project: Beta\nReference: ref-1")
+
+
+def test_telegram_send_idempotency_accepts_legacy_double_and_new_bodies(tmp_path):
+    from multi_harness_bridge.telegram import _bridge_message
+    bridge, store, api = setup(tmp_path)
+    current = _bridge_message("Project: Beta\nReference: stable-ref", "beta", "codex")
+    with bridge.connect() as db:
+        for index, (key, body) in enumerate((
+            ("legacy", "Bridge test message\n[beta/codex] Project: Beta\nReference: stable-ref"),
+            ("double", "Mhb: Bridge Message\nBridge test message\n[beta/codex] Project: Beta\nReference: stable-ref"),
+            ("new", current),
+        ), start=902):
+            db.execute("""INSERT INTO telegram_sends
+                (project,sender,recipient,key,body,bot,chat,reply_to,state,message_id,route_harness,
+                 source_queue_id,reply_queue_id,allowed_users)
+                VALUES('beta','codex','pma',?,?,'shared','-1001',NULL,'sent',?,'codex',NULL,NULL,'[\"7\"]')""",
+                       (key, body, index))
+    for key, message_id in (("legacy", 902), ("double", 903), ("new", 904)):
+        old = bridge.send("beta", "codex", "pma", "Project: Beta\nReference: stable-ref", key)
+        assert old["state"] == "sent" and old["message_id"] == message_id
+    assert api.sent == []
 
 
 def test_two_projects_shared_chat_dedupe_allowlist_and_ambiguous_routes(tmp_path):
@@ -143,7 +186,7 @@ def test_tick_recovers_coordinator_stage_without_an_inbox_message(tmp_path):
     assert store.finish("alpha", "pma", "inbox", "pma-inbox-alpha", inbox["id"], inbox["lease"])
     assert store.status("alpha", "pma")["inbox"] == 0
     assert bridge.tick() == 1
-    assert api.sent == [("-1001", "[alpha/codex] Recover me", None)]
+    assert api.sent == [("-1001", "Mhb: Bridge Message\n[alpha/codex] Recover me", None)]
 
 
 def test_poll_advances_rejected_updates_but_propagates_store_value_errors(tmp_path):
@@ -165,7 +208,7 @@ def test_continuous_tick_isolates_project_and_bot_failures(tmp_path):
     store.send("alpha", "unknown", "pma", "bad route", "bad-route")
     store.send("beta", "codex", "pma", "good route", "good-route")
     assert bridge.tick(isolate_errors=True) == 1
-    assert api.sent == [("-1001", "[beta/codex] good route", None)]
+    assert api.sent == [("-1001", "Mhb: Bridge Message\n[beta/codex] good route", None)]
     assert store.status("alpha", "pma")["coordinator"] == 1
 
     failed = FakeAPI(poll_error=True)
@@ -209,7 +252,7 @@ def test_operator_reconciles_uncertain_sends_and_old_threads_survive_config_chan
         assert db.execute("SELECT state FROM telegram_sends WHERE source_queue_id=?",
                           (other["id"],)).fetchone()[0] == "unsent"
     assert changed.tick() == 1
-    assert api.sent[-1] == ("-1001", "[beta/antigravity] Retry only if proven absent", None)
+    assert api.sent[-1] == ("-1001", "Mhb: Bridge Message\n[beta/antigravity] Retry only if proven absent", None)
 
 def test_dedicated_bot_configuration_and_hermes_hook(tmp_path):
     config = tmp_path / "telegram.toml"

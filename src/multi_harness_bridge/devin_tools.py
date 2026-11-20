@@ -65,6 +65,20 @@ def _text(value):
     return ""
 
 
+def _devin_user_command(message):
+    """Use the native composer chips when Devin expands a slash skill into prose."""
+    metadata = message.get("metadata") or {}
+    blocks = (metadata.get("extensions") or {}).get("chisel/acp-content-blocks")
+    if blocks is None:
+        return _text(message.get("content"))
+    if metadata.get("is_user_input") is not True or not isinstance(blocks, list):
+        return ""
+    if any(not isinstance(block, dict) or block.get("type") != "text"
+           or not isinstance(block.get("text"), str) for block in blocks):
+        return ""
+    return "".join(block["text"] for block in blocks)
+
+
 def _native_call(project, tool, expected_args=None, *, role_command=None, freshness=180):
     """Resolve exactly one fresh, uncompleted native ACP call for this server."""
     db_path = _native_db()
@@ -112,7 +126,7 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                 if any(actual.get(key) != value for key, value in expected.items()):
                     continue
                 prior = [item for prior_id, item in messages[:index] if prior_id < row_id]
-                user = next((_text(item.get("content")) for item in reversed(prior) if item.get("role") == "user"), None)
+                user = next((_devin_user_command(item) for item in reversed(prior) if item.get("role") == "user"), None)
                 if role_command:
                     from .role_adapters import _parse
                     try:
