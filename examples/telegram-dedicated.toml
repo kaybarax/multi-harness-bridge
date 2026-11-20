@@ -1,0 +1,21 @@
+# Separate bot/chat per project. A route can omit [project/harness] because
+# the chat resolves to exactly one destination.
+[bots.alpha]
+token_env = "PROJECT_A_TELEGRAM_TOKEN"
+
+[bots.beta]
+token_env = "PROJECT_B_TELEGRAM_TOKEN"
+
+[[routes]]
+bot = "alpha"
+chat_id = "-1001234567890"
+allowed_users = ["123456789"]
+project = "project-a"
+harness = "claude"
+
+[[routes]]
+bot = "beta"
+chat_id = "-1009876543210"
+allowed_users = ["123456789"]
+project = "project-b"
+harness = "antigravity"

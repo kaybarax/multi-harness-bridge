@@ -1,0 +1,25 @@
+# One bot and chat shared by all listed projects/harnesses. Each new message
+# uses [project-slug/harness] unless it replies to a known project message.
+[bots.shared]
+token_env = "MULTI_HARNESS_TELEGRAM_TOKEN"
+
+[[routes]]
+bot = "shared"
+chat_id = "-1001234567890"
+allowed_users = ["123456789"]
+project = "project-a"
+harness = "codex"
+
+[[routes]]
+bot = "shared"
+chat_id = "-1001234567890"
+allowed_users = ["123456789"]
+project = "project-b"
+harness = "codex"
+
+[[routes]]
+bot = "shared"
+chat_id = "-1001234567890"
+allowed_users = ["123456789"]
+project = "project-b"
+harness = "antigravity"

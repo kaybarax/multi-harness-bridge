@@ -1,0 +1,10 @@
+name: multi-harness-telegram
+label: Multi Harness Telegram Router
+kind: standalone
+version: 0.1.0
+author: Multi Harness Bridge
+description: >
+  Routes allowlisted Telegram events from Hermes into the local public project
+  queue. Hermes remains the sole native update poller.
+provides_hooks:
+  - pre_gateway_dispatch
