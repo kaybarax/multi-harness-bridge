@@ -153,7 +153,7 @@ def generate(*, platform_name: str | None = None, output_dir: str | Path | None 
     output = Path(output_dir).expanduser() if output_dir is not None else default_output_dir(selected)
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    python = str(Path(executable or _current_executable()).expanduser().resolve())
+    python = os.path.abspath(Path(executable or _current_executable()).expanduser())
     created = []
     for project, roots in sorted(state.projects.items()):
         if not roots:

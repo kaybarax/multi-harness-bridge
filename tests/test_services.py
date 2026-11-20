@@ -87,3 +87,6 @@ def test_service_preserves_virtualenv_interpreter_path(tmp_path, monkeypatch):
         pytest.skip(f"symlinks unavailable: {exc}")
     monkeypatch.setattr(sys, "executable", str(executable))
     assert _current_executable() == str(executable)
+    state = Config(tmp_path / "state", {"sample": (tmp_path,)})
+    unit, = generate(platform_name="macos", output_dir=tmp_path / "units", state=state)
+    assert plistlib.loads(unit.read_bytes())["ProgramArguments"][0] == str(executable)
