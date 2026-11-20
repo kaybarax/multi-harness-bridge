@@ -81,6 +81,29 @@ before resolving it. Confirmed sends advance the queue through its coordinator
 stage. After a restart, expired coordinator leases are claimed independently
 even when the PMA inbox is empty.
 
+Resolve an uncertain send only after checking its exact project and queue UUID.
+To record a confirmed provider receipt, provide the positive Telegram message
+ID found in the conversation:
+
+```sh
+multi-harness-telegram \
+  --database "$MHB_HOME/bridge.sqlite3" \
+  --telegram-state "$MHB_HOME/telegram.sqlite3" \
+  --reconcile-project project-a \
+  --reconcile-queue-id QUEUE-UUID \
+  --reconcile-outcome confirmed-sent \
+  --provider-message-id 1234
+```
+
+If you verified that Telegram did not create the message, use
+`--reconcile-outcome verified-unsent` and omit `--provider-message-id`. That
+explicit decision releases the exact coordinator lease; the next tick may
+retry the same key against its persisted bot, chat and thread, even if the
+active route config has changed. A confirmed receipt also preserves the
+historical allowlist and route provenance needed to correlate later replies.
+The continuous service isolates bot/project failures and keeps running;
+`--once` exits on the first operational failure for diagnosis.
+
 The focused tests use a simulated Bot API and the real SQLite Store. They cover
 multiple projects and harnesses, both directions of the PMA route, native
 thread replies, dedupe, uncertainty, shared/dedicated configurations, and the

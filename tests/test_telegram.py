@@ -1,18 +1,20 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from multi_harness_bridge.store import Store
-from multi_harness_bridge.telegram import Route, TelegramBridge, load_config
+from multi_harness_bridge.telegram import Route, TelegramBridge, load_config, main as telegram_main
 
 
 class FakeAPI:
-    def __init__(self, *, failures=0, updates=()):
+    def __init__(self, *, failures=0, updates=(), poll_error=False):
         self.sent = []
         self.failures = failures
         self.updates = list(updates)
+        self.poll_error = poll_error
 
     def send_message(self, chat, text, reply_to=None):
         self.sent.append((chat, text, reply_to))
@@ -23,6 +25,8 @@ class FakeAPI:
 
     def get_updates(self, offset=None, timeout=0):
         assert timeout == 0
+        if self.poll_error:
+            raise RuntimeError("simulated poll failure")
         result, self.updates = self.updates, []
         return result
 
@@ -148,7 +152,6 @@ def test_poll_advances_rejected_updates_but_propagates_store_value_errors(tmp_pa
     assert bridge.poll_once("shared") == 1
     with bridge.connect() as db:
         assert db.execute("SELECT next_offset FROM telegram_polling WHERE bot='shared'").fetchone()[0] == 2
-
     api.updates = [update(2, 2, "[alpha/codex] Retry me")]
     store.send = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("sender stopped"))
     with pytest.raises(ValueError, match="sender stopped"):
@@ -157,6 +160,57 @@ def test_poll_advances_rejected_updates_but_propagates_store_value_errors(tmp_pa
         assert db.execute("SELECT next_offset FROM telegram_polling WHERE bot='shared'").fetchone()[0] == 2
 
 
+def test_continuous_tick_isolates_project_and_bot_failures(tmp_path):
+    bridge, store, api = setup(tmp_path)
+    store.send("alpha", "unknown", "pma", "bad route", "bad-route")
+    store.send("beta", "codex", "pma", "good route", "good-route")
+    assert bridge.tick(isolate_errors=True) == 1
+    assert api.sent == [("-1001", "[beta/codex] good route", None)]
+    assert store.status("alpha", "pma")["coordinator"] == 1
+
+    failed = FakeAPI(poll_error=True)
+    bridge.apis = {"broken": failed, "shared": api}
+    assert bridge.poll_all(isolate_errors=True) == 0
+    with pytest.raises(RuntimeError, match="simulated poll failure"):
+        bridge.poll_all(isolate_errors=False)
+
+
+def test_operator_reconciles_uncertain_sends_and_old_threads_survive_config_change(tmp_path):
+    api = FakeAPI(failures=1)
+    bridge, store, _ = setup(tmp_path, api)
+    source = store.send("alpha", "codex", "pma", "Possibly sent", "manual-confirm")
+    with pytest.raises(RuntimeError, match="simulated timeout"):
+        bridge.tick()
+    assert telegram_main(["--database", store.path, "--telegram-state", str(bridge.path),
+                          "--reconcile-project", "alpha", "--reconcile-queue-id", source["id"],
+                          "--reconcile-outcome", "confirmed-sent", "--provider-message-id", "901"]) == 0
+
+    # Remove alpha/codex from live routing. The persisted provider receipt still
+    # finishes its exact queue item and admits the authenticated thread reply.
+    changed_routes = [Route("shared", "-1001", frozenset({"7"}), "alpha", "claude"),
+                      Route("shared", "-1001", frozenset({"7"}), "beta", "codex"),
+                      Route("shared", "-1001", frozenset({"7"}), "beta", "antigravity")]
+    changed = TelegramBridge(bridge.path, store, changed_routes, {"shared": api})
+    assert changed.tick() == 1
+    api.updates = [update(15, 82, "Continue after config change", reply=901)]
+    assert changed.poll_all() == 1
+    forwarded = claim_roundtrip(store, "alpha", "codex")
+    assert forwarded["reply_to"] == source["id"]
+
+    # A verified-unsent decision authorizes exactly one same-key retry.
+    api.failures = 1
+    other = store.send("beta", "antigravity", "pma", "Retry only if proven absent", "manual-unsent")
+    with pytest.raises(RuntimeError, match="simulated timeout"):
+        changed.tick()
+    assert telegram_main(["--database", store.path, "--telegram-state", str(bridge.path),
+                          "--reconcile-project", "beta", "--reconcile-queue-id", other["id"],
+                          "--reconcile-outcome", "verified-unsent"]) == 0
+    with bridge.connect() as db:
+        assert db.execute("SELECT state FROM telegram_sends WHERE source_queue_id=?",
+                          (other["id"],)).fetchone()[0] == "unsent"
+    assert changed.tick() == 1
+    assert api.sent[-1] == ("-1001", "[beta/antigravity] Retry only if proven absent", None)
+
 def test_dedicated_bot_configuration_and_hermes_hook(tmp_path):
     config = tmp_path / "telegram.toml"
     config.write_text('''[bots.dedicated]\ntoken_env="DEDICATED_TOKEN"\n\n[[routes]]\nbot="dedicated"\nchat_id="-20"\nallowed_users=["8"]\nproject="beta"\nharness="codex"\n''')
@@ -164,6 +218,14 @@ def test_dedicated_bot_configuration_and_hermes_hook(tmp_path):
         load_config(config, {})
     apis, routes = load_config(config, {"DEDICATED_TOKEN": "not-a-real-token"})
     assert set(apis) == {"dedicated"}
+    example_dir = Path(__file__).parents[1] / "examples"
+    shared_apis, shared_routes = load_config(example_dir / "telegram-shared.toml",
+                                             {"MULTI_HARNESS_TELEGRAM_TOKEN": "fake-shared-token"})
+    dedicated_apis, dedicated_routes = load_config(example_dir / "telegram-dedicated.toml",
+                                                   {"PROJECT_A_TELEGRAM_TOKEN": "fake-a",
+                                                    "PROJECT_B_TELEGRAM_TOKEN": "fake-b"})
+    assert len(shared_apis) == 1 and len(shared_routes) == 3
+    assert len(dedicated_apis) == 2 and len(dedicated_routes) == 2
     bridge, store, api = setup(tmp_path / "hermes")
 
     class Context:
