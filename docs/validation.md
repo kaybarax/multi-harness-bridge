@@ -4,8 +4,8 @@ The original workflow ran on macOS. This repository distributes a generalized im
 
 | Platform or interface | Evidence | What to verify on your installation |
 |---|---|---|
-| macOS | Python package tests exercise SQLite, role rotation, wake bookkeeping, native transcript fixtures, MCP and A2A. The Antigravity helper was compiled locally. | Confirm that the installed host version accepts a wake, presents the intended conversation, and preserves your existing composer draft. |
-| Linux | The queue, CLI and peer-route self-test were exercised in a Linux container. The package can render a user systemd service. | Install the service in your login session and verify each available host's native command. |
+| macOS | A clean checkout was built into a wheel and installed in a fresh environment. All 71 tests passed. The tests exercise SQLite, role rotation, wake bookkeeping, native transcript fixtures, MCP and A2A. The Antigravity helper was compiled locally. | Confirm that the installed host version accepts a wake, presents the intended conversation, and preserves your existing composer draft. |
+| Linux | The installed wheel passed 69 tests on Linux ARM64 with Python 3.12. The two macOS-specific tests were skipped. The offline queue self-test also completed twelve routes. A generated unit passed systemd’s native verifier. | Install the service in your login session and verify each available host's native command. |
 | Windows | The package supports Python 3.11+ and generates a Task Scheduler definition. Tests inspect its XML and quoting. | Windows installation and an interactive desktop run require validation on a Windows machine. |
 | Telegram and Hermes | Automated tests use a simulated Bot API with the real queue, including provider uncertainty and correlated replies. | Verify bot permissions, chat and user allowlists, and a threaded return message with your own account. |
 | Claude Code | Automated checks cover its local integration. | Run a live inbox-to-coordinator test when a Claude session is available. |

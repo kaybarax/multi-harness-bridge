@@ -16,7 +16,7 @@ def main():
         parser.exit(1, "Use Python 3.11 or newer.\n")
     root = Path(__file__).resolve().parents[1]
     environment = (args.venv or root / ".venv").resolve()
-    venv.EnvBuilder(with_pip=True).create(environment)
+    venv.EnvBuilder(with_pip=True, symlinks=os.name != "nt").create(environment)
     bin_dir = environment / ("Scripts" if os.name == "nt" else "bin")
     python = bin_dir / ("python.exe" if os.name == "nt" else "python")
     # A wheel install also makes the bundled skills available outside the clone.
