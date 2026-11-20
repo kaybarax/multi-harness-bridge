@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.multi-harness-bridge.wake</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/absolute/path/to/multi-harness-wake</string>
+    <string>--project</string><string>your-project-id</string>
+  </array>
+  <key>WorkingDirectory</key><string>/absolute/path/to/registered/workspace</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>MHB_HOME</key><string>/absolute/path/to/private/mhb-home</string>
+    <key>MHB_WAKE_CONFIG</key><string>/absolute/path/to/private/wake.json</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/absolute/path/to/private/wake.log</string>
+  <key>StandardErrorPath</key><string>/absolute/path/to/private/wake-error.log</string>
+</dict>
+</plist>

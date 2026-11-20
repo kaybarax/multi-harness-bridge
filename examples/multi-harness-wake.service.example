@@ -1,0 +1,15 @@
+[Unit]
+Description=Multi Harness Bridge native session wake monitor
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/absolute/path/to/registered/workspace
+Environment=MHB_HOME=/absolute/path/to/private/mhb-home
+Environment=MHB_WAKE_CONFIG=/absolute/path/to/private/wake.json
+ExecStart=/absolute/path/to/multi-harness-wake --project your-project-id
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
