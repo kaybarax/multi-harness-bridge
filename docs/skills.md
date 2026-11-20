@@ -1,6 +1,19 @@
 # Project skills and native role access
 
-From a registered project workspace, run:
+Setup provisions three user-wide skills. Open a fresh chat in your registered project and use the composer for your app.
+
+| App | Coordinator | Bridge Inbox | Propagation |
+| --- | --- | --- | --- |
+| Codex | `$take-coordinator` | `$take-bridge` | `$propagate-skills` |
+| Devin Desktop Local (select a project folder first) | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+| Antigravity Desktop | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+| Claude Code | `/take-coordinator` | `/take-bridge` | `/propagate-skills` |
+
+In Devin Desktop, select **Local**, choose the project in **Session folder**, then type `/take` in the composer to see both role skills. Type `/propagate` to find the third. An unscoped Local composer can show an empty picker. The standalone Devin CLI lists the same slash commands. Selecting a role skill and sending the request performs the handoff. Append a quoted title to request a sidebar rename.
+
+Setup preserves existing skill entries, including customized files and links. Review any same-name entry reported as preserved. Use `--no-user-skills` for an isolated installation. To provision just the skills from an installed environment, run `python -m multi_harness_bridge.user_skills`. Keep that environment's command directory on the harness PATH.
+
+To enable native role operations for a registered project, run `multi-harness-skills --install-native` from the invoking harness. For project-local skill copies and native setup together, run:
 
 ```sh
 multi-harness-skills --bootstrap

@@ -11,6 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core-only", action="store_true", help="Skip optional MCP, A2A and Claude integration libraries")
     parser.add_argument("--venv", type=Path, help="Directory for the isolated Python environment")
+    parser.add_argument("--no-user-skills", action="store_true", help="Skip user-wide chat skill installation")
     args = parser.parse_args()
     if sys.version_info < (3, 11):
         parser.exit(1, "Use Python 3.11 or newer.\n")
@@ -25,6 +26,8 @@ def main():
     command = bin_dir / ("mhb.exe" if os.name == "nt" else "mhb")
     subprocess.run([str(command), "init"], check=True)
     subprocess.run([str(command), "self-test"], check=True)
+    if not args.no_user_skills:
+        subprocess.run([str(python), "-m", "multi_harness_bridge.user_skills"], check=True)
     print(f"Bridge installed. Add {bin_dir} to your PATH or activate {environment}.")
 
 
