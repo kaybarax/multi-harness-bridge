@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multi-harness-bridge"
+version = "0.1.0"
+description = "A local, project-scoped mailbox and handoff system for AI development harnesses"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = []
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.12,<2"]
+test = ["pytest>=8,<10"]
+
+[project.scripts]
+mhb = "multi_harness_bridge.cli:main"
+multi-harness-bridge = "multi_harness_bridge.cli:main"
+multi-harness-wake = "multi_harness_bridge.wake:main"
+multi-harness-telegram = "multi_harness_bridge.telegram:main"
+multi-harness-skills = "multi_harness_bridge.skills:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+multi_harness_bridge = ["builtin_skills/*/SKILL.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
