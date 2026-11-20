@@ -135,6 +135,4 @@ the Store database. A confirmed send is not repeated. A verified pre-submit
 refusal can be retried at most three times. If a host call times out or returns
 an ambiguous result after it may have submitted the prompt, the attempt is
 marked `uncertain` and is not automatically retried; inspect the native
-session and reconcile manually. A pre-existing wake record remains
-authoritative even if a role is later rebound, because the old send's outcome
-cannot safely be inferred from the new binding.
+session and reconcile manually. Each wake record identifies the exact project, harness, role and native session. A replacement chat can receive a new wake for pending work. The durable queue validates the current binding and lease before advancing the message.

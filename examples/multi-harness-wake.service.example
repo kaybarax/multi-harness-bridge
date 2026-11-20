@@ -1,6 +1,5 @@
 [Unit]
 Description=Multi Harness Bridge native session wake monitor
-After=default.target
 
 [Service]
 Type=simple
