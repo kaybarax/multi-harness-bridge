@@ -1,6 +1,8 @@
 import json
 import sqlite3
 import io
+import os
+import stat
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -97,3 +99,28 @@ def test_claude_hook_context_is_partitioned_by_session(tmp_path, monkeypatch):
     path = tmp_path / "bridge-home/native-context" / ("claude-" + __import__("hashlib").sha256(session.encode()).hexdigest()[:32] + ".json")
     assert json.loads(path.read_text())["session_id"] == session
     assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_codex_title_uses_native_app_server_and_reads_back(tmp_path, monkeypatch):
+    session = "39b3a1ac-6a0d-46c2-a3b6-5404eb4c4e61"
+    codex_home = tmp_path / "codex"
+    codex_home.mkdir()
+    with sqlite3.connect(codex_home / "state_5.sqlite") as db:
+        db.execute("CREATE TABLE threads(id TEXT PRIMARY KEY,name TEXT)")
+        db.execute("INSERT INTO threads VALUES(?,?)", (session, "old"))
+    binary_dir = tmp_path / "bin"
+    binary_dir.mkdir()
+    fake = binary_dir / "codex"
+    fake.write_text("#!/usr/bin/env python3\nimport json,os,sqlite3,sys\n"
+                    "for line in sys.stdin:\n"
+                    " m=json.loads(line)\n"
+                    " if m.get('id')==2:\n"
+                    "  p=os.path.join(os.environ['CODEX_HOME'],'state_5.sqlite')\n"
+                    "  with sqlite3.connect(p) as d:d.execute('UPDATE threads SET name=? WHERE id=?',(m['params']['name'],m['params']['threadId']))\n"
+                    " if 'id' in m: print(json.dumps({'id':m['id'],'result':{}}),flush=True)\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", str(binary_dir) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    invocation = adapters.Invocation("sample", "codex", session, "coordinator", tmp_path,
+                                     title="Verified name", proof="fixture")
+    assert adapters.apply_native_title(invocation) == {"status":"verified", "title":"Verified name"}

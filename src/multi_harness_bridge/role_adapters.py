@@ -118,24 +118,31 @@ def apply_native_title(invocation: Invocation, *, codex_home=None):
     command = ["codex", "app-server", "--stdio"]
     try:
         process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.DEVNULL, text=True)
+                                    stderr=subprocess.DEVNULL, bufsize=0)
+        output_buffer = bytearray()
         def send(value):
-            process.stdin.write(json.dumps(value) + "\n")
+            process.stdin.write((json.dumps(value) + "\n").encode("utf-8"))
             process.stdin.flush()
         def wait_response(request_id):
+            nonlocal output_buffer
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                ready, _, _ = select.select([process.stdout], [], [], max(0, deadline-time.monotonic()))
-                if not ready:
-                    break
-                line = process.stdout.readline()
-                if not line:
-                    break
-                message = json.loads(line)
-                if message.get("id") == request_id:
-                    if message.get("error"):
-                        raise RuntimeError("Codex app-server rejected title update")
-                    return message.get("result")
+                if b"\n" not in output_buffer:
+                    ready, _, _ = select.select([process.stdout.fileno()], [], [], max(0, deadline-time.monotonic()))
+                    if not ready:
+                        break
+                    data = os.read(process.stdout.fileno(), 65536)
+                    if not data:
+                        break
+                    output_buffer.extend(data)
+                while b"\n" in output_buffer:
+                    line, _, rest = output_buffer.partition(b"\n")
+                    output_buffer = bytearray(rest)
+                    message = json.loads(line.decode("utf-8"))
+                    if message.get("id") == request_id:
+                        if message.get("error"):
+                            raise RuntimeError("Codex app-server rejected title update")
+                        return message.get("result")
             raise RuntimeError("Codex app-server did not confirm title update")
         send({"method":"initialize","id":1,"params":{"clientInfo":{"name":"multi-harness-bridge","version":"0.1"}}})
         wait_response(1)

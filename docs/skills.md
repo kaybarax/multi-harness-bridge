@@ -14,6 +14,8 @@ Claude receives a project-local `UserPromptSubmit` hook in
 `mhb_roles_<project>` in `.devin/mcp_config.local.json`, preserving existing
 servers. Antigravity installs project MCP grants and its signed native helper.
 Codex needs no project configuration edits for native session verification.
+Install the package with the `mcp` extra before loading the Devin server, then
+reload the project MCP configuration in Devin Desktop.
 
 For an initial shell-based setup where no native caller context is available,
 select the target explicitly with `multi-harness-skills --bootstrap --to devin`
