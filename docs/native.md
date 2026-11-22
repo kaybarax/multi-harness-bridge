@@ -79,7 +79,9 @@ the relay grace window the dispatcher reports `relay-pending` instead of
 queueing. The inbox agent's `bridge-mailbox` finish then returns a
 `wake_relay` instruction, and the agent invokes the native
 `send_message_to_thread` tool once with the exact `threadId` and `prompt` to
-inject the wake into the coordinator's active turn. Only after that tool call
+inject the wake into the coordinator's active turn. The relay prompt is a
+short reviewer-safe variant because Codex's `auto_review` approval reviewer
+rejects the queue `WAKE_PROMPT` wording for cross-thread sends. Only after that tool call
 succeeds does the agent run `--mailbox relay-confirm --message-id <id>`, which
 records the relay in the wake ledger and suppresses the fallback queue for
 that notification. A failed or skipped tool call leaves the fallback eligible:

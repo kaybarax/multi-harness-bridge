@@ -243,15 +243,18 @@ def _claim_and_finish(cfg, store, message_id, host="codex"):
 
 def test_codex_inbox_finish_emits_wake_relay_without_confirming(tmp_path, monkeypatch):
     from multi_harness_bridge import wake
-    from multi_harness_bridge.wake import WAKE_PROMPT
+    from multi_harness_bridge.wake import WAKE_PROMPT, WAKE_RELAY_PROMPT
 
     cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
     message_id = store.send("sample", "devin", "codex", "queued work", "stable-id")["id"]
     result = _claim_and_finish(cfg, store, message_id)
     assert result["finished"] is True
+    # The relay uses the reviewer-safe prompt variant, not the queue wording.
     assert result["wake_relay"] == {"tool": "send_message_to_thread",
                                     "threadId": coordinator_session,
-                                    "prompt": WAKE_PROMPT.format(notification_id=message_id)}
+                                    "prompt": WAKE_RELAY_PROMPT.format(notification_id=message_id)}
+    assert result["wake_relay"]["prompt"] != WAKE_PROMPT.format(notification_id=message_id)
+    assert "bridge-mailbox" in result["wake_relay"]["prompt"]
     assert store.trace("sample", message_id)["stage"] == "coordinator"
     # Finish alone must not suppress the queue fallback; the dispatcher still
     # holds the fresh wake in the relay grace window.

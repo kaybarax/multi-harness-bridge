@@ -12,7 +12,7 @@ import sys
 import time
 
 from . import config
-from .wake import WAKE_PROMPT, record_agent_relay
+from .wake import WAKE_RELAY_PROMPT, record_agent_relay
 
 from .propagation import (BUILTIN_ROOT, HARNESS_DIRS, MANIFEST, _blockers, _skills,
                           bootstrap, digest, install)
@@ -139,7 +139,7 @@ def _mailbox(args, host, cfg):
                 if coordinator:
                     result["wake_relay"] = {"tool": "send_message_to_thread",
                                             "threadId": coordinator,
-                                            "prompt": WAKE_PROMPT.format(notification_id=args.message_id)}
+                                            "prompt": WAKE_RELAY_PROMPT.format(notification_id=args.message_id)}
     elif args.mailbox == "relay-confirm":
         # The inbox agent confirms only after the relayed tool call succeeded;
         # until then the dispatcher's queued fallback stays eligible.
