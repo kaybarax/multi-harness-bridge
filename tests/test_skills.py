@@ -207,3 +207,81 @@ def test_native_cli_multiline_fanout_and_reply(tmp_path, monkeypatch, capsys):
                  "--key", "reply-key"])
     reply = json.loads(capsys.readouterr().out)
     assert reply["request_id"] == request["request_id"]
+
+
+def _relay_fixture(tmp_path, monkeypatch, host="codex", option=True):
+    """Bound codex pair with one inbox-stage delivery addressed to the harness."""
+    from multi_harness_bridge import config, role_adapters
+    from multi_harness_bridge.store import Store
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    cfg = Config(tmp_path, {"sample": (workspace,)})
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setenv("MULTI_HARNESS_BRIDGE_HARNESS", host)
+    inbox_session = f"{host}-inbox-session"
+    coordinator_session = f"{host}-coordinator-session"
+    monkeypatch.setattr(skills, "_native_invocation", lambda host_, hint=None: role_adapters.Invocation(
+        "sample", host, inbox_session, "", workspace, proof="fixture-native"))
+    store = Store(cfg.database)
+    store.bind("sample", host, "coordinator", coordinator_session)
+    store.bind("sample", host, "inbox", inbox_session)
+    if option:
+        config.set_project_option(cfg.root, "sample", "codex", "coordinator_wake", "agent-relay")
+    return cfg, store, inbox_session, coordinator_session
+
+
+def _claim_and_finish(cfg, store, message_id, host="codex"):
+    args = SimpleNamespace(project=None, mailbox="claim", message_id=message_id, lease=None,
+                           recipient=None, body=None, body_file=None, key=None, reply_to=None)
+    claimed = skills._mailbox(args, host, cfg)
+    args.mailbox = "finish"
+    args.message_id = claimed["message"]["id"]
+    args.lease = claimed["message"]["lease"]
+    return skills._mailbox(args, host, cfg)
+
+
+def test_codex_inbox_finish_emits_wake_relay_and_records_dedup(tmp_path, monkeypatch):
+    import sqlite3
+
+    from multi_harness_bridge.wake import WAKE_PROMPT
+
+    cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    message_id = store.send("sample", "devin", "codex", "queued work", "stable-id")["id"]
+    result = _claim_and_finish(cfg, store, message_id)
+    assert result["finished"] is True
+    assert result["wake_relay"] == {"tool": "send_message_to_thread",
+                                    "threadId": coordinator_session,
+                                    "prompt": WAKE_PROMPT.format(notification_id=message_id)}
+    assert store.trace("sample", message_id)["stage"] == "coordinator"
+    with sqlite3.connect(cfg.database) as db:
+        row = db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
+                         (message_id,)).fetchone()
+    assert row == ("sent",)
+
+
+def test_mailbox_finish_omits_wake_relay_when_option_off(tmp_path, monkeypatch):
+    cfg, store, _, _ = _relay_fixture(tmp_path, monkeypatch, option=False)
+    message_id = store.send("sample", "devin", "codex", "queued work", "stable-id")["id"]
+    result = _claim_and_finish(cfg, store, message_id)
+    assert result["finished"] is True and "wake_relay" not in result
+
+
+def test_mailbox_finish_omits_wake_relay_for_non_codex_host(tmp_path, monkeypatch):
+    cfg, store, _, _ = _relay_fixture(tmp_path, monkeypatch, host="claude")
+    message_id = store.send("sample", "devin", "claude", "queued work", "stable-id")["id"]
+    result = _claim_and_finish(cfg, store, message_id, host="claude")
+    assert result["finished"] is True and "wake_relay" not in result
+
+
+def test_mailbox_finish_outbound_stage_does_not_relay(tmp_path, monkeypatch):
+    cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    store.bind("sample", "devin", "coordinator", "devin-coordinator")
+    store.bind("sample", "devin", "inbox", "devin-inbox")
+    request = store.send_fanout("sample", "codex", ["devin"], "fanout body", "req-key",
+                                session=coordinator_session)
+    delivery_id = request["deliveries"][0]["id"]
+    result = _claim_and_finish(cfg, store, delivery_id)
+    # The codex inbox finish moves outbound -> inbox; the coordinator is not next.
+    assert result["finished"] is True and "wake_relay" not in result
+    assert store.trace("sample", delivery_id)["stage"] == "inbox"

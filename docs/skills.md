@@ -91,6 +91,15 @@ delivery to their own Coordinator.
 For Codex and Claude, finish requires the exact lease from that claim, passed
 as `--mailbox finish --message-id <id> --lease=<lease>`.
 
+When a project enables the Codex agent relay (`mhb option set PROJECT codex
+coordinator_wake agent-relay`), a Codex inbox finish that advances a delivery
+to the Coordinator stage returns a `wake_relay` field naming the native
+send-message tool, the coordinator `threadId`, and the wake `prompt`. The
+mailbox skill instructs the agent to invoke that tool once before ending the
+turn; the field is absent for other harnesses, other stages, and when the
+option is off. See the [native wake guide](native.md) for the queue fallback
+and `.codex/config.toml` approval requirements.
+
 Ask a bound Coordinator to send one message to named peer harnesses. Use
 `codex` for Codex, `claude` for Claude Code, `devin` for Devin Local, and
 `antigravity` for Antigravity Desktop in the recipient list. In Codex or

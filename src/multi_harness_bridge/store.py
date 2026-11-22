@@ -469,6 +469,7 @@ class Store:
     def _message_payload(row):
         result = {field: row[field] for field in ("id", "body", "sender", "recipient", "reply_to")}
         result["attempt"] = row["attempts"] + 1
+        result["updated"] = row["updated"]
         if row["request_id"] is not None:
             result.update(request_id=row["request_id"], stage=row["stage"])
         return result

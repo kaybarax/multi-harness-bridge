@@ -24,6 +24,7 @@ from . import config
 POLL_SECONDS = 4.0
 COMMAND_TIMEOUT = 8.0
 MAX_COMMAND_TIMEOUT = 60.0
+RELAY_GRACE_SECONDS = 45.0
 HARNESS_NAMES = {"codex", "claude", "devin", "antigravity"}
 ROLES = {"coordinator", "inbox"}
 WAKE_PROMPT = ("A new Multi Harness Bridge message is pending (notification {notification_id}). "
@@ -139,6 +140,22 @@ def _devin_workspace(cfg, project, session):
     raise WakeDeferred("Devin bound session has no verified working directory in the project")
 
 
+def _load_codex_thread(session):
+    """Best-effort macOS deep link that loads an unloaded Codex Desktop thread.
+
+    ``codex queue`` only drains inside a thread the Desktop app has loaded;
+    a cold thread never receives the queued wake. Opening the thread URL
+    attaches it to the app-server first. This briefly navigates the Desktop
+    UI, returns immediately, and never blocks or fails the wake itself.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        _run(["open", f"codex://threads/{session}"], timeout=5)
+    except (WakeRejected, WakeError, OSError):
+        pass
+
+
 def _default_wake(harness, values, *, before_prompt=None):
     """Use a supported host CLI where one is available on PATH."""
     prompt = WAKE_PROMPT.format(notification_id=values["notification_id"])
@@ -146,6 +163,7 @@ def _default_wake(harness, values, *, before_prompt=None):
         executable = shutil.which("codex")
         if not executable:
             raise WakeError("Codex CLI is unavailable; configure a native adapter")
+        _load_codex_thread(values["session"])
         argv = [executable, "queue", "--thread", values["session"], "--message", prompt]
     elif harness == "claude":
         if os.environ.get("MHB_CLAUDE_DETACHED_WAKE") != "1":
@@ -223,6 +241,39 @@ def _attempt_status(db, notification_id, project, harness, role, session):
     return {"id": notification_id, "status": row[0]} if row else None
 
 
+def record_agent_relay(store, project, harness, role, session, notification_id):
+    """Record a wake delivered through an in-session agent relay as sent.
+
+    The bound inbox agent reaches this through the mailbox finish path when it
+    emits a relay instruction. The durable ledger then suppresses the polling
+    dispatcher's fallback queue for the same notification. An existing attempt
+    row is never overwritten.
+    """
+    db = _ledger(store.path)
+    try:
+        now = time.time()
+        with db:
+            db.execute("""INSERT OR IGNORE INTO mhb_wake_attempts
+                (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+                VALUES (?,?,?,?,?,'sent',1,?,?)""",
+                (notification_id, project, harness, role, session, now, now))
+    finally:
+        db.close()
+
+
+def _agent_relay_enabled(store, project):
+    """True when options.json opts this project into the Codex agent relay."""
+    return config.project_option(Path(store.path).parent, project,
+                                 "codex", "coordinator_wake") == "agent-relay"
+
+
+def _within_relay_grace(item):
+    """True while the pending item is younger than the agent-relay grace window."""
+    updated = item.get("updated")
+    return (isinstance(updated, (int, float)) and not isinstance(updated, bool)
+            and time.time() - updated < RELAY_GRACE_SECONDS)
+
+
 def wake_one(store, project, harness, role, session, *, commands=None):
     """Nudge one pending notification for the exact active native role.
 
@@ -258,6 +309,12 @@ def wake_one(store, project, harness, role, session, *, commands=None):
         if not candidate:
             return _attempt_status(db, item["id"], project, harness, role, session)
     item = candidate
+    if (harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
+            and _within_relay_grace(item)):
+        # The bound inbox agent relays this wake inside its own turn. Hold the
+        # queue fallback briefly; record_agent_relay suppresses it on success
+        # and the normal path resumes once the grace window expires.
+        return {"status": "relay-pending", "id": item["id"]}
     values = {"project": project, "harness": harness, "role": role,
               "session": session, "notification_id": str(item.get("id", "")),
               # Never forward the mailbox body into a prompt, argv, or GUI.

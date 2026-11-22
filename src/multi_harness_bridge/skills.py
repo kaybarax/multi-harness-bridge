@@ -6,11 +6,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import time
 
 from . import config
+from .wake import WAKE_PROMPT, record_agent_relay
 
 from .propagation import (BUILTIN_ROOT, HARNESS_DIRS, MANIFEST, _blockers, _skills,
                           bootstrap, digest, install)
@@ -129,6 +131,22 @@ def _mailbox(args, host, cfg):
         if finished and previous_claim is not None:
             previous_claim.unlink(missing_ok=True)
         result = {"project": project, "role": role, "message_id": args.message_id, "finished": finished}
+        if (finished and host == "codex" and role == "inbox"
+                and config.project_option(cfg.root, project, "codex", "coordinator_wake") == "agent-relay"):
+            trace = store.trace(project, args.message_id)
+            if trace and trace.get("stage") == "coordinator":
+                coordinator = store.roles(project, "codex").get("coordinator")
+                if coordinator:
+                    try:
+                        record_agent_relay(store, project, "codex", "coordinator",
+                                           coordinator, args.message_id)
+                    except (OSError, sqlite3.Error):
+                        # A missed ledger row only means the dispatcher may also
+                        # queue its fallback wake; the relay still stands.
+                        pass
+                    result["wake_relay"] = {"tool": "send_message_to_thread",
+                                            "threadId": coordinator,
+                                            "prompt": WAKE_PROMPT.format(notification_id=args.message_id)}
     elif args.mailbox in {"send", "send-fanout", "reply"}:
         if role != "coordinator":
             raise PermissionError("Coordinator ownership is required for sending and replying")

@@ -28,6 +28,19 @@ def build_parser():
     add = project.add_parser("add")
     add.add_argument("name")
     add.add_argument("roots", nargs="+", type=Path)
+    option = commands.add_parser("option", help="Read or change per-project harness options")
+    option_cmds = option.add_subparsers(dest="action", required=True)
+    listing = option_cmds.add_parser("list")
+    listing.add_argument("project", nargs="?")
+    setting = option_cmds.add_parser("set")
+    setting.add_argument("project")
+    setting.add_argument("harness", choices=HOSTS)
+    setting.add_argument("key")
+    setting.add_argument("value")
+    removing = option_cmds.add_parser("unset")
+    removing.add_argument("project")
+    removing.add_argument("harness", choices=HOSTS)
+    removing.add_argument("key")
     for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace", "pending", "monitor"):
         cmd = commands.add_parser(name)
         cmd.add_argument("project")
@@ -100,6 +113,20 @@ def run(args):
         if args.action == "add":
             config = settings.register(args.name, args.roots)
         return {name: [str(path) for path in paths] for name, paths in config.projects.items()}
+    if args.command == "option":
+        if args.action == "list":
+            options = settings.load_options(config.root)
+            if args.project is not None:
+                options = {name: opts for name, opts in options.items() if name == args.project}
+            return {"options": options}
+        project = config.require(args.project)
+        value = args.value if args.action == "set" else None
+        options = settings.set_project_option(config.root, project, args.harness, args.key, value)
+        result = {"options": options}
+        if args.harness == "codex" and args.key == "coordinator_wake" and value == "agent-relay":
+            result["codex_workspaces"] = [settings.provision_codex_workspace(path)
+                                          for path in config.projects[project]]
+        return result
     if args.command == "doctor":
         return {"platform": platform.platform(), "python": platform.python_version(), "sqlite": sqlite3.sqlite_version,
                 "state": str(config.root), "initialized": config.database.is_file(),

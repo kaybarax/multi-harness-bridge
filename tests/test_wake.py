@@ -1,9 +1,10 @@
 import sqlite3
+import time
 import uuid
 
 import pytest
 
-from multi_harness_bridge import wake
+from multi_harness_bridge import config, wake
 from multi_harness_bridge import devin_acp
 from multi_harness_bridge.store import Store
 
@@ -451,3 +452,127 @@ def test_reconcile_refuses_active_wake_and_recovers_stale_sending(tmp_path):
                    (now - wake.MAX_COMMAND_TIMEOUT - 20, item_id))
     db.close()
     assert wake.reconcile(store, "sample", item_id, "not-sent")["status"] == "retryable"
+
+
+def _codex_relay_store(tmp_path, *, updated=None):
+    """Store with a fresh codex coordinator-pending message and agent-relay on."""
+    store = Store(tmp_path / "bridge.sqlite3")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    message = store.send("sample", "devin", "codex", "queued work", "stable-key")
+    claimed = store.claim("sample", "codex", "inbox", "codex-inbox",
+                          message_id=message["id"])
+    store.finish("sample", "codex", "inbox", "codex-inbox",
+                 message["id"], claimed["lease"])
+    config.set_project_option(tmp_path, "sample", "codex", "coordinator_wake", "agent-relay")
+    if updated is not None:
+        with sqlite3.connect(store.path) as db:
+            db.execute("UPDATE messages SET updated=? WHERE id=?",
+                       (updated, message["id"]))
+    return store, message["id"]
+
+
+def test_codex_agent_relay_holds_fresh_coordinator_wake(tmp_path, monkeypatch):
+    store, message_id = _codex_relay_store(tmp_path)
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("fallback dispatched during grace"))
+    result = wake.wake_one(store, "sample", "codex", "coordinator",
+                           "codex-coordinator", commands={})
+    assert result == {"status": "relay-pending", "id": message_id}
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM mhb_wake_attempts").fetchone()[0] == 0
+
+
+def test_codex_agent_relay_falls_back_to_queue_after_grace(tmp_path, monkeypatch):
+    store, message_id = _codex_relay_store(
+        tmp_path, updated=time.time() - wake.RELAY_GRACE_SECONDS - 1)
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    result = wake.wake_one(store, "sample", "codex", "coordinator",
+                           "codex-coordinator", commands={})
+    assert result == {"id": message_id, "status": "sent"}
+    assert calls == [message_id]
+
+
+def test_codex_coordinator_wake_without_option_dispatches_immediately(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    message = store.send("sample", "devin", "codex", "queued work", "stable-key")
+    claimed = store.claim("sample", "codex", "inbox", "codex-inbox",
+                          message_id=message["id"])
+    store.finish("sample", "codex", "inbox", "codex-inbox",
+                 message["id"], claimed["lease"])
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    result = wake.wake_one(store, "sample", "codex", "coordinator",
+                           "codex-coordinator", commands={})
+    assert result == {"id": message["id"], "status": "sent"}
+    assert calls == [message["id"]]
+
+
+def test_codex_agent_relay_only_covers_coordinator_role(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    message = store.send("sample", "devin", "codex", "queued work", "stable-key")
+    config.set_project_option(tmp_path, "sample", "codex", "coordinator_wake", "agent-relay")
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    result = wake.wake_one(store, "sample", "codex", "inbox",
+                           "codex-inbox", commands={})
+    assert result == {"id": message["id"], "status": "sent"}
+    assert calls == [message["id"]]
+
+
+def test_agent_relay_record_suppresses_fallback_wake(tmp_path, monkeypatch):
+    store, message_id = _codex_relay_store(tmp_path)
+    wake.record_agent_relay(store, "sample", "codex", "coordinator",
+                            "codex-coordinator", message_id)
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("duplicate wake dispatched"))
+    result = wake.wake_one(store, "sample", "codex", "coordinator",
+                           "codex-coordinator", commands={})
+    assert result == {"id": message_id, "status": "sent"}
+
+
+def test_codex_thread_load_is_darwin_best_effort(monkeypatch):
+    calls = []
+    monkeypatch.setattr(wake.sys, "platform", "darwin")
+    monkeypatch.setattr(wake, "_run", lambda argv, timeout=8: calls.append((argv, timeout)))
+    wake._load_codex_thread("thread-123")
+    assert calls == [(["open", "codex://threads/thread-123"], 5)]
+    calls.clear()
+    monkeypatch.setattr(wake.sys, "platform", "linux")
+    wake._load_codex_thread("thread-123")
+    assert calls == []
+    monkeypatch.setattr(wake.sys, "platform", "darwin")
+
+    def boom(*_, **__):
+        raise wake.WakeError("unavailable")
+
+    monkeypatch.setattr(wake, "_run", boom)
+    wake._load_codex_thread("thread-123")
+
+
+def test_default_wake_codex_loads_thread_then_queues(monkeypatch):
+    order = []
+    monkeypatch.setattr(wake.shutil, "which", lambda name: "/fake/codex")
+    monkeypatch.setattr(wake, "_load_codex_thread", lambda session: order.append(("load", session)))
+
+    def fake_run(argv, timeout=8):
+        order.append(("run", argv))
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(wake, "_run", fake_run)
+    wake._default_wake("codex", {"project": "sample", "harness": "codex",
+                                 "role": "coordinator", "session": "sess-1",
+                                 "notification_id": "nid-1", "body": "wake"})
+    assert order[0] == ("load", "sess-1")
+    assert order[1][0] == "run"
+    argv = order[1][1]
+    assert argv[1:4] == ["queue", "--thread", "sess-1"]
+    assert "nid-1" in argv[-1]

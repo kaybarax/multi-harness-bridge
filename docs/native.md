@@ -63,7 +63,25 @@ establish the native mailbox role by itself.
 ## Host differences
 
 Codex uses its `codex queue --thread SESSION --message PROMPT` host interface,
-which queues a prompt for the exact session. Claude Code uses its in-session
+which queues a prompt for the exact session. On macOS the dispatcher first
+opens `codex://threads/SESSION` so an unloaded Desktop thread attaches to the
+app-server and can drain the queue; the deep link briefly navigates the
+Desktop UI. Queued items only dispatch at turn boundaries, so a busy
+coordinator chat can hold a wake behind a manual steer. A project can instead
+opt into the agent relay with `mhb option set PROJECT codex coordinator_wake
+agent-relay`, which records the choice in `<MHB_HOME>/options.json` and
+merges `approval_policy = "on-request"` and `approvals_reviewer =
+"auto_review"` into each registered workspace's `.codex/config.toml` without
+removing existing keys. Codex applies approval mode per thread at creation,
+so the bound inbox thread must be created after that file exists; the relay
+tool refuses older threads. While a coordinator-bound message is younger than
+the relay grace window the dispatcher reports `relay-pending` instead of
+queueing. The inbox agent's `bridge-mailbox` finish then returns a
+`wake_relay` instruction, and the agent invokes the native
+`send_message_to_thread` tool once with the exact `threadId` and `prompt` to
+inject the wake into the coordinator's active turn. A recorded relay
+suppresses the fallback queue for that notification; past the grace window
+the normal `codex queue` path remains the automatic fallback. Claude Code uses its in-session
 `mhb monitor PROJECT claude ROLE SESSION` subscription by default. It prints
 JSON hints for the bound session and never invokes a detached model turn. A
 detached `claude --resume SESSION --print PROMPT` wake is available only when
