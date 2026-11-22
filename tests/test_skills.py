@@ -241,9 +241,8 @@ def _claim_and_finish(cfg, store, message_id, host="codex"):
     return skills._mailbox(args, host, cfg)
 
 
-def test_codex_inbox_finish_emits_wake_relay_and_records_dedup(tmp_path, monkeypatch):
-    import sqlite3
-
+def test_codex_inbox_finish_emits_wake_relay_without_confirming(tmp_path, monkeypatch):
+    from multi_harness_bridge import wake
     from multi_harness_bridge.wake import WAKE_PROMPT
 
     cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
@@ -254,10 +253,78 @@ def test_codex_inbox_finish_emits_wake_relay_and_records_dedup(tmp_path, monkeyp
                                     "threadId": coordinator_session,
                                     "prompt": WAKE_PROMPT.format(notification_id=message_id)}
     assert store.trace("sample", message_id)["stage"] == "coordinator"
+    # Finish alone must not suppress the queue fallback; the dispatcher still
+    # holds the fresh wake in the relay grace window.
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("fallback dispatched during grace"))
+    assert wake.wake_one(store, "sample", "codex", "coordinator",
+                         coordinator_session, commands={}) == {
+        "status": "relay-pending", "id": message_id}
+
+
+def _relay_confirm(cfg, store, message_id, host="codex"):
+    args = SimpleNamespace(project=None, mailbox="relay-confirm", message_id=message_id,
+                           lease=None, recipient=None, body=None, body_file=None,
+                           key=None, reply_to=None)
+    return skills._mailbox(args, host, cfg)
+
+
+def test_relay_confirm_records_sent_and_suppresses_fallback(tmp_path, monkeypatch):
+    import sqlite3
+
+    from multi_harness_bridge import wake
+
+    cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    message_id = store.send("sample", "devin", "codex", "queued work", "stable-id")["id"]
+    _claim_and_finish(cfg, store, message_id)
+    result = _relay_confirm(cfg, store, message_id)
+    assert result == {"project": "sample", "role": "inbox",
+                      "message_id": message_id, "relay_confirmed": True}
     with sqlite3.connect(cfg.database) as db:
         row = db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
                          (message_id,)).fetchone()
     assert row == ("sent",)
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("fallback dispatched after confirm"))
+    assert wake.wake_one(store, "sample", "codex", "coordinator",
+                         coordinator_session, commands={}) == {"id": message_id, "status": "sent"}
+    # Confirming twice is idempotent.
+    assert _relay_confirm(cfg, store, message_id)["relay_confirmed"] is True
+
+
+def test_relay_confirm_rejects_wrong_stage_missing_and_unbound(tmp_path, monkeypatch):
+    from multi_harness_bridge import role_adapters, wake
+
+    cfg, store, inbox_session, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    message_id = store.send("sample", "devin", "codex", "queued work", "stable-id")["id"]
+    # Still at inbox stage: not awaiting the coordinator.
+    with pytest.raises(ValueError, match="not awaiting"):
+        _relay_confirm(cfg, store, message_id)
+    # Unknown message id.
+    with pytest.raises(ValueError, match="not awaiting"):
+        _relay_confirm(cfg, store, "99999999-9999-4999-8999-999999999999")
+    # A session with no binding cannot confirm.
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint=None: role_adapters.Invocation(
+        "sample", "codex", "unbound-session", "", tmp_path / "project", proof="fixture-native"))
+    with pytest.raises(ValueError, match="not bound"):
+        _relay_confirm(cfg, store, message_id)
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint=None: role_adapters.Invocation(
+        "sample", "codex", inbox_session, "", tmp_path / "project", proof="fixture-native"))
+    _claim_and_finish(cfg, store, message_id)
+    # Every rejected confirm left the fallback wake eligible in the grace window.
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("fallback dispatched during grace"))
+    assert wake.wake_one(store, "sample", "codex", "coordinator",
+                         coordinator_session, commands={}) == {
+        "status": "relay-pending", "id": message_id}
+
+
+def test_relay_confirm_rejects_non_codex_host(tmp_path, monkeypatch):
+    cfg, store, _, _ = _relay_fixture(tmp_path, monkeypatch, host="claude")
+    message_id = store.send("sample", "devin", "claude", "queued work", "stable-id")["id"]
+    _claim_and_finish(cfg, store, message_id, host="claude")
+    with pytest.raises(ValueError, match="only valid for the codex harness"):
+        _relay_confirm(cfg, store, message_id, host="claude")
 
 
 def test_mailbox_finish_omits_wake_relay_when_option_off(tmp_path, monkeypatch):

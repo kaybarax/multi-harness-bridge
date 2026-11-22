@@ -79,9 +79,12 @@ the relay grace window the dispatcher reports `relay-pending` instead of
 queueing. The inbox agent's `bridge-mailbox` finish then returns a
 `wake_relay` instruction, and the agent invokes the native
 `send_message_to_thread` tool once with the exact `threadId` and `prompt` to
-inject the wake into the coordinator's active turn. A recorded relay
-suppresses the fallback queue for that notification; past the grace window
-the normal `codex queue` path remains the automatic fallback. Claude Code uses its in-session
+inject the wake into the coordinator's active turn. Only after that tool call
+succeeds does the agent run `--mailbox relay-confirm --message-id <id>`, which
+records the relay in the wake ledger and suppresses the fallback queue for
+that notification. A failed or skipped tool call leaves the fallback eligible:
+past the grace window the normal `codex queue` path still delivers, so a
+forgotten confirm costs at most a harmless duplicate wake. Claude Code uses its in-session
 `mhb monitor PROJECT claude ROLE SESSION` subscription by default. It prints
 JSON hints for the bound session and never invokes a detached model turn. A
 detached `claude --resume SESSION --print PROMPT` wake is available only when

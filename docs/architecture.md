@@ -21,7 +21,7 @@ The coordinator and inbox are two distinct roles even when both are visible unde
 
 For replies, keep the shared `request_id` and each recipient's delivery ID from the send result. The origin processes replies through its usual mailbox tools, using `reply_to` to match each reply to a recipient delivery. If an assistant needs to wait, the in-session monitor and native wake worker report available messages while the database holds the durable state. Claiming grants a lease. Finishing records receipt, and a failed consumer leaves work available after lease expiry. The [native wake guide](native.md) covers notification deduplication and recovery when a submitted prompt has an uncertain outcome.
 
-A Codex project can opt into the agent relay (`coordinator_wake: agent-relay` in `options.json`). The inbox agent then relays the coordinator wake inside its own turn through the native send-message-to-thread tool instead of waiting for `codex queue` to drain. The mailbox records that relay in the same wake ledger the dispatcher uses, so the fallback queue does not also fire; the ordinary queue path remains the fallback after a short grace window.
+A Codex project can opt into the agent relay (`coordinator_wake: agent-relay` in `options.json`). The inbox agent then relays the coordinator wake inside its own turn through the native send-message-to-thread tool instead of waiting for `codex queue` to drain. After a successful tool call the agent confirms the relay through the mailbox, which records it in the same wake ledger the dispatcher uses so the fallback queue does not also fire; an unconfirmed or failed relay leaves the ordinary queue path eligible after a short grace window.
 
 ## Isolation and recovery checks
 

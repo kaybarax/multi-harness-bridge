@@ -137,16 +137,30 @@ def _mailbox(args, host, cfg):
             if trace and trace.get("stage") == "coordinator":
                 coordinator = store.roles(project, "codex").get("coordinator")
                 if coordinator:
-                    try:
-                        record_agent_relay(store, project, "codex", "coordinator",
-                                           coordinator, args.message_id)
-                    except (OSError, sqlite3.Error):
-                        # A missed ledger row only means the dispatcher may also
-                        # queue its fallback wake; the relay still stands.
-                        pass
                     result["wake_relay"] = {"tool": "send_message_to_thread",
                                             "threadId": coordinator,
                                             "prompt": WAKE_PROMPT.format(notification_id=args.message_id)}
+    elif args.mailbox == "relay-confirm":
+        # The inbox agent confirms only after the relayed tool call succeeded;
+        # until then the dispatcher's queued fallback stays eligible.
+        if host != "codex":
+            raise ValueError("relay-confirm is only valid for the codex harness")
+        if role != "inbox":
+            raise PermissionError("The bound inbox session relays coordinator wakes")
+        if not args.message_id:
+            raise ValueError("--message-id is required for relay-confirm")
+        trace = store.trace(project, args.message_id)
+        if not trace or trace.get("stage") != "coordinator" or trace.get("recipient") != host:
+            raise ValueError("message is not awaiting this harness's coordinator")
+        coordinator = store.roles(project, host).get("coordinator")
+        if not coordinator:
+            raise ValueError("no coordinator is bound for this harness")
+        try:
+            record_agent_relay(store, project, host, "coordinator", coordinator, args.message_id)
+        except (OSError, sqlite3.Error) as exc:
+            raise ValueError(f"relay confirmation could not be recorded ({type(exc).__name__})") from None
+        result = {"project": project, "role": role, "message_id": args.message_id,
+                  "relay_confirmed": True}
     elif args.mailbox in {"send", "send-fanout", "reply"}:
         if role != "coordinator":
             raise PermissionError("Coordinator ownership is required for sending and replying")
@@ -193,7 +207,7 @@ def main(argv=None):
     parser.add_argument("--install-native", action="store_true", help="Install supported host-local hook/helper")
     parser.add_argument("--take", choices=("coordinator", "bridge"), help="Transfer the current verified native chat to this role")
     parser.add_argument("--hint", help="Disambiguate a project matching the current native workspace")
-    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
+    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "relay-confirm", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
     parser.add_argument("--message-id")
     parser.add_argument("--lease", help="Exact lease returned by the claim being finished")
     parser.add_argument("--recipient", action="append", help="Destination harness, repeat for send-fanout")
