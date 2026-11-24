@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shlex
 import sqlite3
@@ -30,7 +31,62 @@ def _db(cfg):
     db = sqlite3.connect(cfg.database, timeout=5)
     db.execute("""CREATE TABLE IF NOT EXISTS ag_hook_grants(
         digest TEXT PRIMARY KEY,project TEXT,session TEXT,tool TEXT,parameters TEXT,title TEXT,expires REAL)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS ag_hook_grant_proofs(
+        digest TEXT PRIMARY KEY,orchestrator INTEGER NOT NULL,request_id TEXT)""")
     return db
+
+
+def _extract_user_request(content):
+    """Extract one direct request from Antigravity's native transcript envelope."""
+    if not isinstance(content, str):
+        raise ValueError("Native user content must be text")
+    opening, closing = "<USER_REQUEST>", "</USER_REQUEST>"
+    if opening not in content and closing not in content:
+        return content
+    if content.count(opening) != 1 or content.count(closing) != 1:
+        raise ValueError("Native user request envelope is missing or duplicated")
+    match = re.fullmatch(r"\s*<USER_REQUEST>(.*?)</USER_REQUEST>(.*)", content, re.DOTALL)
+    if not match:
+        raise ValueError("Native user request envelope has an invalid shape")
+    request, trailer = match.groups()
+    sections = re.fullmatch(
+        r"\s*(?:<ADDITIONAL_METADATA>(.*?)</ADDITIONAL_METADATA>\s*)?"
+        r"(?:<USER_SETTINGS_CHANGE>(.*?)</USER_SETTINGS_CHANGE>\s*)?",
+        trailer, re.DOTALL,
+    )
+    if not sections:
+        raise ValueError("Native user request has malformed trailing context")
+    return request
+
+
+def _orchestrator_request_id(event, brain, session):
+    """Bind opt-in to the latest verified native user turn, never prompt text alone."""
+    transcript = brain / ".system_generated/logs/transcript.jsonl"
+    try:
+        latest = None
+        with transcript.open(encoding="utf-8") as stream:
+            for line in stream:
+                item = json.loads(line)
+                if (isinstance(item, dict) and item.get("source") == "USER_EXPLICIT"
+                        and item.get("type") == "USER_INPUT"):
+                    latest = item
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise PermissionError("Cannot verify Antigravity's current native user turn for -orc") from None
+    prompt = event.get("lastUserInput")
+    if not isinstance(prompt, str):
+        raise PermissionError("Antigravity -orc requires the direct user command in native turn evidence")
+    prompt = prompt.strip().removeprefix("@").strip()
+    step = latest.get("step_index") if latest else None
+    content = latest.get("content") if latest else None
+    try:
+        request = _extract_user_request(content).strip()
+    except ValueError:
+        raise PermissionError("Antigravity native user request envelope is invalid") from None
+    request = request.strip().removeprefix("@").strip()
+    if (not isinstance(step, int) or isinstance(step, bool) or step < 0
+            or request != prompt.strip()):
+        raise PermissionError("Cannot match Antigravity -orc to the latest native user turn")
+    return f"antigravity:{session}:{step}"
 
 
 def _explicit_skill_request(prompt):
@@ -94,9 +150,14 @@ def before_tool(cfg, project, event):
     args = dict(call.get("args") or {})
     args.pop("desktop_grant", None)
     title = None
+    orchestrator = False
+    request_id = None
     if tool in {"take_bridge", "take_coordinator"}:
-        from .role_adapters import _parse
-        title = _parse((event.get("lastUserInput") or "").removeprefix("@"), "inbox" if tool == "take_bridge" else "coordinator")
+        from .role_adapters import _parse_details
+        title, orchestrator = _parse_details((event.get("lastUserInput") or "").removeprefix("@"),
+                                            "inbox" if tool == "take_bridge" else "coordinator")
+        if orchestrator:
+            request_id = _orchestrator_request_id(event, brain, session)
     elif tool == "propagate_skills":
         mode, sources = _explicit_skill_request(event.get("lastUserInput"))
         supplied = args.get("sources")
@@ -123,9 +184,12 @@ def before_tool(cfg, project, event):
     token = secrets.token_urlsafe(32)
     with closing(_db(cfg)) as db, db:
         db.execute("DELETE FROM ag_hook_grants WHERE expires<=?", (time.time(),))
-        db.execute("INSERT INTO ag_hook_grants VALUES(?,?,?,?,?,?,?)",
-                   (hashlib.sha256(token.encode()).hexdigest(), project, session, tool,
-                    json.dumps(args, sort_keys=True), title, time.time()+120))
+        db.execute("DELETE FROM ag_hook_grant_proofs WHERE digest NOT IN (SELECT digest FROM ag_hook_grants)")
+        digest = hashlib.sha256(token.encode()).hexdigest()
+        db.execute("INSERT INTO ag_hook_grants(digest,project,session,tool,parameters,title,expires) VALUES(?,?,?,?,?,?,?)",
+                   (digest, project, session, tool, json.dumps(args, sort_keys=True), title, time.time()+120))
+        db.execute("INSERT INTO ag_hook_grant_proofs VALUES(?,?,?)",
+                   (digest, int(orchestrator), request_id))
     return {"decision":"allow", "overwrite":{"desktop_grant":token}}
 
 
@@ -139,9 +203,13 @@ def invoke(cfg, project, tool, grant):
                          (fingerprint, project, tool, time.time())).fetchone()
         if not row:
             raise PermissionError("Expired, used or mismatched Desktop grant")
+        proof = db.execute("SELECT orchestrator,request_id FROM ag_hook_grant_proofs WHERE digest=?",
+                           (fingerprint,)).fetchone()
         db.execute("DELETE FROM ag_hook_grants WHERE digest=?", (fingerprint,))
+        db.execute("DELETE FROM ag_hook_grant_proofs WHERE digest=?", (fingerprint,))
     session, data, title = row
     args = json.loads(data)
+    orchestrator, request_id = (bool(proof[0]), proof[1]) if proof else (False, None)
     store = config.open_store(cfg)
     if tool == "propagate_skills":
         summary = ag_wake._desktop_propagation_summary(
@@ -163,10 +231,18 @@ def invoke(cfg, project, tool, grant):
     if tool in {"take_coordinator", "take_bridge"}:
         role = "coordinator" if tool == "take_coordinator" else "inbox"
         previous = roles[role]
-        roles = store.bind(project, "antigravity", role, session, take=True)
+        if role == "coordinator":
+            takeover = store.take_coordinator(project, "antigravity", session,
+                                              designate=bool(orchestrator), request_id=request_id)
+            roles = takeover["roles"]
+            orchestrator_status = takeover["orchestrator"]
+        else:
+            roles = store.bind(project, "antigravity", role, session, take=True)
         result = {"project":project,"harness":"antigravity","role":role,"previous":previous,
                   "roles":roles,"status":store.status(project,"antigravity"),
                   "pending":store.pending_overview(project,"antigravity",20)}
+        if role == "coordinator":
+            result["orchestrator"] = orchestrator_status
         if title is not None:
             try:
                 ag_wake.rename(project, role, session, title, cfg=cfg)
@@ -179,7 +255,8 @@ def invoke(cfg, project, tool, grant):
     if role is None:
         raise PermissionError("The Desktop chat no longer owns a role")
     if tool == "bridge_status":
-        return {"roles":roles, "status":store.status(project,"antigravity")}
+        return {"roles":roles, "status":store.status(project,"antigravity"),
+                "orchestrator":store.orchestrator_status(project)}
     if tool == "pickup_notification":
         item = store.claim(project, "antigravity", role, session, message_id=args.get("notification_id"))
         if not item:

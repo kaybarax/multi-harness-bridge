@@ -28,6 +28,12 @@ def build_parser():
     add = project.add_parser("add")
     add.add_argument("name")
     add.add_argument("roots", nargs="+", type=Path)
+    orchestrator = commands.add_parser("orchestrator", help="Inspect or clear the optional project board owner")
+    orchestrator_commands = orchestrator.add_subparsers(dest="action", required=True)
+    orchestrator_status = orchestrator_commands.add_parser("status")
+    orchestrator_status.add_argument("project")
+    orchestrator_clear = orchestrator_commands.add_parser("clear")
+    orchestrator_clear.add_argument("project")
     skill_entry = commands.add_parser("skill-entry", help="Validate or refresh repository-owned project skill pins")
     entry_actions = skill_entry.add_subparsers(dest="action", required=True)
     entry_refresh = entry_actions.add_parser("refresh", help="Recompute entry, index, and procedure hashes")
@@ -171,6 +177,10 @@ def run(args):
         return {"credential_file": str(args.out.resolve()), "project": args.project, "role": args.role}
     project = config.require(args.project)
     store = settings.open_store(config)
+    if args.command == "orchestrator":
+        if args.action == "status":
+            return store.project_status(project)
+        return store.clear_orchestrator(project)
     if args.command == "pending":
         return store.pending_overview(project, args.harness, args.limit)
     if args.command == "trace":

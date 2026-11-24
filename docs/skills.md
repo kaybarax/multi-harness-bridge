@@ -55,6 +55,18 @@ Use canonical harness identifiers in commands and source lists: `codex`,
 `claude`, `devin`, and `antigravity`. The Devin Desktop Local UI uses the
 `devin` identifier; `devin_local` is not a supported harness alias.
 
+## Optional project orchestrator
+
+Two teams can use the same bridge differently. One can invoke plain `take-coordinator` in each harness and leave each coordinator in charge of its own workers and mailbox. Another can also choose one coordinator to own a shared project board. Both use the same inboxes, delivery routes and worker assignments.
+
+To designate a board owner, invoke `$take-coordinator -orc` in Codex or `/take-coordinator -orc` in Claude Code, Devin Local or Antigravity. For a title, use `take-coordinator -orc "Release planning"`. The flag must come directly from the user. In `take-coordinator "-orc"` the quoted text is a title.
+
+Repeat the flagged command in a different coordinator chat to transfer board ownership. Plain takeover rotates only the local coordinator. If it replaces the chat that owned the board, check project status and explicitly designate a successor when ready. A project can continue with a vacant board at any time. The designation identifies the board contact and grants no additional mailbox or execution permissions.
+
+Inspect the current designation and the project’s harness coordinators with `mhb orchestrator status PROJECT`. Use the local operator command `mhb orchestrator clear PROJECT` to return to independent coordination while retaining all harness bindings. Check status after a handoff or a missed peer notice.
+
+For a project using an external binding provider, complete that provider’s native coordinator handoff first. The flagged MHB invocation verifies that the calling chat holds the binding before recording the designation. If the provider reports an incomplete handoff, finish or recover it there and retry the invocation. See [deployment reconciliation](deployment-reconciliation.md).
+
 ## Propagating project skills
 
 Name source harnesses explicitly:

@@ -21,3 +21,16 @@ The earlier Accessibility-based macOS Antigravity dispatcher was also exercised 
 The current Antigravity App sidecar passed a separate macOS background test. A bound Devin coordinator sent a harmless request to Antigravity. The bound Antigravity inbox and coordinator received native system messages and returned one pre-authorized, correlated reply to the original Devin chat. Codex remained in front throughout the exchange. The installed sidecar build passed 134 automated tests. See the [fresh-install steps](../README.md#set-up-the-antigravity-background-sidecar).
 
 Run `mhb self-test` for twelve directed, simulated round trips across two projects. Use the [live acceptance checklist](checklist.md) to exercise desktop sessions and Telegram. A provider receipt, a successful queue claim and a reply visible in a native chat are distinct observations.
+
+## Optional project orchestrator
+
+On macOS, disposable projects were used to compare plain coordinator takeover at `6391811` with the optional orchestrator implementation. Each native check used a real user turn and an independent read of the bridge state.
+
+| Native harness | Plain takeover | Additional check |
+| --- | --- | --- |
+| Codex CLI | Both builds bound the requesting chat with no board owner. | An explicit `-orc` designated the chat. A later plain takeover from a fresh chat made the designation stale. |
+| Claude Code | Both builds bound the requesting chat with no board owner. | An explicit `-orc` designated the chat. After an operator cleared the owner, a plain takeover preserved the cleared state. |
+| Devin Local | Both builds bound the requesting chat with no board owner. | An explicit `-orc` designated the chat. A quoted `"-orc"` acted as a title on role rotation. The optional sidebar rename reported an error on both builds. |
+| Antigravity Desktop | Both builds bound the requesting chat with no board owner. Pickup remained disabled and the queues stayed empty. | A fresh chat invoked `/take-coordinator -orc` with a quoted title. The bridge recorded that chat as owner at revision one. |
+
+The full Python suite passed all 207 tests from both the source checkout and the installed candidate wheel. The offline self-test completed twelve directed round trips across two isolated projects.

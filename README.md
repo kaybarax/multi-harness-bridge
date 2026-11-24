@@ -43,6 +43,8 @@ The default state directory is `~/.multi-harness-bridge`. Set `MHB_HOME` before 
 4. **Enable pickup.** For Antigravity Desktop, follow [Set up the Antigravity background sidecar](#set-up-the-antigravity-background-sidecar) below. For other apps, follow the [native wake guide](docs/native.md). Check the project with `mhb status orchard codex`. For automatic startup, generate a [user service definition](docs/services.md). Use the `bridge-mailbox` skill to send one free-text request from a coordinator to one or more peer harnesses in the project. Inspect each coordinator's receipt and send a reply using its delivery ID.
 5. **Connect Telegram if desired.** Choose a shared bot or dedicated bots, configure the authorized chat and users, and select who owns the Telegram connection. A threaded reply returns through the PMA to the originating harness and project. See [Telegram and Hermes](docs/telegram.md).
 
+Each harness can coordinate its workers independently. If your project uses a shared board and you want one chat to own it, invoke `take-coordinator -orc` in that chat. You can leave the board owner unset for the lifetime of the project. [Optional project orchestrator](docs/skills.md#optional-project-orchestrator)
+
 ### Set up the Antigravity background sidecar
 
 On macOS, run the default setup under **Try it locally** and activate its virtual environment. The Antigravity adapter needs the MCP dependencies. Use the same environment and `MHB_HOME` for all commands below. Keep the virtual environment at its installed path because the Desktop app uses its Python executable to start the sidecar.

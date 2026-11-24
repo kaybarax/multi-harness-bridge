@@ -144,7 +144,8 @@ def _mailbox(args, host, cfg):
         raise ValueError("This verified native chat is not bound to a project role")
     if args.mailbox == "status":
         result = {"project": project, "harness": host, "role": role, "session": invocation.session,
-                  "roles": roles, "queue": store.status(project, host)}
+                  "roles": roles, "queue": store.status(project, host),
+                  "orchestrator": store.orchestrator_status(project)}
     elif args.mailbox == "claim":
         message = store.claim(project, host, role, invocation.session, message_id=args.message_id)
         result = {"project": project, "harness": host, "role": role, "message": message}

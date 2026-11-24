@@ -202,6 +202,12 @@ def test_mailbox_uses_bound_native_session_and_exact_lease(tmp_path, monkeypatch
     store.finish("sample", "codex", "inbox", "f158aa0f-aaf9-41d3-a589-fbb43793a1ea", inbound["id"], inbound["lease"])
     args = SimpleNamespace(project=None, mailbox="claim", message_id=None, lease=None, recipient=None,
                            body=None, body_file=None, key=None, reply_to=None)
+    args.mailbox = "status"
+    status = skills._mailbox(args, "codex", cfg)
+    assert status["roles"]["coordinator"] == session
+    assert status["queue"]["enabled"] is True
+    assert status["orchestrator"]["status"] == "never_designated"
+    args.mailbox = "claim"
     result = skills._mailbox(args, "codex", cfg)
     assert result["message"]["body"] == "queued work"
     args.mailbox = "finish"
@@ -214,6 +220,34 @@ def test_mailbox_uses_bound_native_session_and_exact_lease(tmp_path, monkeypatch
     with store._connect() as connection:
         row = connection.execute("SELECT sender,recipient,key,reply_to FROM messages WHERE id=?", (sent["id"],)).fetchone()
     assert tuple(row) == ("codex", "other", "reply-key", original)
+
+
+@pytest.mark.parametrize("host", ["codex", "claude"])
+def test_native_mailbox_status_includes_project_orchestrator(tmp_path, monkeypatch, host):
+    from multi_harness_bridge import role_adapters
+    from multi_harness_bridge.store import Store
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    cfg = Config(tmp_path / "state", {"sample": (workspace,)})
+    cfg.root.mkdir()
+    session = "39b3a1ac-6a0d-46c2-a3b6-5404eb4c4e61"
+    inbox = "f158aa0f-aaf9-41d3-a589-fbb43793a1ea"
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setattr(skills, "_native_invocation", lambda *_args, **_kwargs: role_adapters.Invocation(
+        "sample", host, session, "", workspace, proof="fixture-native"))
+    store = Store(cfg.database)
+    store.bind("sample", host, "coordinator", session)
+    store.bind("sample", host, "inbox", inbox)
+    store.take_coordinator("sample", host, session, designate=True)
+    args = SimpleNamespace(project=None, mailbox="status")
+
+    result = skills._mailbox(args, host, cfg)
+
+    assert result["roles"] == {"coordinator": session, "inbox": inbox}
+    assert result["orchestrator"] == {
+        "status": "active", "harness": host, "session": session, "revision": 1,
+    }
 
 
 @pytest.mark.parametrize("host", ["codex", "claude"])

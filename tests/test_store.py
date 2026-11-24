@@ -158,6 +158,131 @@ def test_previous_schema_is_migrated(tmp_path):
         assert "updated" in {r[1] for r in db.execute("PRAGMA table_info(messages)")}
 
 
+def test_orchestrator_stale_is_sticky_and_retries_cannot_re_elect(tmp_path):
+    store = Store(tmp_path / "queue.db")
+    for harness in ("codex", "claude"):
+        store.bind("p", harness, "coordinator", f"{harness}-c")
+        store.bind("p", harness, "inbox", f"{harness}-i")
+
+    elected = store.take_coordinator("p", "codex", "codex-c", designate=True,
+                                      request_id="turn-a")
+    assert elected["orchestrator"]["status"] == "active"
+    assert store.project_status("p")["orchestrator"]["harness"] == "codex"
+    assert store.status("p", "codex")["outbound"] == 1
+    store.take_coordinator("p", "claude", "claude-next", request_id="claude-plain")
+    assert store.project_status("p")["orchestrator"]["status"] == "active"
+    assert store.project_status("p")["orchestrator"]["harness"] == "codex"
+
+    store.take_coordinator("p", "codex", "codex-next", request_id="turn-b")
+    assert store.project_status("p")["orchestrator"]["status"] == "stale"
+    with store._connect() as db:
+        stale_notices = db.execute(
+            "SELECT COUNT(*) FROM messages WHERE project='p' AND request_id IS NOT NULL "
+            "AND body LIKE '%owner is stale%'"
+        ).fetchone()[0]
+    assert stale_notices == 1
+    # Rebinding the former owner chat without an explicit election stays stale.
+    store.take_coordinator("p", "codex", "codex-c", request_id="turn-c")
+    assert store.project_status("p")["orchestrator"]["status"] == "stale"
+    # A flagged A→B replacement records a direct transfer without a duplicate
+    # stale notice for the old owner.
+    store.take_coordinator("p", "codex", "codex-c", designate=True,
+                           request_id="turn-c-orc")
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM messages WHERE project='p' AND request_id IS NOT NULL "
+            "AND body LIKE '%owner is stale%'"
+        ).fetchone()[0] == 1
+
+    # A retry of the old explicit invocation cannot reclaim after another election.
+    store.take_coordinator("p", "claude", "claude-next", designate=True,
+                           request_id="turn-d")
+    store.take_coordinator("p", "codex", "codex-c", designate=True,
+                           request_id="turn-a")
+    assert store.project_status("p")["orchestrator"]["harness"] == "claude"
+
+    before = store.roles("p", "codex")
+    cleared = store.clear_orchestrator("p")
+    assert cleared["orchestrator"]["status"] == "cleared"
+    assert store.project_status("p")["orchestrator"]["status"] == "cleared"
+    assert store.roles("p", "codex") == before
+    events = store.project_status("p")["orchestrator_events"]
+    assert [event["event"] for event in events] == [
+        "designated", "stale", "designated", "designated", "cleared"]
+
+
+def test_orchestrator_side_tables_preserve_v4_and_track_old_client_rebind(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "queue.db"
+    store = Store(path)
+    store.bind("p", "codex", "coordinator", "a")
+    store.bind("p", "codex", "inbox", "i")
+    store.take_coordinator("p", "codex", "a", designate=True)
+    with sqlite3.connect(path) as db:
+        # Simulate an old v4 process updating only the pre-existing bindings table.
+        db.execute("UPDATE bindings SET session='b' WHERE project='p' AND harness='codex' AND role='coordinator'")
+        db.execute("UPDATE bindings SET session='a' WHERE project='p' AND harness='codex' AND role='coordinator'")
+        assert db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+    assert store.project_status("p")["orchestrator"]["status"] == "stale"
+
+
+def test_orchestrator_transfer_serializes_and_failed_binding_rolls_back(tmp_path):
+    store = Store(tmp_path / "queue.db")
+    for harness in ("codex", "claude"):
+        store.bind("p", harness, "coordinator", f"{harness}-c")
+        store.bind("p", harness, "inbox", f"{harness}-i")
+    store.take_coordinator("p", "codex", "codex-c", designate=True)
+    with pytest.raises(ValueError, match="already bound"):
+        store.take_coordinator("p", "claude", "claude-i", designate=True)
+    assert store.project_status("p")["orchestrator"]["harness"] == "codex"
+    assert store.roles("p", "claude") == {"coordinator": "claude-c", "inbox": "claude-i"}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda harness: store.take_coordinator("p", harness, f"{harness}-c",
+                                                    designate=True, request_id=f"transfer-{harness}"),
+            ("claude", "codex"),
+        ))
+    status = store.project_status("p")
+    assert status["orchestrator"]["status"] == "active"
+    assert status["orchestrator"]["harness"] in {"codex", "claude"}
+    assert len([item for item in results if item["orchestrator"]["status"] == "active"]) == 2
+
+
+def test_project_status_persists_external_owner_staleness(tmp_path):
+    from contextlib import contextmanager
+
+    class Provider:
+        current = "a"
+
+        def handles(self, project, harness):
+            return project == "p" and harness == "codex"
+
+        @contextmanager
+        def guard(self, project, *, exclusive=False):
+            yield
+
+        def roles(self, project, harness):
+            return {"coordinator": self.current, "inbox": "i"}
+
+        def enabled(self, project, harness):
+            return True
+
+    provider = Provider()
+    store = Store(tmp_path / "queue.db", bindings_provider=provider)
+    with pytest.raises(ValueError, match="current native coordinator"):
+        store.take_coordinator("p", "codex", "not-current", designate=True,
+                               request_id="rejected-election")
+    assert provider.roles("p", "codex") == {"coordinator": "a", "inbox": "i"}
+    assert store.project_status("p")["orchestrator"]["status"] == "never_designated"
+    store.take_coordinator("p", "codex", "a", designate=True, request_id="election")
+    provider.current = "b"
+    assert store.project_status("p")["orchestrator"]["status"] == "stale"
+    provider.current = "a"
+    assert store.project_status("p")["orchestrator"]["status"] == "stale"
+
+
 @pytest.mark.parametrize("harness", ["codex", "claude", "devin", "antigravity"])
 def test_inbox_takeover_resumes_only_verified_route(tmp_path, harness):
     store = Store(tmp_path / "queue.db")
@@ -178,3 +303,24 @@ def test_inbox_takeover_resumes_only_verified_route(tmp_path, harness):
     store.set_enabled("alpha", harness, False)
     store.bind("alpha", harness, "inbox", "next", take=True)
     assert store.status("alpha", harness)["enabled"]
+
+
+def test_plain_takeover_preserves_mail_and_other_projects_designation(tmp_path):
+    store = Store(tmp_path / "queue.db")
+    for project in ("orchard", "harbor"):
+        for harness in ("codex", "claude", "devin", "antigravity"):
+            store.bind(project, harness, "inbox", f"{project}-{harness}-inbox")
+            store.take_coordinator(project, harness, f"{project}-{harness}")
+        assert store.project_status(project)["orchestrator_events"] == []
+        assert all(store.status(project, harness)["outbound"] == 0
+                   for harness in store.project_status(project)["coordinators"])
+
+    store.take_coordinator("orchard", "claude", "orchard-claude", designate=True)
+    message = store.send("harbor", "devin", "codex", "Review ready", "review")
+    store.take_coordinator("harbor", "codex", "harbor-next")
+    for role, session in (("inbox", "harbor-codex-inbox"), ("coordinator", "harbor-next")):
+        item = store.claim("harbor", "codex", role, session)
+        assert item["id"] == message["id"]
+        assert store.finish("harbor", "codex", role, session, item["id"], item["lease"])
+    assert store.orchestrator_status("harbor")["status"] == "never_designated"
+    assert store.orchestrator_status("orchard")["session"] == "orchard-claude"
