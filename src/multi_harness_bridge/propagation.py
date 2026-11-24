@@ -19,6 +19,23 @@ MANIFEST = ".multi-harness-skills.json"
 BUILTIN_ROOT = Path(__file__).with_name("builtin_skills")
 
 
+def explicit_skill_request(prompt):
+    """Read the operation and named harnesses from a direct native user turn."""
+    match = re.fullmatch(
+        r"\s*(?:please\s+)?(?:@|/)?propagate(?:-skills|\s+(skills|one project entry))\s+from\s+(.+?)\s*[.!]?\s*",
+        prompt if isinstance(prompt, str) else "", re.IGNORECASE,
+    )
+    if not match:
+        raise PermissionError("The current user request must explicitly name skill sources")
+    sources = re.split(r"\s*(?:,\s*(?:and\s+)?|\band\b|\+)\s*", match.group(2).lower())
+    if any(source not in HARNESS_DIRS for source in sources):
+        raise PermissionError("Skill source list must name supported harnesses explicitly")
+    if len(sources) != len(set(sources)):
+        raise PermissionError("Duplicate skill sources are not allowed")
+    mode = "entry" if (match.group(1) or "").lower() == "one project entry" else "copy"
+    return mode, sources
+
+
 def _skills(path):
     if not path.is_dir():
         return []

@@ -9,6 +9,10 @@ import uuid
 ROLES = {"coordinator", "inbox"}
 LEASE_SECONDS = 30
 DB_TIMEOUT_SECONDS = 10
+# Leave time for the adapter's bounded launch, verification, and native pickup.
+WAKE_STALE_SECONDS = 135.0
+WAKE_RETRY_BASE_SECONDS = 2.0
+WAKE_RETRY_MAX_SECONDS = 60.0
 SCHEMA_VERSION = 4
 HUMAN_NOTIFICATION_ROUTES = {"telegram", "pma"}
 
@@ -719,9 +723,12 @@ class Store:
             AND NOT EXISTS (SELECT 1 FROM mhb_wake_attempts AS wake
             WHERE wake.notification_id=messages.id AND wake.project=messages.project
             AND wake.harness=? AND wake.role=? AND wake.session=?
-            AND (wake.state<>'retryable' OR wake.attempts>=3))
+            AND ((wake.state IN ('sending','uncertain','sent') AND wake.updated_at > ?)
+                 OR (wake.state='retryable' AND wake.updated_at + CASE WHEN wake.attempts<=0 THEN 0
+                     ELSE MIN(?, ? * (1 << MIN(wake.attempts-1, 6))) END > ?)))
             """ if wake_session is not None else ""
-        wake_params = (harness, role, wake_session) if wake_session is not None else ()
+        wake_params = (harness, role, wake_session, now - WAKE_STALE_SECONDS,
+                       WAKE_RETRY_MAX_SECONDS, WAKE_RETRY_BASE_SECONDS, now) if wake_session is not None else ()
         fields, limit = ("id,attempts", "") if notifications_only else ("*", "LIMIT 1")
         return db.execute(
             f"""SELECT {fields} FROM messages WHERE project=? AND pickup_harness=? AND stage IN (?,?)

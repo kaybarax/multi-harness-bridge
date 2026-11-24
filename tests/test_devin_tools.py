@@ -94,7 +94,8 @@ def test_devin_does_not_normalize_other_namespaces_or_non_native_input():
     assert devin_tools._devin_user_command(chip) == ""
 
 
-def test_devin_automatic_tools_require_active_attempt_and_persisted_native_pickup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dispatch", ["sending", "late-uncertain", "late-replaced"])
+def test_devin_automatic_tools_require_exact_attempt_and_persisted_native_pickup(tmp_path, monkeypatch, dispatch):
     from contextlib import closing
     from datetime import datetime, timezone
     from multi_harness_bridge import devin_acp, wake
@@ -124,8 +125,8 @@ def test_devin_automatic_tools_require_active_attempt_and_persisted_native_picku
     pickup = server._tool_manager.get_tool(devin_acp.PICKUP_TOOL).fn
     finish = server._tool_manager.get_tool(devin_acp.FINISH_TOOL).fn
 
-    def add_native(row_id, payload):
-        now = datetime.now(timezone.utc)
+    def add_native(row_id, payload, at=None):
+        now = datetime.fromtimestamp(at, timezone.utc) if at is not None else datetime.now(timezone.utc)
         message = {**payload, "metadata": {"created_at": now.isoformat()}}
         with sqlite3.connect(native) as db:
             db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)",
@@ -135,12 +136,27 @@ def test_devin_automatic_tools_require_active_attempt_and_persisted_native_picku
         return {"role": "assistant", "tool_calls": [{"id": call_id, "name": "mcp_call_tool", "arguments": {
             "server_name": "mhb_roles_sample", "tool_name": tool, "arguments": args}}]}
 
+    delayed_at = time.time() - (170 if dispatch == "late-replaced" else 90)
     with closing(wake._ledger(store.path)) as ledger:
         assert wake._reserve(ledger, {"id": delivery_id}, "sample", "devin", "coordinator", session)[0]
-    add_native(1, {"role": "user", "content": devin_acp._wake_prompt("mhb_roles_sample", delivery_id, True)})
+        if dispatch != "sending":
+            with ledger:
+                ledger.execute("UPDATE mhb_wake_attempts SET state='uncertain',started_at=?,updated_at=?",
+                               (delayed_at - 1, delayed_at))
+                ledger.execute("UPDATE mhb_wake_sessions SET state='uncertain',updated_at=?", (delayed_at,))
+        if dispatch == "late-replaced":
+            assert wake._reserve(ledger, {"id": delivery_id}, "sample", "devin", "coordinator", session,
+                                 store=store)[0]
+    user_at = delayed_at if dispatch != "sending" else None
+    prompt = devin_acp._wake_prompt("mhb_roles_sample", delivery_id, True)
+    add_native(1, {"role": "user", "content": prompt}, at=user_at)
     first_call = call("pickup", devin_acp.PICKUP_TOOL, {"notification_id": delivery_id})
     add_native(2, first_call)
     add_native(3, first_call)
+    if user_at is not None:
+        with pytest.raises(PermissionError, match="bound route"):
+            devin_acp.active_wake(store, "sample", "mhb_roles_sample", {
+                "session": "devin-inbox", "user_at": user_at, "user_prompt": prompt}, delivery_id)
     receipt = pickup(delivery_id)
     finish_args = {"notification_id": delivery_id, "lease": receipt["lease"], "reply": "Received"}
     add_native(4, call("too-early", devin_acp.FINISH_TOOL, finish_args))
@@ -177,7 +193,66 @@ def test_devin_role_server_registers_only_expected_native_tools(tmp_path, monkey
     assert server.name == "mhb_roles_sample"
     assert set(server.tools) == {"prepare_role_handoff", "take_coordinator", "take_bridge",
                                  "bridge_status", "pickup_notification", "acknowledge",
-                                 "pickup_wake", "finish_wake", "send_message", "send_fanout", "reply_free_text", "set_pickup"}
+                                 "pickup_wake", "finish_wake", "send_message", "send_fanout",
+                                 "reply_free_text", "set_pickup", "propagate_skills"}
+
+
+def test_devin_skill_propagation_uses_verified_native_turn_without_environment_identity(tmp_path, monkeypatch):
+    import types
+    from multi_harness_bridge import propagation
+
+    class FakeServer:
+        def __init__(self, name, instructions=""):
+            self.name, self.tools = name, {}
+        def tool(self, name=None):
+            def register(fn):
+                self.tools[name or fn.__name__] = fn
+                return fn
+            return register
+
+    fake = types.ModuleType("mcp.server.fastmcp")
+    fake.FastMCP = FakeServer
+    monkeypatch.setitem(sys.modules, "mcp", types.ModuleType("mcp"))
+    monkeypatch.setitem(sys.modules, "mcp.server", types.ModuleType("mcp.server"))
+    monkeypatch.setitem(sys.modules, "mcp.server.fastmcp", fake)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    cfg = Config(tmp_path / "bridge-home", {"sample": (workspace,)})
+    monkeypatch.setattr(devin_tools.config, "load", lambda: cfg)
+    native = tmp_path / "sessions.sqlite3"
+    prompt = "propagate skills from codex and claude"
+    args = {"sources": ["codex", "claude"]}
+    call = {"role": "assistant", "tool_calls": [{"id": "call-1", "name": "mcp_call_tool",
+            "arguments": {"server_name": "mhb_roles_sample", "tool_name": "propagate_skills",
+                          "arguments": args}}]}
+    with sqlite3.connect(native) as db:
+        db.execute("CREATE TABLE sessions(id TEXT,working_directory TEXT,workspace_dirs TEXT,title TEXT,hidden INTEGER DEFAULT 0)")
+        db.execute("CREATE TABLE message_nodes(session_id TEXT,row_id INTEGER,chat_message TEXT,created_at REAL)")
+        db.execute("INSERT INTO sessions VALUES(?,?,?,?,0)", ("native-id", str(workspace), "[]", "chat"))
+        db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)", ("native-id", 1,
+            json.dumps({"role": "user", "content": prompt}), time.time()))
+        db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)", ("native-id", 2, json.dumps(call), time.time()))
+    monkeypatch.setenv("MHB_DEVIN_SESSIONS_DB", str(native))
+    monkeypatch.delenv("MULTI_HARNESS_BRIDGE_HARNESS", raising=False)
+    monkeypatch.delenv("DEVIN_SESSION_ID", raising=False)
+    monkeypatch.delenv("DEVIN_LOCAL_SESSION_ID", raising=False)
+    invoked = []
+    monkeypatch.setattr(propagation, "install", lambda *a, **kw: invoked.append((a, kw)) or {"status": "complete"})
+    server = devin_tools.make_role_server(cfg, "sample")
+    result = server.tools["propagate_skills"](sources=args["sources"])
+    assert result == {"status": "complete"}
+    assert invoked[0][0] == ("sample", ["codex", "claude"], "devin")
+    assert invoked[0][1]["workspace"] == workspace
+    assert invoked[0][1]["cfg"] is cfg
+
+    with sqlite3.connect(native) as db:
+        changed = {**args, "sources": ["codex"]}
+        altered = {**call, "tool_calls": [{**call["tool_calls"][0], "arguments": {
+            **call["tool_calls"][0]["arguments"], "arguments": changed}}]}
+        db.execute("UPDATE message_nodes SET chat_message=? WHERE row_id=2", (json.dumps(altered),))
+    with pytest.raises(PermissionError):
+        server.tools["propagate_skills"](sources=["codex"])
+    assert len(invoked) == 1
 
 
 def test_devin_fanout_tracks_native_caller_across_both_roots(tmp_path, monkeypatch):

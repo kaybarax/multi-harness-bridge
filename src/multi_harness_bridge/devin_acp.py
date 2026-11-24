@@ -17,11 +17,14 @@ import time
 import uuid
 
 from . import config
-from .wake import MAX_COMMAND_TIMEOUT, WakeDeferred, WakeError, WakeRejected
+from .wake import STALE_WAKE_SECONDS, WakeDeferred, WakeError, WakeRejected
 
 NATIVE_DB = Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
 WAKE_TIMEOUT = 20.0
 ROUTED_COORDINATOR_TIMEOUT = 45.0
+NATIVE_WAKE_SECONDS = 2 * STALE_WAKE_SECONDS
+TURN_ACTIVITY_SECONDS = 300.0
+SESSION_LIST_TIMEOUT = 2.0
 WAKE_PREFIX = "Multi Harness Bridge native wake. "
 PICKUP_TOOL = "pickup_wake"
 FINISH_TOOL = "finish_wake"
@@ -29,6 +32,14 @@ FINISH_TOOL = "finish_wake"
 
 class ACPError(RuntimeError):
     pass
+
+
+class ACPOperationRejected(ACPError):
+    def __init__(self, error):
+        super().__init__("Devin ACP refused the requested operation")
+        data = error.get("data") if isinstance(error, dict) else None
+        self.session_locked = (isinstance(data, dict)
+                               and data.get("cognition.ai/errorKind") == "session_locked")
 
 
 def _same_session(left, right):
@@ -118,7 +129,7 @@ def _native_message_time(message, fallback):
     return fallback
 
 
-def _native_messages(session, workspace, since, native_db):
+def _native_messages(session, workspace, since, native_db, *, require_readable=False):
     db_path = Path(native_db or os.environ.get("MHB_DEVIN_SESSIONS_DB") or NATIVE_DB).expanduser().resolve()
     expected_native_id = session.removeprefix("acp/devin-cli/")
     try:
@@ -127,28 +138,78 @@ def _native_messages(session, workspace, since, native_db):
             columns = {row[1] for row in db.execute("PRAGMA table_info(message_nodes)")}
             required = {"row_id", "session_id", "chat_message", "created_at"}
             if not required <= columns:
+                if require_readable:
+                    raise WakeDeferred("Devin session activity is unavailable before prompt submission")
                 return []
             sessions = db.execute("SELECT id,working_directory FROM sessions WHERE id IN (?,?)",
                                   (expected_native_id, "acp/devin-cli/" + expected_native_id)).fetchall()
             if len(sessions) != 1 or not isinstance(sessions[0][1], str):
+                if require_readable:
+                    raise WakeDeferred("Devin session activity cannot be matched to the bound chat")
                 return []
             native_id, directory = sessions[0]
             if Path(directory).resolve() != Path(workspace).resolve():
+                if require_readable:
+                    raise WakeDeferred("Devin session activity does not match the bound workspace")
                 return []
             rows = db.execute("""SELECT row_id,chat_message,created_at FROM message_nodes
                 WHERE session_id=? AND created_at>=? ORDER BY row_id""",
                 (native_id, math.floor(since))).fetchall()
     except (OSError, sqlite3.Error):
+        if require_readable:
+            raise WakeDeferred("Devin session activity is unreadable before prompt submission") from None
         return []
     messages = []
     for row in rows:
         try:
             message = json.loads(row["chat_message"])
         except (TypeError, json.JSONDecodeError):
+            if require_readable:
+                raise WakeDeferred("Devin session activity contains an unreadable recent message") from None
             continue
         if isinstance(message, dict) and _native_message_time(message, row["created_at"]) >= since:
             messages.append((row["row_id"], message))
     return messages
+
+
+def _session_list_state(executable, session, workspace):
+    """Read the installed CLI's per-session daemon state for this exact workspace."""
+    try:
+        result = subprocess.run([executable, "list", "--format", "json", "--process-model", "daemon"],
+                                cwd=workspace, stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=SESSION_LIST_TIMEOUT, check=False)
+        entries = json.loads(result.stdout) if result.returncode == 0 else None
+        if not isinstance(entries, list):
+            return None
+        matches = [entry for entry in entries if isinstance(entry, dict)
+                   and _same_session(entry.get("id"), session)]
+        if len(matches) != 1:
+            return None
+        observed = matches[0].get("working_directory")
+        if isinstance(observed, str) and Path(observed).resolve() == Path(workspace).resolve():
+            return matches[0].get("state")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    return None
+
+
+def _require_idle_turn(executable, session, workspace, native_db):
+    state = _session_list_state(executable, session, workspace)
+    if state in ("running", "waiting", "busy"):
+        raise WakeDeferred(f"Devin native turn is active ({state})")
+    # An attached session can be idle. Replay metadata and system context by
+    # themselves do not establish that the current turn has finished.
+    since = time.time() - TURN_ACTIVITY_SECONDS
+    messages = _native_messages(session, workspace, since, native_db, require_readable=True)
+    latest = next((message for _, message in reversed(messages)
+                   if message.get("role") in {"user", "assistant", "tool"}), None)
+    if latest is None:
+        return
+    metadata = latest.get("metadata") or {}
+    if (latest.get("role") == "assistant" and not latest.get("tool_calls")
+            and isinstance(metadata, dict) and metadata.get("finish_reason") == "stop"):
+        return
+    raise WakeDeferred("Devin native transcript has a recent unfinished turn")
 
 
 def _native_call_args(session, workspace, server_name, tool_call_id, tool, *,
@@ -182,16 +243,19 @@ def _native_call_args(session, workspace, server_name, tool_call_id, tool, *,
     return matched
 
 
-def _native_completion(session, workspace, server_name, prompt, notification_id, since, native_db):
+def _native_completion(session, workspace, server_name, prompt, notification_id, since, native_db,
+                       *, user_row_id=None):
     """Recognize only results for this wake's exact tool call in its recorded native turn."""
     active = False
     calls = {}
     finished = {}
-    for _, message in _native_messages(session, workspace, since, native_db):
+    for row_id, message in _native_messages(session, workspace, since, native_db):
         role = message.get("role")
         if role == "user":
-            active = message.get("content") == prompt
+            active = message.get("content") == prompt and (user_row_id is None or row_id == user_row_id)
             calls.clear()
+            if user_row_id is not None and row_id > user_row_id:
+                break
         if not active:
             continue
         if role == "assistant":
@@ -230,30 +294,52 @@ def _wake_prompt(server_name, notification_id, routed_coordinator):
     return prompt
 
 
-def active_wake(store, project, server_name, call, notification_id):
-    """Fence automatic calls to the exact native turn and dispatcher's active ledger row."""
+def active_wake(store, project, server_name, call, notification_id, *, lease=None):
+    """Validate the exact native turn even if its bounded ACP connection finished."""
     session = call["session"]
-    if not isinstance(call["user_at"], (int, float)):
+    at = call["user_at"]
+    now = time.time()
+    if not isinstance(at, (int, float)) or not 0 <= now - at <= NATIVE_WAKE_SECONDS:
         raise PermissionError("This tool requires an active native mailbox wake")
-    try:
-        path = Path(store.path).resolve()
-        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=2)) as db:
-            rows = db.execute("""SELECT role,updated_at FROM mhb_wake_attempts
-                WHERE notification_id=? AND project=? AND harness='devin' AND session=? AND state='sending'""",
-                (notification_id, project, session)).fetchall()
-    except sqlite3.Error:
-        rows = []
-    eligible = [(role, started) for role, started in rows if started <= call["user_at"]
-                and time.time() - started < MAX_COMMAND_TIMEOUT + 15]
-    if len(eligible) != 1:
-        raise PermissionError("This exact native wake is no longer active")
-    role, started = eligible[0]
-    trace = store.trace(project, notification_id)
-    routed_coordinator = role == "coordinator" and trace and trace.get("request_id") is not None
+    key = (notification_id, project, session)
+    with store._route_guard(project), closing(store._connect()) as db, db:
+        db.execute("BEGIN")
+        row = db.execute("""SELECT stage,request_id,lease,lease_role,lease_session,deadline
+            FROM messages WHERE id=? AND project=? AND pickup_harness='devin'""", key[:2]).fetchone()
+        roles = store._roles(db, project, "devin")
+        role = next((role for role, bound in roles.items() if bound == session), None)
+        first_stage = "outbound" if role == "inbox" else "coordinator"
+        if not role or not row or row["stage"] not in (first_stage, role):
+            raise PermissionError("This exact native wake is no longer active on the bound route")
+        active_lease = row["lease"] is not None and row["deadline"] > now
+        if lease is None:
+            if active_lease or not store._enabled(db, project, "devin"):
+                raise PermissionError("This exact native wake is no longer active for pickup")
+        elif (role != "coordinator" or not active_lease or row["lease"] != lease
+              or row["lease_role"] != role or row["lease_session"] != session):
+            raise PermissionError("This exact native wake is no longer active for that lease")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='mhb_wake_attempts' AND type='table'").fetchone():
+            raise PermissionError("This exact native wake is no longer active in the dispatch ledger")
+        # A retry may have replaced the ledger row between the native prompt
+        # and its first tool invocation. Admit the recorded prior generation
+        # only for this exact still-pending route and native turn.
+        attempt = db.execute("""SELECT started_at FROM (
+                SELECT started_at FROM mhb_wake_attempts
+                WHERE notification_id=? AND project=? AND session=? AND role=? AND harness='devin'
+                AND state IN ('sending','uncertain','sent')
+                UNION ALL
+                SELECT prior_started_at AS started_at FROM mhb_wake_history
+                WHERE notification_id=? AND project=? AND session=? AND role=? AND harness='devin'
+                AND action='automatic-retry' AND prior_state IN ('sending','uncertain','sent')
+            ) WHERE started_at BETWEEN ? AND ? ORDER BY started_at DESC LIMIT 1""",
+            (*key, role, *key, role, at - STALE_WAKE_SECONDS, at)).fetchone()
+    if not attempt:
+        raise PermissionError("This exact native wake is no longer active in the dispatch ledger")
+    routed_coordinator = role == "coordinator" and row["request_id"] is not None
     prompt = _wake_prompt(server_name, notification_id, routed_coordinator)
     if call["user_prompt"] != prompt:
         raise PermissionError("Current native turn does not match this wake")
-    return role, started, prompt
+    return role, attempt[0], prompt
 
 
 class ACPClient:
@@ -316,7 +402,7 @@ class ACPClient:
                 continue
             if event.get("id") == call_id:
                 if "error" in event:
-                    raise ACPError("Devin ACP refused the requested operation")
+                    raise ACPOperationRejected(event["error"])
                 result = event.get("result")
                 if not isinstance(result, dict):
                     raise ACPError("Devin ACP returned no result object")
@@ -324,7 +410,6 @@ class ACPClient:
         raise TimeoutError("Devin ACP request timed out")
 
     def close(self):
-        # The process is terminated by the owner before the reader is joined.
         self.reader.join(timeout=0.25)
 
 
@@ -513,7 +598,11 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
     routed_coordinator = role == "coordinator" and item is not None and "request_id" in item
     native_server = server_name(project)
     native_session = session.removeprefix("acp/devin-cli/")
-    proc = _start(executable, workspace)
+    _require_idle_turn(executable, native_session, workspace, native_db)
+    try:
+        proc = _start(executable, workspace)
+    except OSError as exc:
+        raise WakeRejected(f"Devin ACP could not start ({type(exc).__name__})") from None
     if timeout is None:
         timeout = ROUTED_COORDINATOR_TIMEOUT if routed_coordinator else WAKE_TIMEOUT
     client = ACPClient(proc, timeout=timeout)
@@ -527,12 +616,18 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
                                          "mcpServers": []})
         except WakeRejected:
             raise
+        except ACPOperationRejected as exc:
+            reason = "session_locked" if exc.session_locked else "operation-rejected"
+            raise WakeDeferred(f"Devin rejected the bound session before prompt submission ({reason})") from None
         except Exception as exc:
             raise WakeDeferred(f"Devin rejected the bound session before prompt submission ({type(exc).__name__})") from None
         if before_prompt is not None and not before_prompt():
             raise WakeDeferred("Devin wake was stopped or rebound before prompt submission")
         prompt = _wake_prompt(native_server, notification_id, routed_coordinator)
         state, pending = {"allowed": 0}, {}
+        _require_idle_turn(executable, native_session, workspace, native_db)
+        if time.monotonic() >= client.deadline:
+            raise WakeDeferred("Devin ACP deadline expired before prompt submission")
         submitted_at = time.time()
         handler = _permission_handler(server_name=native_server, expected_session=native_session,
                                       workspace=workspace, notification_id=notification_id,
@@ -546,10 +641,14 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
             raise
         except EOFError:
             raise TimeoutError("Devin ACP exited after prompt submission; outcome is uncertain") from None
-        except ACPError as exc:
-            if state["allowed"]:
-                raise TimeoutError("Devin ACP failed after allowing the exact mailbox tool") from None
-            raise WakeDeferred("Devin ACP refused the exact mailbox prompt") from None
+        except ACPOperationRejected:
+            persisted = any(message.get("role") == "user" and message.get("content") == prompt
+                            for _, message in _native_messages(native_session, workspace, submitted_at, native_db))
+            if not persisted and not state["allowed"]:
+                raise WakeDeferred("Devin ACP refused the wake before accepting the exact prompt") from None
+            raise WakeError("Devin ACP refused after accepting the exact prompt; delivery is uncertain") from None
+        except ACPError:
+            raise WakeError("Devin ACP transport failed after wake submission; delivery is uncertain") from None
         if item is not None:
             observed = _native_completion(native_session, workspace, native_server, prompt,
                                           notification_id, submitted_at, native_db)
@@ -567,8 +666,8 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
             raise WakeRejected("Devin did not request the one authorized mailbox notification tool")
         return result
     finally:
-        client.close()
         _stop_process(proc)
+        client.close()
 
 
 def rename(session, workspace, title, *, native_db=None, timeout=15.0):

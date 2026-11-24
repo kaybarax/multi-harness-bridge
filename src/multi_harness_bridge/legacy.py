@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import sqlite3
 import uuid
@@ -12,6 +13,11 @@ import uuid
 
 ACTORS = {"devin": "devin_local", "antigravity": "antigravity_desktop"}
 HARNESSES = frozenset({"codex", "claude", *ACTORS})
+DEVIN_WAKE_LOCKS = ("devin-local-project-wake.lock", "devin-local-relay.wake.lock")
+
+
+class LegacyWakeBusy(RuntimeError):
+    pass
 
 
 @contextmanager
@@ -85,6 +91,21 @@ class LegacyBindings:
         if harness == "claude" and coordinator is not None:
             coordinator = coordinator.removeprefix("local_")
         return _uuid(coordinator), _uuid(inbox)
+
+    @contextmanager
+    def devin_wake_guard(self):
+        """Share the legacy dispatchers' native wake exclusion without taking their queues."""
+        import fcntl
+
+        with ExitStack() as locks:
+            for name in DEVIN_WAKE_LOCKS:
+                descriptor = os.open(self.state / name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+                locks.callback(os.close, descriptor)
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise LegacyWakeBusy("A legacy Devin dispatcher owns the native wake lock") from None
+            yield
 
     def _native_pair(self, harness):
         if harness == "devin":

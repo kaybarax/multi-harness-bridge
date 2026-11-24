@@ -46,7 +46,10 @@ the project registration. An unrecognized collision is an error.
    it records a new role owner, its compatibility launcher refreshes the
    recognized legacy registrations in both roots. Refresh historically loaded
    legacy MCP processes in affected chats to pick up updated static arguments.
-   Other legacy route tools retain their role validation and schemas.
+   Identify those processes by their static role and session arguments. The
+   portable `serve-roles` process serves its owning native stdio client and exits
+   when that client closes stdin. Refresh the affected server through the native
+   client. Other legacy route tools retain their role validation and schemas.
 2. Install or refresh the project-specific Antigravity registration and hook
    using the candidate's native installer. Reload that exact registered server in
    the native app. Refresh the Devin server in each affected chat so it discovers
@@ -55,12 +58,23 @@ the project registration. An unrecognized collision is an error.
    environment. The Claude Code installer pins the same state directory in
    both workspace-scoped prompt hooks. Its native identity proof uses Claude
    Code transcript metadata. Retain the established legacy role handoff and
-   lifecycle commands.
+   lifecycle commands. If a custom Devin propagation skill is already installed,
+   its maintained copy needs to call `propagate_skills` on the project's
+   `mhb_roles_<project>` MCP server with the sources from the direct user turn.
+   Setup preserves the existing skill directory and any links to it. For a
+   stock copy, compare its regular `SKILL.md` file with the previously bundled
+   version before replacing that exact file from the candidate. Keep a backup
+   and leave any custom copy or link in place for its maintainer to update.
 3. Run the candidate wake dispatcher scoped to this one project. It handles its own
    mailbox and rechecks the current role, pickup state, and notification before
    submitting the wake. Claude uses the subscribed native chat. For Devin, verify
    the project from the actual native session working directory so either root is
-   supported.
+   supported. With the legacy binding provider configured, the portable worker
+   shares `state/devin-local-project-wake.lock` and `state/devin-local-relay.wake.lock`
+   with the two legacy pollers. It acquires them in that order, without waiting,
+   after the portable SQLite reservation commits. It holds them through native
+   command cleanup. A busy lock leaves the notification pending without spending
+   an attempt. The legacy pollers continue to serve their own queues.
 4. Read status in the existing chats. Compare the role pairs, pending work,
    and stop state with the refreshed baseline. Use one new idempotency key per
    test exchange, and compare observed pickup and replies with the durable trace.
@@ -73,6 +87,10 @@ its native take and stop/resume workflows. An active legacy handoff recovery rec
 or conflicting mailbox and native role pair blocks candidate authorization until the
 existing bridge resolves it. Reconciliation does not rewrite native transcripts,
 clear queue leases, replay deliveries, or purge caches.
+
+A legacy direct control command can still contend for the same Devin session.
+Run manual legacy stop or resume outside an active native wake when possible.
+If the native host reports the session is locked, retry after that turn exits.
 
 ## Rollback
 

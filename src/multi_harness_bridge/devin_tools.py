@@ -86,7 +86,8 @@ def _devin_user_command(message):
     return command
 
 
-def _native_call(project, tool, expected_args=None, *, role_command=None, freshness=180):
+def _native_call(project, tool, expected_args=None, *, role_command=None, freshness=180,
+                 argument_defaults=None, latest_turn=False):
     """Resolve exactly one fresh, uncompleted native ACP call for this server."""
     from .devin_acp import _native_message_time
 
@@ -119,6 +120,8 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
         if not session:
             continue
         completed = {item.get("tool_call_id") for _, _, item in messages if item.get("role") == "tool"}
+        latest_user = next((row_id for row_id, _, item in reversed(messages)
+                            if item.get("role") == "user"), None)
         for index, (row_id, _, message) in enumerate(messages):
             if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
                 continue
@@ -137,6 +140,8 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                                   for prior_id, at, item in reversed(messages[:index])
                                   if prior_id < row_id and item.get("role") == "user"), (None, None, None))
                 user_row_id, user_at, user = user_turn
+                if latest_turn and (user_row_id is None or user_row_id != latest_user):
+                    continue
                 if role_command:
                     from .role_adapters import _parse_details
                     try:
@@ -160,14 +165,15 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                 candidate = {"session": session_id, "workspace": workspace, "title": title,
                              "orchestrator": orchestrator,
                              "request_id": request_id, "actual_args": actual, "call_id": call_id,
-                             "user_prompt": user, "user_at": user_at}
+                             "user_prompt": user, "user_at": user_at, "user_row_id": user_row_id}
                 if key in matches and matches[key] != candidate:
                     conflicts.add(key)
                 matches[key] = candidate
     # A matching call must be unique across all fresh native sessions.
     expected = expected_args or {}
-    candidates = [match for key, match in matches.items() if key not in conflicts
-                  and all(match["actual_args"].get(name) == value for name, value in expected.items())]
+    candidates = [match for key, match in matches.items() if key not in conflicts and (
+        {**argument_defaults, **match["actual_args"]} == expected if argument_defaults is not None
+        else all(match["actual_args"].get(name) == value for name, value in expected.items()))]
     if len(candidates) != 1:
         raise PermissionError("Devin tool call did not resolve to one fresh native caller")
     return candidates[0]
@@ -183,10 +189,10 @@ def make_role_server(cfg, project):
     store = config.open_store(cfg)
     role_values = {"coordinator": "coordinator", "bridge": "inbox"}
 
-    def current(tool, args=None):
+    def current(tool, args=None, **options):
         from .devin_acp import WAKE_PREFIX, FINISH_TOOL, PICKUP_TOOL
 
-        call = _native_call(project, tool, args)
+        call = _native_call(project, tool, args, **options)
         if (call["user_prompt"] or "").startswith(WAKE_PREFIX) and tool not in {PICKUP_TOOL, FINISH_TOOL}:
             raise PermissionError("This native wake is scoped to its notification tools")
         return call
@@ -304,9 +310,8 @@ def make_role_server(cfg, project):
         """Pick up only the exact notification in the current automatic native wake."""
         from . import devin_acp
 
-        call = current(devin_acp.PICKUP_TOOL, {"notification_id": notification_id})
-        if set(call["actual_args"]) != {"notification_id"}:
-            raise PermissionError("Wake pickup must match the exact native tool inputs")
+        call = current(devin_acp.PICKUP_TOOL, {"notification_id": notification_id},
+                       argument_defaults={}, latest_turn=True, freshness=devin_acp.NATIVE_WAKE_SECONDS)
         role, _, _ = devin_acp.active_wake(store, project, server_name(project), call, notification_id)
         return devin_acp._pickup_notification(store, project, role, call["session"], notification_id)
 
@@ -316,15 +321,13 @@ def make_role_server(cfg, project):
         from . import devin_acp
 
         args = {"notification_id": notification_id, "lease": lease, "reply": reply}
-        call = current(devin_acp.FINISH_TOOL, args)
-        if set(call["actual_args"]) - set(args):
-            raise PermissionError("Wake finish must match the exact native tool inputs")
+        call = current(devin_acp.FINISH_TOOL, args, argument_defaults={"reply": None},
+                       latest_turn=True, freshness=devin_acp.NATIVE_WAKE_SECONDS)
         name = server_name(project)
-        role, started, prompt = devin_acp.active_wake(store, project, name, call, notification_id)
-        if role != "coordinator":
-            raise PermissionError("Only the woken coordinator can complete this notification")
+        _, _, prompt = devin_acp.active_wake(store, project, name, call, notification_id, lease=lease)
         observed = devin_acp._native_completion(call["session"], call["workspace"], name, prompt,
-                                                notification_id, started, _native_db())
+                                                notification_id, call["user_at"], _native_db(),
+                                                user_row_id=call["user_row_id"])
         return devin_acp._finish_notification(store, project, call["session"], notification_id,
                                               observed.get(devin_acp.PICKUP_TOOL), notification_id, lease, reply)
 
@@ -360,6 +363,26 @@ def make_role_server(cfg, project):
     def set_pickup(enabled: bool) -> dict:
         call=current("set_pickup",{"enabled":enabled})
         return {"enabled":store.set_enabled(project,"devin",enabled,session=call["session"])}
+
+    @server.tool()
+    def propagate_skills(sources: list[str], mode: str = "auto", workspace: str = "") -> dict:
+        """Provision skills from explicitly named sources in this verified Devin workspace."""
+        from . import project_entry, propagation
+
+        call = _native_call(project, "propagate_skills", {"sources": sources, "mode": mode, "workspace": workspace},
+                            argument_defaults={"mode": "auto", "workspace": ""}, latest_turn=True)
+        requested_mode, requested_sources = propagation.explicit_skill_request(call["user_prompt"])
+        if sources != requested_sources:
+            raise PermissionError("Skill sources must exactly match the current direct user request")
+        active_workspace, _ = propagation.resolve_workspace(project, cfg, call["workspace"])
+        if workspace and Path(workspace).expanduser().resolve(strict=True) != active_workspace:
+            raise PermissionError("Requested workspace does not match the current Devin session")
+        declared = (active_workspace / project_entry.DECLARATION).is_file()
+        selected_mode = "entry" if declared else "copy"
+        if mode not in {"auto", selected_mode} or requested_mode == "entry" and not declared:
+            raise PermissionError("Propagation mode must match the active project's declaration")
+        install_skills = project_entry.install if declared else propagation.install
+        return install_skills(project, sources, "devin", workspace=active_workspace, cfg=cfg)
 
     return server
 

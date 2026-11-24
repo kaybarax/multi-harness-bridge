@@ -7,8 +7,9 @@ claiming, reading, and acknowledgement stay with that session's assistant.
 from __future__ import annotations
 
 import argparse
-from contextlib import closing
+from contextlib import closing, nullcontext
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -19,7 +20,9 @@ import sys
 import time
 import uuid
 
-from . import config
+from . import config, legacy
+from .store import (DB_TIMEOUT_SECONDS, WAKE_RETRY_BASE_SECONDS as RETRY_BASE_SECONDS,
+                    WAKE_RETRY_MAX_SECONDS as RETRY_MAX_SECONDS, WAKE_STALE_SECONDS as STALE_WAKE_SECONDS)
 
 POLL_SECONDS = 4.0
 COMMAND_TIMEOUT = 8.0
@@ -86,8 +89,8 @@ def _run(argv, timeout=COMMAND_TIMEOUT):
     except FileNotFoundError as exc:
         raise WakeRejected(f"Native executable is unavailable ({type(exc).__name__})") from None
     except subprocess.TimeoutExpired as exc:
-        # A timeout after launch may have submitted the wake. Never retry it
-        # automatically because the remote UI can accept input before exit.
+        # A timeout after launch may have submitted the wake. Hold its lane
+        # for the recovery window while the native session can still claim it.
         raise WakeError(f"{type(exc).__name__}; delivery state is uncertain") from None
 
 
@@ -190,11 +193,15 @@ def _default_wake(harness, values, *, before_prompt=None):
         return
     elif harness == "antigravity":
         from . import ag_wake
+        if before_prompt is not None and not before_prompt():
+            raise WakeDeferred("Wake reservation changed before Antigravity submission")
         ag_wake.wake(values["project"], values["role"], values["session"],
                      values["notification_id"])
         return
     else:
         raise WakeError("This harness requires a configured native adapter")
+    if before_prompt is not None and not before_prompt():
+        raise WakeDeferred("Wake reservation changed before native submission")
     result = _run(argv)
     if result.returncode != 0:
         if harness == "claude":
@@ -205,8 +212,7 @@ def _default_wake(harness, values, *, before_prompt=None):
 
 
 def _ledger(db_path):
-    db = sqlite3.connect(db_path, timeout=5)
-    db.execute("PRAGMA busy_timeout=5000")
+    db = sqlite3.connect(db_path, timeout=DB_TIMEOUT_SECONDS)
     db.execute("""CREATE TABLE IF NOT EXISTS mhb_wake_attempts (
         notification_id TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL,
         role TEXT NOT NULL, session TEXT NOT NULL,
@@ -225,51 +231,49 @@ def _ledger(db_path):
         role TEXT NOT NULL, session TEXT NOT NULL, prior_state TEXT NOT NULL,
         prior_attempts INTEGER NOT NULL, prior_started_at REAL NOT NULL,
         prior_updated_at REAL NOT NULL, action TEXT NOT NULL, action_at REAL NOT NULL)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS mhb_wake_history_route ON mhb_wake_history
+        (project,notification_id,harness,role,session)""")
     db.commit()
     return db
 
 
-def _reconcile_completed_lane(db, store, project, harness, role, session, lane, now):
-    """Age a sent lane only after its exact message has left this role's route.
-
-    Older native MCP servers update the authoritative queue row but do not know
-    about ``mhb_wake_sessions``. The exact message stage is therefore the
-    completion signal; any live lease for this bound role still keeps the lane
-    occupied. Uncertain and currently pending notifications remain untouched.
-    """
-    if not store or lane[1] != "sent":
-        return lane
-    db.row_factory = sqlite3.Row
-    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'").fetchone():
-        return lane
-    if hasattr(store, "_roles"):
-        with store._route_guard(project):
-            roles = store._roles(db, project, harness)
-            enabled = store._enabled(db, project, harness)
+def _release_lane(db, route, lane, now):
+    """Reconcile a lane against its exact route, under the queue writer lock."""
+    notification_id, state, updated_at = lane
+    if state == "cooldown":
+        if now - updated_at < TURN_COOLDOWN_SECONDS:
+            return False
     else:
-        roles = store.roles(project, harness)
-        enabled = store.status(project, harness).get("enabled")
-    if roles.get(role) != session or not enabled:
-        return lane
-    stages = ("outbound", "inbox") if role == "inbox" else ("coordinator",)
-    row = db.execute("""SELECT pickup_harness,stage FROM messages
-        WHERE project=? AND id=?""", (project, lane[0])).fetchone()
-    if not row or (row["pickup_harness"] == harness and row["stage"] in stages):
-        return lane
-    active = db.execute("""SELECT 1 FROM messages WHERE project=? AND pickup_harness=?
-        AND lease_role=? AND lease_session=? AND lease IS NOT NULL AND deadline>?
-        LIMIT 1""", (project, harness, role, session, now)).fetchone()
-    if active:
-        return lane
-    changed = db.execute("""UPDATE mhb_wake_sessions SET state='cooldown',updated_at=?
-        WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
-        AND state='sent' AND updated_at=?""",
-        (now, project, harness, role, session, lane[0], lane[2])).rowcount
-    if changed != 1:
-        return db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
-            WHERE project=? AND harness=? AND role=? AND session=?""",
-            (project, harness, role, session)).fetchone()
-    return (lane[0], "cooldown", now)
+        aged = now - updated_at >= STALE_WAKE_SECONDS
+        if state != "sent" and not aged:
+            return False
+        project, harness, role, _ = route
+        first_stage = "outbound" if role == "inbox" else "coordinator"
+        on_route = db.execute("""SELECT 1 FROM messages WHERE project=? AND id=?
+            AND pickup_harness=? AND stage IN (?,?)""",
+            (project, notification_id, harness, first_stage, role)).fetchone()
+        if not on_route:
+            # Older native processes can advance the message without updating
+            # the lane. Honor the same cooldown as an in-process finish.
+            db.execute("""UPDATE mhb_wake_sessions SET state='cooldown',updated_at=?
+                WHERE project=? AND harness=? AND role=? AND session=?""", (now, *route))
+            return False
+        if not aged:
+            return False
+    db.execute("""DELETE FROM mhb_wake_sessions
+        WHERE project=? AND harness=? AND role=? AND session=?""", route)
+    return True
+
+
+def _retry_delay(attempts):
+    return min(RETRY_MAX_SECONDS, RETRY_BASE_SECONDS * (2 ** min(attempts - 1, 6))) if attempts > 0 else 0
+
+
+def _archive_attempt(db, notification_id, route, attempt, action, now):
+    db.execute("""INSERT INTO mhb_wake_history
+        (notification_id,project,harness,role,session,prior_state,prior_attempts,
+         prior_started_at,prior_updated_at,action,action_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (notification_id, *route, *attempt, action, now))
 
 
 def _reserve(db, item, project, harness, role, session, *, store=None):
@@ -280,50 +284,61 @@ def _reserve(db, item, project, harness, role, session, *, store=None):
         uuid.UUID(notification_id)
     except ValueError:
         raise WakeError("Pending notification id is not a UUID") from None
-    now = time.time()
-    db.execute("BEGIN IMMEDIATE")
-    lane = db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
-        WHERE project=? AND harness=? AND role=? AND session=?""",
-        (project, harness, role, session)).fetchone()
-    if lane:
-        lane = _reconcile_completed_lane(db, store, project, harness, role, session, lane, now)
-    if lane:
-        if lane[0] == notification_id and lane[1] != "cooldown":
-            db.commit()
-            return False, notification_id, None
-        if lane[1] == "cooldown" and now - lane[2] >= TURN_COOLDOWN_SECONDS:
-            db.execute("DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=? AND session=?",
-                       (project, harness, role, session))
+    route = (project, harness, role, session)
+    key = (notification_id, *route)
+    queue = store if hasattr(store, "_can_pickup") else None
+    guard = queue._route_guard(project) if queue is not None else nullcontext()
+    with guard, db:
+        db.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        if queue is not None:
+            db.row_factory = sqlite3.Row
+            if not queue._can_pickup(db, *route):
+                return None, notification_id, "session-not-bound-or-stopped"
+            if not queue._pending_rows(db, project, harness, role, now, notification_id).fetchone():
+                return None, notification_id, "notification-no-longer-pending"
+        lane = db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
+            WHERE project=? AND harness=? AND role=? AND session=?""", route).fetchone()
+        active = db.execute("""SELECT id FROM messages WHERE project=? AND pickup_harness=?
+            AND lease_role=? AND lease_session=? AND lease IS NOT NULL AND deadline>?
+            ORDER BY updated,id LIMIT 1""", (*route, now)).fetchone() if queue is not None else None
+        if active:
+            if not lane:
+                db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'claimed',?)",
+                           (*route, active[0], now))
+            return None, notification_id, "session-busy"
+        if lane:
+            released = (_release_lane(db, route, lane, now) if queue is not None
+                        else lane[1] == "cooldown" and now - lane[2] >= TURN_COOLDOWN_SECONDS)
+            if not released:
+                reason = "session-busy" if lane[0] != notification_id or lane[1] == "cooldown" else None
+                return None, notification_id, reason
+            if queue is None:
+                db.execute("""DELETE FROM mhb_wake_sessions
+                    WHERE project=? AND harness=? AND role=? AND session=?""", route)
+        attempt = db.execute("""SELECT state,attempts,started_at,updated_at FROM mhb_wake_attempts
+            WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?""", key).fetchone()
+        started = now
+        if attempt:
+            if attempt[0] == "retryable":
+                if attempt[3] + _retry_delay(attempt[1]) > now:
+                    return None, notification_id, None
+            else:
+                if queue is None or now - attempt[3] < STALE_WAKE_SECONDS:
+                    return None, notification_id, None
+                _archive_attempt(db, notification_id, route, attempt, "automatic-retry", now)
+            started = max(now, math.nextafter(attempt[2], math.inf))
+            db.execute("""UPDATE mhb_wake_attempts
+                SET state='sending',attempts=attempts+1,started_at=?,updated_at=?
+                WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?""",
+                (started, now, *key))
         else:
-            db.commit()
-            return False, notification_id, "session-busy"
-    has_messages = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()
-    active = db.execute("""SELECT id FROM messages WHERE project=? AND pickup_harness=?
-        AND lease_role=? AND lease_session=? AND lease IS NOT NULL AND deadline>?
-        ORDER BY updated,id LIMIT 1""", (project, harness, role, session, now)).fetchone() if has_messages else None
-    if active:
-        db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'claimed',?)",
-                   (project, harness, role, session, active[0], now))
-        db.commit()
-        return False, notification_id, "session-busy"
-    with db:
-        cur = db.execute("""INSERT OR IGNORE INTO mhb_wake_attempts
-            (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
-            VALUES (?,?,?,?,?,'sending',1,?,?)""",
-            (notification_id, project, harness, role, session, now, now))
-        if cur.rowcount:
-            db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sending',?)",
-                       (project, harness, role, session, notification_id, now))
-            return True, notification_id, None
-        row = db.execute("SELECT state,attempts FROM mhb_wake_attempts WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
-                         (notification_id, project, harness, role, session)).fetchone()
-        if row and row[0] == "retryable" and row[1] < 3:
-            db.execute("UPDATE mhb_wake_attempts SET state='sending',attempts=attempts+1,updated_at=? WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
-                       (now, notification_id, project, harness, role, session))
-            db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sending',?)",
-                       (project, harness, role, session, notification_id, now))
-            return True, notification_id, None
-    return False, notification_id, None
+            db.execute("""INSERT INTO mhb_wake_attempts
+                (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+                VALUES(?,?,?,?,?,'sending',1,?,?)""", (*key, started, now))
+        db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sending',?)",
+                   (*route, notification_id, started))
+        return started, notification_id, None
 
 
 def _attempt_status(db, notification_id, project, harness, role, session):
@@ -333,18 +348,43 @@ def _attempt_status(db, notification_id, project, harness, role, session):
     return {"id": notification_id, "status": row[0]} if row else None
 
 
+def _finalize_attempt(db, notification_id, project, harness, role, session,
+                      attempt_started, state, refund_attempt):
+    """Finish only the reservation generation owned by this dispatcher call."""
+    now = time.time()
+    changed = db.execute("UPDATE mhb_wake_attempts SET state=?,attempts=MAX(0,attempts-?),updated_at=? "
+                         "WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=? "
+                         "AND state='sending' AND started_at=?",
+                         (state, int(refund_attempt), now, notification_id, project, harness, role,
+                          session, attempt_started)).rowcount
+    if not changed:
+        return
+    if state == "retryable":
+        db.execute("DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=? "
+                   "AND session=? AND notification_id=? AND state='sending' AND updated_at=?",
+                   (project, harness, role, session, notification_id, attempt_started))
+    else:
+        db.execute("UPDATE mhb_wake_sessions SET state=?,updated_at=? WHERE project=? "
+                   "AND harness=? AND role=? AND session=? AND notification_id=? "
+                   "AND state='sending' AND updated_at=?",
+                   (state, now, project, harness, role, session, notification_id, attempt_started))
+
+
 def record_agent_relay(store, project, harness, role, session, notification_id):
     """Record a wake delivered through an in-session agent relay as sent.
 
     The bound inbox agent reaches this through the mailbox finish path when it
     emits a relay instruction. The durable ledger then suppresses the polling
-    dispatcher's fallback queue for the same notification. An existing attempt
-    row is never overwritten.
+    dispatcher's fallback queue for the same notification.
     """
     db = _ledger(store.path)
     try:
         now = time.time()
         with db:
+            db.execute("BEGIN IMMEDIATE")
+            key = (notification_id, project, harness, role, session)
+            if _relay_replaced(db, key):
+                raise WakeError("the relay reservation has already been replaced")
             reservation = db.execute("""SELECT state FROM mhb_wake_sessions
                 WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?""",
                 (project, harness, role, session, notification_id)).fetchone()
@@ -356,26 +396,15 @@ def record_agent_relay(store, project, harness, role, session, notification_id):
             if (not reservation or reservation[0] not in {"sending", "claimed", "cooldown"}
                     or not attempt or attempt[0] != "sending"):
                 raise WakeError("no active relay reservation matches this notification")
-            db.execute("""INSERT OR IGNORE INTO mhb_wake_attempts
-                (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
-                VALUES (?,?,?,?,?,'sent',1,?,?)""",
-                (notification_id, project, harness, role, session, now, now))
             db.execute("""UPDATE mhb_wake_attempts SET state='sent',updated_at=?
                 WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?
                 AND state='sending'""", (now, notification_id, project, harness, role, session))
-            lane = db.execute("""SELECT notification_id FROM mhb_wake_sessions
-                WHERE project=? AND harness=? AND role=? AND session=?""",
-                (project, harness, role, session)).fetchone()
-            if not lane:
-                db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sent',?)",
-                           (project, harness, role, session, notification_id, now))
-            else:
-                db.execute("""UPDATE mhb_wake_sessions SET state='sent',updated_at=?
-                    WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
-                    AND state='sending'""", (now, project, harness, role, session, notification_id))
-                db.execute("""UPDATE mhb_wake_sessions SET updated_at=?
-                    WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
-                    AND state='cooldown'""", (now, project, harness, role, session, notification_id))
+            db.execute("""UPDATE mhb_wake_sessions SET state='sent',updated_at=?
+                WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
+                AND state='sending'""", (now, project, harness, role, session, notification_id))
+            db.execute("""UPDATE mhb_wake_sessions SET updated_at=?
+                WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
+                AND state='cooldown'""", (now, project, harness, role, session, notification_id))
     finally:
         db.close()
 
@@ -386,9 +415,14 @@ def reserve_agent_relay(store, project, harness, role, session, notification_id)
     try:
         reserved, _, reason = _reserve(db, {"id": notification_id}, project,
                                        harness, role, session, store=store)
-        return reserved, reason
+        return reserved is not None, reason
     finally:
         db.close()
+
+
+def _relay_replaced(db, key):
+    return db.execute("""SELECT 1 FROM mhb_wake_history WHERE notification_id=? AND project=?
+        AND harness=? AND role=? AND session=? LIMIT 1""", key).fetchone() is not None
 
 
 def fail_agent_relay(store, project, harness, role, session, notification_id):
@@ -397,6 +431,15 @@ def fail_agent_relay(store, project, harness, role, session, notification_id):
     try:
         now = time.time()
         with db:
+            db.execute("BEGIN IMMEDIATE")
+            route = (project, harness, role, session)
+            key = (notification_id, *route)
+            attempt = db.execute("""SELECT state,attempts,started_at,updated_at FROM mhb_wake_attempts
+                WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?
+                AND state='sending'""", key).fetchone()
+            if attempt is None or _relay_replaced(db, key):
+                raise ValueError("no unconfirmed relay reservation matches this notification")
+            _archive_attempt(db, notification_id, route, attempt, "relay-failed", now)
             changed = db.execute("""UPDATE mhb_wake_attempts SET state='retryable',
                 attempts=MAX(0,attempts-1),updated_at=? WHERE notification_id=? AND project=?
                 AND harness=? AND role=? AND session=? AND state='sending'""",
@@ -427,8 +470,8 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     """Nudge one pending notification for the exact active native role.
 
     The operation intentionally does not call Store.claim/finish or acknowledge
-    the message. A durable local ledger prevents a repeated polling cycle from
-    resubmitting a successful or ambiguous desktop send.
+    the message. The durable ledger serializes attempts and allows recovery
+    once the exact notification is still pending beyond the recovery window.
     """
     if harness not in HARNESS_NAMES or role not in ROLES:
         raise ValueError("Unsupported native harness or role")
@@ -494,31 +537,24 @@ def wake_one(store, project, harness, role, session, *, commands=None):
               "session": session, "notification_id": str(item.get("id", "")),
               # Never forward the mailbox body into a prompt, argv, or GUI.
               "body": WAKE_PROMPT.format(notification_id=str(item.get("id", "")))}
-    # Catch malformed fallback configuration before recording an attempt.
-    if isinstance(entry, dict):
-        verify_values = {"project": project, "harness": harness,
-                    "role": role, "session": session, "notification_id": str(item.get("id", "")),
-                    "body": values["body"]}
-        _command_args(entry, "verify", verify_values)
-        _command_args(entry, "wake", {"project": project, "harness": harness,
-                    "role": role, "session": session, "notification_id": str(item.get("id", "")),
-                    "body": values["body"]})
-        _verify(entry, values)
-    elif harness == "antigravity":
-        # The desktop-specific module verifies the exact visible native
-        # conversation before this notification reserves a one-shot wake.
-        from . import ag_wake
-        ag_wake.verify(project, role, session)
     db = _ledger(store.path)
-    reserved = False
+    state = "uncertain"
     refund_attempt = False
+    attempt_started = None
     notification_id = item.get("id")
     try:
-        reserved, notification_id, reserve_reason = _reserve(
+        # A failed preflight has not reserved or submitted a native wake.
+        if isinstance(entry, dict):
+            _command_args(entry, "wake", values)
+            _verify(entry, values)
+        elif harness == "antigravity":
+            from . import ag_wake
+            ag_wake.verify(project, role, session)
+        attempt_started, notification_id, reserve_reason = _reserve(
             db, item, project, harness, role, session, store=store)
-        if not reserved:
-            if reserve_reason == "session-busy":
-                return {"id": notification_id, "status": "held", "reason": "session-busy"}
+        if attempt_started is None:
+            if reserve_reason:
+                return {"id": notification_id, "status": "held", "reason": reserve_reason}
             return _attempt_status(db, notification_id, project, harness, role, session)
         # Recheck stop, role, and the same still-pending item after acquiring
         # the durable send guard. A stop or role handoff during preflight wins.
@@ -538,16 +574,31 @@ def wake_one(store, project, harness, role, session, *, commands=None):
                 state = "retryable"
                 refund_attempt = True
                 raise WakeRejected(f"Antigravity destination verification refused ({type(exc).__name__})") from None
+        def before_prompt():
+            return (store.roles(project, harness).get(role) == session
+                    and store.status(project, harness).get("enabled")
+                    and store.pending(project, harness, role, session, message_id=notification_id) is not None
+                    and db.execute("""SELECT 1 FROM mhb_wake_attempts WHERE notification_id=?
+                        AND project=? AND harness=? AND role=? AND session=? AND state='sending' AND started_at=?""",
+                        (notification_id, project, harness, role, session, attempt_started)).fetchone() is not None)
+
         try:
-            if isinstance(entry, dict):
-                _launch(entry, values)
-                _verify(entry, values, preflight=False)
-            else:
-                def before_prompt():
-                    return (store.roles(project, harness).get(role) == session
-                            and store.status(project, harness).get("enabled")
-                            and store.pending(project, harness, role, session, message_id=notification_id) is not None)
-                _default_wake(harness, values, before_prompt=before_prompt)
+            provider = getattr(store, "bindings_provider", None)
+            guard = (provider.devin_wake_guard()
+                     if harness == "devin" and isinstance(provider, legacy.LegacyBindings)
+                     and provider.handles(project, harness) else nullcontext())
+            with guard:
+                if isinstance(entry, dict):
+                    if not before_prompt():
+                        raise WakeDeferred("Wake reservation changed before native submission")
+                    _launch(entry, values)
+                    _verify(entry, values, preflight=False)
+                else:
+                    _default_wake(harness, values, before_prompt=before_prompt)
+        except legacy.LegacyWakeBusy as exc:
+            state = "retryable"
+            refund_attempt = True
+            raise WakeDeferred(str(exc)) from None
         except WakeDeferred:
             state = "retryable"
             refund_attempt = True
@@ -562,25 +613,19 @@ def wake_one(store, project, harness, role, session, *, commands=None):
             # A launcher exception after its call began is ambiguous unless it
             # has an explicit pre-submit rejection type.
             state = "uncertain"
-            raise WakeError(f"Native wake failed ({type(exc).__name__}); reconcile before retrying") from None
+            raise WakeError(f"Native wake failed ({type(exc).__name__}); delivery state is uncertain") from None
         state = "sent"
         if harness == "antigravity":
             return {"id": notification_id, "status": state, "mechanism": "agentapi", "session": session}
         return {"id": notification_id, "status": "sent"}
+    except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+        exc.notification_id = notification_id
+        raise
     finally:
-        if reserved:
-            with db:
-                db.execute("UPDATE mhb_wake_attempts SET state=?,attempts=MAX(0,attempts-?),updated_at=? WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
-                           (locals().get("state", "uncertain"), int(refund_attempt), time.time(), notification_id,
-                            project, harness, role, session))
-                lane_state = locals().get("state", "uncertain")
-                if lane_state == "retryable":
-                    db.execute("DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=? AND state='sending'",
-                               (project, harness, role, session, notification_id))
-                else:
-                    db.execute("UPDATE mhb_wake_sessions SET state=?,updated_at=? WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=? AND state='sending'",
-                               (lane_state, time.time(), project, harness, role, session, notification_id))
-        db.close()
+        with closing(db), db:
+            if attempt_started is not None:
+                _finalize_attempt(db, notification_id, project, harness, role, session,
+                                  attempt_started, state, refund_attempt)
 
 
 def cycle(project=None, harness=None, role=None):
@@ -613,27 +658,45 @@ def cycle(project=None, harness=None, role=None):
                     if result:
                         reports.append({"project": selected_project, "harness": actor,
                                         "role": target_role, **result})
-                except WakeRejected as exc:
-                    reports.append({"project": selected_project, "harness": actor,
-                                    "role": target_role, "status": "retryable",
-                                    "reason": str(exc)})
                 except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                    reports.append({"project": selected_project, "harness": actor,
-                                    "role": target_role, "status": "held",
-                                    "reason": str(exc)})
+                    result = {"project": selected_project, "harness": actor, "role": target_role,
+                              "session": session,
+                              "status": "retryable" if isinstance(exc, WakeRejected) else "held",
+                              "reason": str(exc), "at": time.time()}
+                    if notification_id := getattr(exc, "notification_id", None):
+                        result["id"] = notification_id
+                    reports.append(result)
     return reports
 
 
 def list_attempts(store, project):
-    db = _ledger(store.path)
-    try:
+    with closing(_ledger(store.path)) as db:
         db.row_factory = sqlite3.Row
-        rows = db.execute("""SELECT notification_id,harness,role,session,state,attempts,
-            started_at,updated_at FROM mhb_wake_attempts WHERE project=?
-            ORDER BY updated_at DESC LIMIT 100""", (project,)).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        db.close()
+        rows = db.execute("""SELECT a.notification_id,a.harness,a.role,a.session,a.state,a.attempts,
+            a.started_at,a.updated_at,l.state AS lane_state,l.updated_at AS lane_updated_at,
+            m.stage AS queue_stage,CASE WHEN m.lease_role=a.role AND m.lease_session=a.session
+                THEN m.deadline END AS lease_deadline,
+            m.pickup_harness=a.harness AND (a.role=m.stage OR a.role='inbox' AND m.stage='outbound') AS on_route,
+            (SELECT COUNT(*) FROM mhb_wake_history h WHERE h.notification_id=a.notification_id
+                AND h.project=a.project AND h.harness=a.harness AND h.role=a.role AND h.session=a.session
+                AND h.action='automatic-retry') AS automatic_retries
+            FROM mhb_wake_attempts a LEFT JOIN mhb_wake_sessions l ON l.project=a.project
+                AND l.harness=a.harness AND l.role=a.role AND l.session=a.session
+                AND l.notification_id=a.notification_id
+            LEFT JOIN messages m ON m.project=a.project AND m.id=a.notification_id
+            WHERE a.project=? ORDER BY a.updated_at DESC LIMIT 100""", (project,))
+        reports = []
+        for row in rows:
+            report = dict(row)
+            on_route = report.pop("on_route")
+            delay = _retry_delay(row["attempts"]) if row["state"] == "retryable" else STALE_WAKE_SECONDS
+            retry_at = row["updated_at"] + delay
+            lane_delay = TURN_COOLDOWN_SECONDS if row["lane_state"] == "cooldown" else STALE_WAKE_SECONDS
+            report["retry_eligible_at"] = (max(retry_at, row["lease_deadline"] or 0,
+                                                (row["lane_updated_at"] or 0) + lane_delay)
+                                           if on_route else None)
+            reports.append(report)
+        return reports
 
 
 def reconcile(store, project, notification_id, outcome, *, harness=None, role=None, session=None):
@@ -650,13 +713,14 @@ def reconcile(store, project, notification_id, outcome, *, harness=None, role=No
     db = _ledger(store.path)
     try:
         db.execute("BEGIN IMMEDIATE")
-        rows = db.execute("""SELECT harness,role,session,state,attempts,updated_at
+        rows = db.execute("""SELECT harness,role,session,state,attempts,started_at,updated_at
             FROM mhb_wake_attempts WHERE project=? AND notification_id=?
             AND state IN ('uncertain','retryable','sending')""",
             (project, notification_id)).fetchall()
         if all(supplied):
             rows = [row for row in rows if (row[0], row[1], row[2]) == (harness, role, session)]
-        rows = [row for row in rows if row[3] != "sending" or time.time() - row[5] > MAX_COMMAND_TIMEOUT + 15]
+        now = time.time()
+        rows = [row for row in rows if row[3] != "sending" or now - row[6] >= STALE_WAKE_SECONDS]
         if not rows:
             active_query = """SELECT 1 FROM mhb_wake_attempts WHERE project=?
                 AND notification_id=? AND state='sending'"""
@@ -672,22 +736,23 @@ def reconcile(store, project, notification_id, outcome, *, harness=None, role=No
         if len(rows) != 1:
             raise ValueError("notification has multiple unresolved role attempts; reconcile the exact role first")
         row = rows[0]
+        route = (project, *row[:3])
         state = "sent" if outcome == "sent" else "retryable"
-        attempts = 2 if state == "retryable" and row[4] >= 3 else row[4]
-        changed = db.execute("""UPDATE mhb_wake_attempts SET state=?,attempts=?,updated_at=?
+        _archive_attempt(db, notification_id, route, row[3:], f"operator-{outcome}", now)
+        changed = db.execute("""UPDATE mhb_wake_attempts SET state=?,updated_at=?
             WHERE project=? AND notification_id=? AND harness=? AND role=? AND session=?
-            AND state=?""", (state, attempts, time.time(), project, notification_id,
+            AND state=?""", (state, now, project, notification_id,
                                row[0], row[1], row[2], row[3])).rowcount
         if changed != 1:
             raise ValueError("wake attempt changed during reconciliation; reread its status")
         if state == "retryable":
             db.execute("""DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=?
-                AND session=? AND notification_id=?""",
-                (project, row[0], row[1], row[2], notification_id))
+                AND session=? AND notification_id=? AND state IN ('sending','uncertain','sent')""",
+                (*route, notification_id))
         else:
             db.execute("""UPDATE mhb_wake_sessions SET state='sent',updated_at=?
-                WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?""",
-                (time.time(), project, row[0], row[1], row[2], notification_id))
+                WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
+                AND state IN ('sending','uncertain')""", (now, *route, notification_id))
         db.commit()
     finally:
         db.close()
@@ -732,12 +797,7 @@ def renotify(store, project, notification_id, *, harness, role, session):
         if not row or row[0] not in {"sent", "uncertain"}:
             raise ValueError("notification has no accepted or uncertain wake to re-notify")
         now = time.time()
-        db.execute("""INSERT INTO mhb_wake_history
-            (notification_id,project,harness,role,session,prior_state,prior_attempts,
-             prior_started_at,prior_updated_at,action,action_at)
-            VALUES(?,?,?,?,?,?,?,?,?,'renotify',?)""",
-            (notification_id, project, harness, role, session, row[0], row[1],
-             row[2], row[3], now))
+        _archive_attempt(db, notification_id, (project, harness, role, session), row, "renotify", now)
         changed = db.execute("""UPDATE mhb_wake_attempts SET state='retryable',attempts=0,
             updated_at=? WHERE notification_id=? AND project=? AND harness=? AND role=?
             AND session=? AND state=?""",
@@ -766,7 +826,7 @@ def main(argv=None):
     parser.add_argument("--reconcile", metavar="NOTIFICATION_ID",
                         help="reconcile an ambiguous wake after inspecting the native session")
     parser.add_argument("--outcome", choices=("sent", "not-sent"),
-                        help="required with --reconcile; not-sent permits a bounded retry")
+                        help="required with --reconcile; not-sent re-arms the exact wake after backoff")
     parser.add_argument("--session", help="exact native session for role-specific reconciliation")
     args = parser.parse_args(argv)
     if args.show_attempts or args.reconcile or args.renotify:
