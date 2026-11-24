@@ -12,7 +12,8 @@ import sys
 import time
 
 from . import config
-from .wake import WAKE_RELAY_PROMPT, record_agent_relay
+from .wake import (WAKE_RELAY_PROMPT, fail_agent_relay, record_agent_relay,
+                   reserve_agent_relay)
 
 from .propagation import (BUILTIN_ROOT, HARNESS_DIRS, MANIFEST, _blockers, _skills,
                           bootstrap, digest, install, resolve_workspace)
@@ -170,9 +171,14 @@ def _mailbox(args, host, cfg):
             if trace and trace.get("stage") == "coordinator":
                 coordinator = store.roles(project, "codex").get("coordinator")
                 if coordinator:
-                    result["wake_relay"] = {"tool": "send_message_to_thread",
-                                            "threadId": coordinator,
-                                            "prompt": WAKE_RELAY_PROMPT.format(notification_id=args.message_id)}
+                    reserved, reason = reserve_agent_relay(
+                        store, project, host, "coordinator", coordinator, args.message_id)
+                    if reserved:
+                        result["wake_relay"] = {"tool": "send_message_to_thread",
+                                                "threadId": coordinator,
+                                                "prompt": WAKE_RELAY_PROMPT.format(notification_id=args.message_id)}
+                    else:
+                        result["wake_relay_status"] = reason or "session-busy"
     elif args.mailbox == "relay-confirm":
         # The inbox agent confirms only after the relayed tool call succeeded;
         # until then the dispatcher's queued fallback stays eligible.
@@ -183,7 +189,7 @@ def _mailbox(args, host, cfg):
         if not args.message_id:
             raise ValueError("--message-id is required for relay-confirm")
         trace = store.trace(project, args.message_id)
-        if not trace or trace.get("stage") != "coordinator" or trace.get("recipient") != host:
+        if not trace or trace.get("stage") not in {"coordinator", "done"} or trace.get("recipient") != host:
             raise ValueError("message is not awaiting this harness's coordinator")
         coordinator = store.roles(project, host).get("coordinator")
         if not coordinator:
@@ -194,6 +200,25 @@ def _mailbox(args, host, cfg):
             raise ValueError(f"relay confirmation could not be recorded ({type(exc).__name__})") from None
         result = {"project": project, "role": role, "message_id": args.message_id,
                   "relay_confirmed": True}
+    elif args.mailbox == "relay-failed":
+        if host != "codex":
+            raise ValueError("relay-failed is only valid for the codex harness")
+        if role != "inbox":
+            raise PermissionError("The bound inbox session owns coordinator relays")
+        if not args.message_id:
+            raise ValueError("--message-id is required for relay-failed")
+        trace = store.trace(project, args.message_id)
+        if not trace or trace.get("stage") != "coordinator" or trace.get("recipient") != host:
+            raise ValueError("message is not awaiting this harness's coordinator")
+        coordinator = store.roles(project, host).get("coordinator")
+        if not coordinator:
+            raise ValueError("no coordinator is bound for this harness")
+        try:
+            fail_agent_relay(store, project, host, "coordinator", coordinator, args.message_id)
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            raise ValueError(f"relay failure could not be recorded ({type(exc).__name__})") from None
+        result = {"project": project, "role": role, "message_id": args.message_id,
+                  "relay_failed": True}
     elif args.mailbox in {"send", "send-fanout", "reply"}:
         if role != "coordinator":
             raise PermissionError("Coordinator ownership is required for sending and replying")
@@ -242,7 +267,7 @@ def main(argv=None):
     parser.add_argument("--install-native", action="store_true", help="Install supported host-local hook/helper")
     parser.add_argument("--take", choices=("coordinator", "bridge"), help="Transfer the current verified native chat to this role")
     parser.add_argument("--hint", help="Disambiguate a project matching the current native workspace")
-    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "relay-confirm", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
+    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "relay-confirm", "relay-failed", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
     parser.add_argument("--message-id")
     parser.add_argument("--lease", help="Exact lease returned by the claim being finished")
     parser.add_argument("--recipient", action="append", help="Destination harness, repeat for send-fanout")
