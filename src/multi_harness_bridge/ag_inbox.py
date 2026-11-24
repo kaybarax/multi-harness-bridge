@@ -33,25 +33,30 @@ def _db(cfg):
     return db
 
 
-def _explicit_skill_sources(prompt):
-    """Read an explicit source list from this direct Desktop user turn."""
+def _explicit_skill_request(prompt):
+    """Read the operation and explicit source list from this direct Desktop turn."""
     import re
     if not isinstance(prompt, str):
         raise PermissionError("Name the skill sources in the current user request")
     match = re.fullmatch(
-        r"\s*(?:please\s+)?(?:@|/)?propagate(?:[ -]skills)\s+from\s+(.+?)\s*[.!]?\s*",
+        r"\s*(?:please\s+)?(?:@|/)?propagate(?:-skills|\s+(skills|one project entry))\s+from\s+(.+?)\s*[.!]?\s*",
         prompt, re.IGNORECASE,
     )
     if not match:
         raise PermissionError("The current user request must explicitly name skill sources")
     allowed = "codex|claude|devin|antigravity"
     if not re.fullmatch(rf"\s*(?:{allowed})(?:\s*(?:,|and|\+)\s*(?:{allowed}))*\s*",
-                        match.group(1), re.IGNORECASE):
+                        match.group(2), re.IGNORECASE):
         raise PermissionError("Skill source list must name supported harnesses explicitly")
-    sources = [item.lower() for item in re.findall(allowed, match.group(1), re.IGNORECASE)]
+    sources = [item.lower() for item in re.findall(allowed, match.group(2), re.IGNORECASE)]
     if len(sources) != len(set(sources)):
         raise PermissionError("Duplicate skill sources are not allowed")
-    return sources
+    return ("entry" if (match.group(1) or "").lower() == "one project entry" else "copy", sources)
+
+
+def _explicit_skill_sources(prompt):
+    """Compatibility helper for callers that only need the requested sources."""
+    return _explicit_skill_request(prompt)[1]
 
 
 def before_tool(cfg, project, event):
@@ -85,11 +90,29 @@ def before_tool(cfg, project, event):
         from .role_adapters import _parse
         title = _parse((event.get("lastUserInput") or "").removeprefix("@"), "inbox" if tool == "take_bridge" else "coordinator")
     elif tool == "propagate_skills":
-        sources = _explicit_skill_sources(event.get("lastUserInput"))
+        mode, sources = _explicit_skill_request(event.get("lastUserInput"))
         supplied = args.get("sources")
         if (not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied)
                 or supplied != sources):
             raise PermissionError("Tool skill sources must exactly match the current user request")
+        active = event.get("workspace") or event.get("workspacePath")
+        if active is None:
+            if len(roots) != 1:
+                raise PermissionError("The active workspace is ambiguous; select one workspace in the native conversation")
+            active = next(iter(roots))
+        active = active if isinstance(active, Path) else ag_wake._local_path(active)
+        if active not in roots:
+            raise PermissionError("Active workspace is not part of the verified native project")
+        requested_workspace = args.get("workspace")
+        if requested_workspace and ag_wake._local_path(requested_workspace) != active:
+            raise PermissionError("Requested destination does not match the active native workspace")
+        entry_declared = (active / ".mhb/project-skills.json").is_file()
+        selected_mode = "entry" if entry_declared else "copy"
+        supplied_mode = args.get("mode", "auto")
+        if supplied_mode not in {"auto", selected_mode} or mode == "entry" and not entry_declared:
+            raise PermissionError("Propagation mode must match the active project's declaration")
+        args["mode"] = selected_mode
+        args["workspace"] = str(active)
     else:
         roles = config.open_store(cfg).roles(project, "antigravity")
         if session not in roles.values() or tool in COORDINATOR_TOOLS and session != roles["coordinator"]:
@@ -120,8 +143,11 @@ def invoke(cfg, project, tool, grant):
     if not ag_wake._desktop_summary(project, session, cfg=cfg):
         raise PermissionError("Desktop session changed during tool call")
     if tool == "propagate_skills":
-        from .propagation import install
-        return install(project, args["sources"], "antigravity", cfg=cfg)
+        if args.get("mode") == "entry":
+            from .project_entry import install
+        else:
+            from .propagation import install
+        return install(project, args["sources"], "antigravity", workspace=args["workspace"], cfg=cfg)
     roles = store.roles(project, "antigravity")
     if tool in {"take_coordinator", "take_bridge"}:
         role = "coordinator" if tool == "take_coordinator" else "inbox"
@@ -217,8 +243,9 @@ def make_server(cfg, project):
         return invoke(cfg, project, "set_pickup", desktop_grant)
 
     @server.tool()
-    def propagate_skills(sources: list[str], desktop_grant: str = "") -> dict:
-        """Copy named project skills to Antigravity after the Desktop hook verifies this user turn."""
+    def propagate_skills(sources: list[str], mode: str = "auto", workspace: str = "",
+                         desktop_grant: str = "") -> dict:
+        """Provision named project skills or the declared entry after native request verification."""
         return invoke(cfg, project, "propagate_skills", desktop_grant)
     return server
 

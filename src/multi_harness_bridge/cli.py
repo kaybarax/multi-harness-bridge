@@ -28,6 +28,12 @@ def build_parser():
     add = project.add_parser("add")
     add.add_argument("name")
     add.add_argument("roots", nargs="+", type=Path)
+    skill_entry = commands.add_parser("skill-entry", help="Validate or refresh repository-owned project skill pins")
+    entry_actions = skill_entry.add_subparsers(dest="action", required=True)
+    entry_refresh = entry_actions.add_parser("refresh", help="Recompute entry, index, and procedure hashes")
+    entry_refresh.add_argument("project")
+    entry_refresh.add_argument("--workspace", type=Path,
+                               help="Registered workspace to refresh; defaults to the current directory")
     option = commands.add_parser("option", help="Read or change per-project harness options")
     option_cmds = option.add_subparsers(dest="action", required=True)
     listing = option_cmds.add_parser("list")
@@ -113,6 +119,11 @@ def run(args):
         if args.action == "add":
             config = settings.register(args.name, args.roots)
         return {name: [str(path) for path in paths] for name, paths in config.projects.items()}
+    if args.command == "skill-entry":
+        from . import project_entry
+        project = config.require(args.project)
+        workspace = (args.workspace or Path.cwd()).expanduser().resolve(strict=True)
+        return project_entry.refresh(project, workspace=workspace, cfg=config)
     if args.command == "option":
         if args.action == "list":
             options = settings.load_options(config.root)
