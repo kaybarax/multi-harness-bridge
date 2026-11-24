@@ -479,6 +479,7 @@ class Store:
         lease = secrets.token_urlsafe(24)
         with self._route_guard(project), closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            self._ensure_wake_sessions(db)
             if not self._can_pickup(db, project, harness, role, session):
                 return None
             now = time.time()
@@ -490,6 +491,12 @@ class Store:
                 attempts=attempts+1,updated=? WHERE id=?""",
                 (lease, role, session, now + LEASE_SECONDS, now, row["id"]),
             )
+            db.execute("""INSERT INTO mhb_wake_sessions
+                (project,harness,role,session,notification_id,state,updated_at)
+                VALUES(?,?,?,?,?,'claimed',?) ON CONFLICT(project,harness,role,session)
+                DO UPDATE SET state='claimed',updated_at=excluded.updated_at
+                WHERE mhb_wake_sessions.notification_id=excluded.notification_id""",
+                (project, harness, role, session, row["id"], now))
             return {**self._message_payload(row), "lease": lease}
 
     def pending(self, project, harness, role, session, *, message_id=None, for_wake=False):
@@ -517,7 +524,22 @@ class Store:
         self._validate_claim(project, harness, role, session)
         with self._route_guard(project), closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
-            return self._finish_lease(db, project, harness, role, session, id, lease)
+            self._ensure_wake_sessions(db)
+            finished = self._finish_lease(db, project, harness, role, session, id, lease)
+            if finished:
+                db.execute("""UPDATE mhb_wake_sessions SET state='cooldown',updated_at=?
+                    WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?""",
+                    (time.time(), project, harness, role, session, id))
+            return finished
+
+    @staticmethod
+    def _ensure_wake_sessions(db):
+        db.execute("""CREATE TABLE IF NOT EXISTS mhb_wake_sessions (
+            project TEXT NOT NULL, harness TEXT NOT NULL, role TEXT NOT NULL,
+            session TEXT NOT NULL, notification_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('sending','sent','uncertain','claimed','cooldown')),
+            updated_at REAL NOT NULL,
+            PRIMARY KEY(project,harness,role,session))""")
 
     def finish_and_reply(self, project, sender, session, message_id, lease, body, key):
         """Complete an exact coordinator lease and queue its reply in one commit."""
@@ -525,8 +547,12 @@ class Store:
         self._name(message_id, "message_id")
         with self._route_guard(project), closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            self._ensure_wake_sessions(db)
             if not self._finish_lease(db, project, sender, "coordinator", session, message_id, lease):
                 return None
+            db.execute("""UPDATE mhb_wake_sessions SET state='cooldown',updated_at=?
+                WHERE project=? AND harness=? AND role='coordinator' AND session=? AND notification_id=?""",
+                (time.time(), project, sender, session, message_id))
             return self._reply_free_text(db, project, sender, message_id, body, key, session)
 
     def _finish_lease(self, db, project, harness, role, session, id, lease):

@@ -32,6 +32,9 @@ def advance(store, message_id, harness, role, stage):
 )
 def test_each_delivery_and_reply_visits_both_native_inboxes(tmp_path, monkeypatch, origin, destinations):
     store = team(tmp_path)
+    # This protocol walk deliberately drives several separate host turns
+    # synchronously without waiting for the native turn-boundary cooldown.
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 0)
     wake_calls = []
 
     def record_wake(harness, values, **kwargs):
@@ -61,7 +64,13 @@ def test_each_delivery_and_reply_visits_both_native_inboxes(tmp_path, monkeypatc
             assert (result["id"], result["status"]) == (message_id, "sent")
             if harness == "antigravity" and "mechanism" in result:
                 assert (result["mechanism"], result["session"]) == ("agentapi", session)
-            assert wake.wake_one(store, "example-project", harness, role, session, commands={})["status"] == "sent"
+            # A second queued delivery to this exact session must wait for the
+            # first one to be claimed and finished.
+            followup = wake.wake_one(store, "example-project", harness, role, session, commands={})
+            if followup["status"] == "held":
+                assert followup["reason"] == "session-busy"
+            else:
+                assert (followup["id"], followup["status"]) == (message_id, "sent")
             item = advance(store, message_id, harness, role, stage)
             assert (item["sender"], item["recipient"], item["body"]) == (sender, recipient, body)
             assert (item["request_id"], item["reply_to"]) == (request["request_id"], reply_to)

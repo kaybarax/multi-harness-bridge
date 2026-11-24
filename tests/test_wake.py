@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 import time
 import uuid
 
@@ -154,6 +155,10 @@ def test_wake_skips_held_predecessors_without_resending_them(tmp_path, monkeypat
         assert wake._reserve(db, older, *route)[0]
         with db:
             db.execute("UPDATE mhb_wake_attempts SET state=?, attempts=?", (state, attempts))
+            if state == "retryable":
+                db.execute("DELETE FROM mhb_wake_sessions")
+            else:
+                db.execute("UPDATE mhb_wake_sessions SET state=?", (state,))
     finally:
         db.close()
 
@@ -164,10 +169,19 @@ def test_wake_skips_held_predecessors_without_resending_them(tmp_path, monkeypat
         calls.append(values["notification_id"])
 
     monkeypatch.setattr(wake, "_default_wake", launch)
-    assert wake.wake_one(store, *route, commands={}) == {"id": next_id, "status": "sent"}
+    first_result = wake.wake_one(store, *route, commands={})
+    if state in {"sent", "uncertain"}:
+        assert first_result == {"id": next_id, "status": "held", "reason": "session-busy"}
+        assert calls == []
+    else:
+        assert first_result == {"id": next_id, "status": "sent"}
+        assert calls == [next_id]
     assert store.pending(*route)["id"] == older["id"]
-    assert wake.wake_one(store, *route, commands={}) == {"id": older["id"], "status": state}
-    assert calls == [next_id]
+    if state in {"sent", "uncertain"}:
+        assert wake.wake_one(store, *route, commands={}) == {
+            "id": next_id, "status": "held", "reason": "session-busy"}
+    else:
+        assert wake.wake_one(store, *route, commands={}) == {"id": older["id"], "status": state}
 
 
 def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False, minimal=False):
@@ -530,6 +544,8 @@ def test_codex_agent_relay_only_covers_coordinator_role(tmp_path, monkeypatch):
 
 def test_agent_relay_record_suppresses_fallback_wake(tmp_path, monkeypatch):
     store, message_id = _codex_relay_store(tmp_path)
+    assert wake.reserve_agent_relay(store, "sample", "codex", "coordinator",
+                                    "codex-coordinator", message_id) == (True, None)
     wake.record_agent_relay(store, "sample", "codex", "coordinator",
                             "codex-coordinator", message_id)
     monkeypatch.setattr(wake, "_default_wake",
@@ -537,6 +553,219 @@ def test_agent_relay_record_suppresses_fallback_wake(tmp_path, monkeypatch):
     result = wake.wake_one(store, "sample", "codex", "coordinator",
                            "codex-coordinator", commands={})
     assert result == {"id": message_id, "status": "sent"}
+
+
+def test_one_session_gets_one_wake_until_claim_finish_and_cooldown(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    first = store.send("sample", "devin", "codex", "first", "first")
+    second = store.send("sample", "devin", "codex", "second", "second")
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+
+    assert wake.wake_one(store, *route, commands={}) == {"id": first["id"], "status": "sent"}
+    # A dispatcher restart reopens the same durable session lane.
+    store = Store(store.path)
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": second["id"], "status": "held", "reason": "session-busy"}
+    assert calls == [first["id"]]
+
+    claimed = store.claim(*route, message_id=first["id"])
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": second["id"], "status": "held", "reason": "session-busy"}
+    assert store.finish(*route, first["id"], claimed["lease"])
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": second["id"], "status": "held", "reason": "session-busy"}
+
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 0)
+    assert wake.wake_one(store, *route, commands={}) == {"id": second["id"], "status": "sent"}
+    assert calls == [first["id"], second["id"]]
+
+
+def test_concurrent_dispatchers_share_one_session_lane(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    first = store.send("sample", "devin", "codex", "first", "first")
+    second = store.send("sample", "devin", "codex", "second", "second")
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def launch(_harness, values, *, before_prompt):
+        assert before_prompt()
+        calls.append(values["notification_id"])
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(wake, "_default_wake", launch)
+    outcomes = []
+    worker = threading.Thread(target=lambda: outcomes.append(
+        wake.wake_one(store, *route, commands={})))
+    worker.start()
+    assert entered.wait(2)
+    competing = wake.wake_one(store, *route, commands={})
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert outcomes == [{"id": first["id"], "status": "sent"}]
+    assert competing == {"id": second["id"], "status": "held", "reason": "session-busy"}
+    assert calls == [first["id"]]
+
+
+def test_expired_lease_does_not_release_wake_lane_without_exact_recovery(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "devin", "inbox", "devin-inbox")
+    store.bind("sample", "devin", "coordinator", "devin-coordinator")
+    first = store.send_fanout("sample", "codex", ["devin"], "first", "first",
+                              session="codex-coordinator")["deliveries"][0]
+    second = store.send_fanout("sample", "codex", ["devin"], "second", "second",
+                               session="codex-coordinator")["deliveries"][0]
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    assert wake.wake_one(store, *route, commands={}) == {"id": first["id"], "status": "sent"}
+    claimed = store.claim(*route, message_id=first["id"])
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE messages SET deadline=? WHERE id=?", (time.time() - 1, first["id"]))
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": second["id"], "status": "held", "reason": "session-busy"}
+    assert wake.renotify(store, "sample", first["id"], harness="codex", role="inbox",
+                         session="codex-inbox")["status"] == "retry-authorized"
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("""SELECT prior_state,action FROM mhb_wake_history
+            WHERE notification_id=?""", (first["id"],)).fetchone() == ("sent", "renotify")
+    assert wake.wake_one(store, *route, commands={}) == {"id": first["id"], "status": "sent"}
+    assert calls == [first["id"], first["id"]]
+
+
+def test_fast_native_claim_and_finish_preserve_cooldown_lane(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "devin", "inbox", "devin-inbox")
+    store.bind("sample", "devin", "coordinator", "devin-coordinator")
+    first = store.send_fanout("sample", "codex", ["devin"], "first", "first",
+                              session="codex-coordinator")["deliveries"][0]
+    second = store.send_fanout("sample", "codex", ["devin"], "second", "second",
+                               session="codex-coordinator")["deliveries"][0]
+
+    def fast_host(_harness, values, *, before_prompt):
+        assert before_prompt()
+        message_id = values["notification_id"]
+        claimed = store.claim(*route, message_id=message_id)
+        assert store.finish(*route, message_id, claimed["lease"])
+
+    monkeypatch.setattr(wake, "_default_wake", fast_host)
+    assert wake.wake_one(store, *route, commands={}) == {"id": first["id"], "status": "sent"}
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT state FROM mhb_wake_sessions").fetchone() == ("cooldown",)
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": second["id"], "status": "held", "reason": "session-busy"}
+
+
+def test_legacy_sent_backlog_does_not_resend_or_block_new_stage_work(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "devin", "inbox", "devin-inbox")
+    store.bind("sample", "devin", "coordinator", "devin-coordinator")
+    old_outbound1 = store.send_fanout("sample", "codex", ["devin"], "old outbound 1", "old-1",
+                                      session="codex-coordinator")["deliveries"][0]
+    old_outbound2 = store.send_fanout("sample", "codex", ["devin"], "old outbound 2", "old-2",
+                                      session="codex-coordinator")["deliveries"][0]
+    old_inbox = store.send("sample", "devin", "codex", "old inbox", "old-inbox")
+    old_coordinator = store.send("sample", "devin", "codex", "old coordinator", "old-coordinator")
+    claimed = store.claim("sample", "codex", "inbox", "codex-inbox",
+                          message_id=old_coordinator["id"])
+    assert store.finish("sample", "codex", "inbox", "codex-inbox",
+                        old_coordinator["id"], claimed["lease"])
+    new_inbox = store.send_fanout("sample", "codex", ["devin"], "new inbox", "new-inbox",
+                                  session="codex-coordinator")["deliveries"][0]
+    new_coordinator = store.send("sample", "devin", "codex", "new coordinator", "new-coordinator")
+    claimed = store.claim("sample", "codex", "inbox", "codex-inbox",
+                          message_id=new_coordinator["id"])
+    assert store.finish("sample", "codex", "inbox", "codex-inbox",
+                        new_coordinator["id"], claimed["lease"])
+    db = wake._ledger(store.path)
+    with db:
+        now = time.time()
+        for message in (old_outbound1, old_outbound2, old_inbox):
+            db.execute("""INSERT INTO mhb_wake_attempts
+                (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+                VALUES(?,?,?,?,?,'sent',1,?,?)""",
+                (message["id"], "sample", "codex", "inbox", "codex-inbox", now, now))
+        db.execute("""INSERT INTO mhb_wake_attempts
+            (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+            VALUES(?,?,?,?,?,'sent',1,?,?)""",
+            (old_coordinator["id"], "sample", "codex", "coordinator", "codex-coordinator", now, now))
+    db.close()
+    calls = []
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 0)
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    assert wake.wake_one(store, *route, commands={}) == {"id": new_inbox["id"], "status": "sent"}
+    assert calls == [new_inbox["id"]]
+    claimed = store.claim(*route, message_id=new_inbox["id"])
+    assert store.finish(*route, new_inbox["id"], claimed["lease"])
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 0)
+    assert wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator",
+                         commands={}) == {"id": new_coordinator["id"], "status": "sent"}
+    assert calls == [new_inbox["id"], new_coordinator["id"]]
+    old_pending = [old_outbound1, old_outbound2, old_inbox, old_coordinator]
+    with sqlite3.connect(store.path) as db:
+        old_states = [db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
+                                 (message["id"],)).fetchone()[0] for message in old_pending]
+        old_stages = [db.execute("SELECT stage FROM messages WHERE id=?",
+                                 (message["id"],)).fetchone()[0] for message in old_pending]
+    assert old_states == ["sent"] * 4
+    assert old_stages == ["outbound", "outbound", "inbox", "coordinator"]
+
+
+def test_legacy_coordinator_sent_record_does_not_block_new_coordinator_work(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    for harness in ("codex", "devin"):
+        store.bind("sample", harness, "inbox", f"{harness}-inbox")
+        store.bind("sample", harness, "coordinator", f"{harness}-coordinator")
+    first = store.send("sample", "devin", "codex", "first", "first")
+    second = store.send("sample", "devin", "codex", "second", "second")
+    for message in (first, second):
+        claimed = store.claim("sample", "codex", "inbox", "codex-inbox",
+                              message_id=message["id"])
+        assert store.finish("sample", "codex", "inbox", "codex-inbox",
+                            message["id"], claimed["lease"])
+    db = wake._ledger(store.path)
+    with db:
+        now = time.time()
+        db.execute("""INSERT INTO mhb_wake_attempts
+            (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+            VALUES(?,?,?,?,?,'sent',1,?,?)""",
+            (first["id"], "sample", "codex", "coordinator", "codex-coordinator", now, now))
+    db.close()
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    assert wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator",
+                         commands={}) == {"id": second["id"], "status": "sent"}
+    assert calls == [second["id"]]
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT stage FROM messages WHERE id=?", (first["id"],)).fetchone() == ("coordinator",)
+        assert db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
+                          (first["id"],)).fetchone() == ("sent",)
+    # The same database's Devin role remains independently dispatchable.
+    unrelated = store.send("sample", "codex", "devin", "unrelated", "unrelated")
+    result = wake.wake_one(store, "sample", "devin", "inbox", "devin-inbox", commands={})
+    assert result == {"id": unrelated["id"], "status": "sent"}
+    assert calls == [second["id"], unrelated["id"]]
 
 
 def test_codex_thread_load_is_darwin_best_effort(monkeypatch):

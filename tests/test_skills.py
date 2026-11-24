@@ -371,6 +371,68 @@ def test_codex_inbox_finish_emits_wake_relay_without_confirming(tmp_path, monkey
         "status": "relay-pending", "id": message_id}
 
 
+def test_definite_relay_failure_releases_lane_for_queue_fallback(tmp_path, monkeypatch):
+    from multi_harness_bridge import wake
+
+    cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    message_id = store.send("sample", "devin", "codex", "queued work", "stable-id")["id"]
+    _claim_and_finish(cfg, store, message_id)
+    args = SimpleNamespace(project=None, mailbox="relay-failed", message_id=message_id,
+                           lease=None, recipient=None, body=None, body_file=None,
+                           key=None, reply_to=None)
+    assert skills._mailbox(args, "codex", cfg)["relay_failed"] is True
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    assert wake.wake_one(store, "sample", "codex", "coordinator",
+                         coordinator_session, commands={}) == {"id": message_id, "status": "sent"}
+    assert calls == [message_id]
+
+
+def test_relay_reservation_prevents_second_same_session_send(tmp_path, monkeypatch):
+    from multi_harness_bridge import wake
+
+    cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    first = store.send("sample", "devin", "codex", "first", "first")["id"]
+    second = store.send("sample", "devin", "codex", "second", "second")["id"]
+    first_result = _claim_and_finish(cfg, store, first)
+    assert "wake_relay" in first_result
+    second_result = _claim_and_finish(cfg, store, second)
+    assert "wake_relay" not in second_result
+    assert second_result["wake_relay_status"] == "session-busy"
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("queue fallback overlapped the relay"))
+    result = wake.wake_one(store, "sample", "codex", "coordinator",
+                           coordinator_session, commands={})
+    assert result["status"] == "relay-pending"
+
+
+def test_relay_confirmation_survives_fast_coordinator_claim_and_finish(tmp_path, monkeypatch):
+    import sqlite3
+    from multi_harness_bridge import wake
+
+    cfg, store, _, coordinator_session = _relay_fixture(tmp_path, monkeypatch)
+    message_id = store.send("sample", "devin", "codex", "fast", "fast")["id"]
+    assert "wake_relay" in _claim_and_finish(cfg, store, message_id)
+    claimed = store.claim("sample", "codex", "coordinator", coordinator_session,
+                          message_id=message_id)
+    assert store.finish("sample", "codex", "coordinator", coordinator_session,
+                        message_id, claimed["lease"])
+    assert _relay_confirm(cfg, store, message_id)["relay_confirmed"] is True
+    with sqlite3.connect(cfg.database) as db:
+        attempt = db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
+                             (message_id,)).fetchone()
+        lane = db.execute("SELECT state FROM mhb_wake_sessions WHERE notification_id=?",
+                          (message_id,)).fetchone()
+    assert attempt == ("sent",)
+    assert lane == ("cooldown",)
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_, **__: pytest.fail("confirmed completed relay was queued again"))
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 0)
+    assert wake.wake_one(store, "sample", "codex", "coordinator",
+                         coordinator_session, commands={}) is None
+
+
 def _relay_confirm(cfg, store, message_id, host="codex"):
     args = SimpleNamespace(project=None, mailbox="relay-confirm", message_id=message_id,
                            lease=None, recipient=None, body=None, body_file=None,

@@ -25,6 +25,10 @@ POLL_SECONDS = 4.0
 COMMAND_TIMEOUT = 8.0
 MAX_COMMAND_TIMEOUT = 60.0
 RELAY_GRACE_SECONDS = 45.0
+# A finish call can happen just before the native host closes its current turn.
+# A brief per-session cooldown reduces the chance the next notification lands
+# in the turn that just finished; it is not a native-idle proof.
+TURN_COOLDOWN_SECONDS = 8.0
 HARNESS_NAMES = {"codex", "claude", "devin", "antigravity"}
 ROLES = {"coordinator", "inbox"}
 WAKE_PROMPT = ("A new Multi Harness Bridge message is pending (notification {notification_id}). "
@@ -210,6 +214,17 @@ def _ledger(db_path):
         attempts INTEGER NOT NULL DEFAULT 1,
         started_at REAL NOT NULL, updated_at REAL NOT NULL,
         PRIMARY KEY(notification_id,project,harness,role,session))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS mhb_wake_sessions (
+        project TEXT NOT NULL, harness TEXT NOT NULL, role TEXT NOT NULL,
+        session TEXT NOT NULL, notification_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('sending','sent','uncertain','claimed','cooldown')),
+        updated_at REAL NOT NULL,
+        PRIMARY KEY(project,harness,role,session))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS mhb_wake_history (
+        notification_id TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL,
+        role TEXT NOT NULL, session TEXT NOT NULL, prior_state TEXT NOT NULL,
+        prior_attempts INTEGER NOT NULL, prior_started_at REAL NOT NULL,
+        prior_updated_at REAL NOT NULL, action TEXT NOT NULL, action_at REAL NOT NULL)""")
     db.commit()
     return db
 
@@ -223,20 +238,47 @@ def _reserve(db, item, project, harness, role, session):
     except ValueError:
         raise WakeError("Pending notification id is not a UUID") from None
     now = time.time()
+    db.execute("BEGIN IMMEDIATE")
+    lane = db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
+        WHERE project=? AND harness=? AND role=? AND session=?""",
+        (project, harness, role, session)).fetchone()
+    if lane:
+        if lane[0] == notification_id and lane[1] != "cooldown":
+            db.commit()
+            return False, notification_id, None
+        if lane[1] == "cooldown" and now - lane[2] >= TURN_COOLDOWN_SECONDS:
+            db.execute("DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=? AND session=?",
+                       (project, harness, role, session))
+        else:
+            db.commit()
+            return False, notification_id, "session-busy"
+    has_messages = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()
+    active = db.execute("""SELECT id FROM messages WHERE project=? AND pickup_harness=?
+        AND lease_role=? AND lease_session=? AND lease IS NOT NULL AND deadline>?
+        ORDER BY updated,id LIMIT 1""", (project, harness, role, session, now)).fetchone() if has_messages else None
+    if active:
+        db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'claimed',?)",
+                   (project, harness, role, session, active[0], now))
+        db.commit()
+        return False, notification_id, "session-busy"
     with db:
         cur = db.execute("""INSERT OR IGNORE INTO mhb_wake_attempts
             (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
             VALUES (?,?,?,?,?,'sending',1,?,?)""",
             (notification_id, project, harness, role, session, now, now))
         if cur.rowcount:
-            return True, notification_id
+            db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sending',?)",
+                       (project, harness, role, session, notification_id, now))
+            return True, notification_id, None
         row = db.execute("SELECT state,attempts FROM mhb_wake_attempts WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
                          (notification_id, project, harness, role, session)).fetchone()
         if row and row[0] == "retryable" and row[1] < 3:
             db.execute("UPDATE mhb_wake_attempts SET state='sending',attempts=attempts+1,updated_at=? WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
                        (now, notification_id, project, harness, role, session))
-            return True, notification_id
-    return False, notification_id
+            db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sending',?)",
+                       (project, harness, role, session, notification_id, now))
+            return True, notification_id, None
+    return False, notification_id, None
 
 
 def _attempt_status(db, notification_id, project, harness, role, session):
@@ -258,10 +300,67 @@ def record_agent_relay(store, project, harness, role, session, notification_id):
     try:
         now = time.time()
         with db:
+            reservation = db.execute("""SELECT state FROM mhb_wake_sessions
+                WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?""",
+                (project, harness, role, session, notification_id)).fetchone()
+            attempt = db.execute("""SELECT state FROM mhb_wake_attempts
+                WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?""",
+                (notification_id, project, harness, role, session)).fetchone()
+            if reservation and reservation[0] in {"sent", "claimed", "cooldown"} and attempt and attempt[0] == "sent":
+                return
+            if (not reservation or reservation[0] not in {"sending", "claimed", "cooldown"}
+                    or not attempt or attempt[0] != "sending"):
+                raise WakeError("no active relay reservation matches this notification")
             db.execute("""INSERT OR IGNORE INTO mhb_wake_attempts
                 (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
                 VALUES (?,?,?,?,?,'sent',1,?,?)""",
                 (notification_id, project, harness, role, session, now, now))
+            db.execute("""UPDATE mhb_wake_attempts SET state='sent',updated_at=?
+                WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?
+                AND state='sending'""", (now, notification_id, project, harness, role, session))
+            lane = db.execute("""SELECT notification_id FROM mhb_wake_sessions
+                WHERE project=? AND harness=? AND role=? AND session=?""",
+                (project, harness, role, session)).fetchone()
+            if not lane:
+                db.execute("INSERT INTO mhb_wake_sessions VALUES(?,?,?,?,?,'sent',?)",
+                           (project, harness, role, session, notification_id, now))
+            else:
+                db.execute("""UPDATE mhb_wake_sessions SET state='sent',updated_at=?
+                    WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
+                    AND state='sending'""", (now, project, harness, role, session, notification_id))
+                db.execute("""UPDATE mhb_wake_sessions SET updated_at=?
+                    WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
+                    AND state='cooldown'""", (now, project, harness, role, session, notification_id))
+    finally:
+        db.close()
+
+
+def reserve_agent_relay(store, project, harness, role, session, notification_id):
+    """Reserve the exact destination session before exposing a relay action."""
+    db = _ledger(store.path)
+    try:
+        reserved, _, reason = _reserve(db, {"id": notification_id}, project,
+                                       harness, role, session)
+        return reserved, reason
+    finally:
+        db.close()
+
+
+def fail_agent_relay(store, project, harness, role, session, notification_id):
+    """Release an in-session relay only after a definite pre-submit failure."""
+    db = _ledger(store.path)
+    try:
+        now = time.time()
+        with db:
+            changed = db.execute("""UPDATE mhb_wake_attempts SET state='retryable',
+                attempts=MAX(0,attempts-1),updated_at=? WHERE notification_id=? AND project=?
+                AND harness=? AND role=? AND session=? AND state='sending'""",
+                (now, notification_id, project, harness, role, session)).rowcount
+            if changed != 1:
+                raise ValueError("no unconfirmed relay reservation matches this notification")
+            db.execute("""DELETE FROM mhb_wake_sessions WHERE project=? AND harness=?
+                AND role=? AND session=? AND notification_id=? AND state='sending'""",
+                (project, harness, role, session, notification_id))
     finally:
         db.close()
 
@@ -309,6 +408,19 @@ def wake_one(store, project, harness, role, session, *, commands=None):
         # The in-session `mhb monitor` delivers read-only notification hints.
         # Do not start a detached Claude turn or record a duplicate external wake.
         return {"status": "subscription-managed", "id": item.get("id")}
+    if (harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
+            and _within_relay_grace(item)):
+        with closing(_ledger(store.path)) as db:
+            lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+                WHERE project=? AND harness=? AND role=? AND session=?""",
+                (project, harness, role, session)).fetchone()
+            attempt = _attempt_status(db, item["id"], project, harness, role, session)
+        if lane and lane[0] == item["id"] and lane[1] in {"sent", "claimed"}:
+            if attempt and attempt["status"] == "sent":
+                return attempt
+            return {"status": "relay-pending", "id": item["id"]}
+        if lane and lane[0] == item["id"] and lane[1] in {"sending", "uncertain"}:
+            return {"status": "relay-pending", "id": item["id"]}
     with closing(_ledger(store.path)) as db:
         candidate = store.pending(project, harness, role, session, for_wake=True)
         if not candidate:
@@ -316,10 +428,23 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     item = candidate
     if (harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
             and _within_relay_grace(item)):
-        # The bound inbox agent relays this wake inside its own turn. Hold the
-        # queue fallback briefly; record_agent_relay suppresses it on success
-        # and the normal path resumes once the grace window expires.
-        return {"status": "relay-pending", "id": item["id"]}
+        # A finish operation reserves the lane before returning a relay tool
+        # action. Keep the fallback held while that send is unresolved. For an
+        # older installation with no reservation yet, retain the original
+        # grace period before using the ordinary queue path.
+        with closing(_ledger(store.path)) as db:
+            lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+                WHERE project=? AND harness=? AND role=? AND session=?""",
+                (project, harness, role, session)).fetchone()
+            attempt = _attempt_status(db, item["id"], project, harness, role, session)
+        if lane and lane[0] != item["id"]:
+            return {"id": item["id"], "status": "held", "reason": "session-busy"}
+        if not lane and not (attempt and attempt["status"] == "retryable"):
+            return {"status": "relay-pending", "id": item["id"]}
+        if lane and lane[1] in {"sending", "sent", "uncertain"}:
+            return {"status": "relay-pending", "id": item["id"]}
+        if attempt and attempt["status"] != "retryable":
+            return {"status": "relay-pending", "id": item["id"]}
     values = {"project": project, "harness": harness, "role": role,
               "session": session, "notification_id": str(item.get("id", "")),
               # Never forward the mailbox body into a prompt, argv, or GUI.
@@ -344,8 +469,10 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     refund_attempt = False
     notification_id = item.get("id")
     try:
-        reserved, notification_id = _reserve(db, item, project, harness, role, session)
+        reserved, notification_id, reserve_reason = _reserve(db, item, project, harness, role, session)
         if not reserved:
+            if reserve_reason == "session-busy":
+                return {"id": notification_id, "status": "held", "reason": "session-busy"}
             return _attempt_status(db, notification_id, project, harness, role, session)
         # Recheck stop, role, and the same still-pending item after acquiring
         # the durable send guard. A stop or role handoff during preflight wins.
@@ -400,6 +527,13 @@ def wake_one(store, project, harness, role, session, *, commands=None):
                 db.execute("UPDATE mhb_wake_attempts SET state=?,attempts=MAX(0,attempts-?),updated_at=? WHERE notification_id=? AND project=? AND harness=? AND role=? AND session=?",
                            (locals().get("state", "uncertain"), int(refund_attempt), time.time(), notification_id,
                             project, harness, role, session))
+                lane_state = locals().get("state", "uncertain")
+                if lane_state == "retryable":
+                    db.execute("DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=? AND state='sending'",
+                               (project, harness, role, session, notification_id))
+                else:
+                    db.execute("UPDATE mhb_wake_sessions SET state=?,updated_at=? WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=? AND state='sending'",
+                               (lane_state, time.time(), project, harness, role, session, notification_id))
         db.close()
 
 
@@ -472,7 +606,8 @@ def reconcile(store, project, notification_id, outcome, *, harness=None, role=No
         db.execute("BEGIN IMMEDIATE")
         rows = db.execute("""SELECT harness,role,session,state,attempts,updated_at
             FROM mhb_wake_attempts WHERE project=? AND notification_id=?
-            AND state IN ('uncertain','retryable','sending')""", (project, notification_id)).fetchall()
+            AND state IN ('uncertain','retryable','sending')""",
+            (project, notification_id)).fetchall()
         if all(supplied):
             rows = [row for row in rows if (row[0], row[1], row[2]) == (harness, role, session)]
         rows = [row for row in rows if row[3] != "sending" or time.time() - row[5] > MAX_COMMAND_TIMEOUT + 15]
@@ -499,10 +634,73 @@ def reconcile(store, project, notification_id, outcome, *, harness=None, role=No
                                row[0], row[1], row[2], row[3])).rowcount
         if changed != 1:
             raise ValueError("wake attempt changed during reconciliation; reread its status")
+        if state == "retryable":
+            db.execute("""DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=?
+                AND session=? AND notification_id=?""",
+                (project, row[0], row[1], row[2], notification_id))
+        else:
+            db.execute("""UPDATE mhb_wake_sessions SET state='sent',updated_at=?
+                WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?""",
+                (time.time(), project, row[0], row[1], row[2], notification_id))
         db.commit()
     finally:
         db.close()
     return {"id": notification_id, "status": state}
+
+
+def renotify(store, project, notification_id, *, harness, role, session):
+    """Re-arm one accepted wake after an operator verifies it remains unprocessed.
+
+    The old send is copied to the append-only history table before the live
+    attempt becomes retryable. This is intentionally exact-ID and never scans
+    or bulk-resets a session's backlog.
+    """
+    if harness not in HARNESS_NAMES or role not in ROLES:
+        raise ValueError("provide a supported harness and role")
+    try:
+        uuid.UUID(notification_id)
+    except (ValueError, TypeError):
+        raise ValueError("notification id must be a UUID") from None
+    if store.roles(project, harness).get(role) != session:
+        raise ValueError("the supplied session is not the currently bound role")
+    if not store.status(project, harness).get("enabled"):
+        raise ValueError("mailbox is stopped")
+    if not store.pending(project, harness, role, session, message_id=notification_id):
+        raise ValueError("notification is not pending and unclaimed for this exact role")
+    db = _ledger(store.path)
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+            WHERE project=? AND harness=? AND role=? AND session=?""",
+            (project, harness, role, session)).fetchone()
+        if lane and lane[0] != notification_id:
+            raise ValueError("another notification currently owns this session's wake lane")
+        row = db.execute("""SELECT state,attempts,started_at,updated_at
+            FROM mhb_wake_attempts WHERE notification_id=? AND project=? AND harness=?
+            AND role=? AND session=?""",
+            (notification_id, project, harness, role, session)).fetchone()
+        if not row or row[0] not in {"sent", "uncertain"}:
+            raise ValueError("notification has no accepted or uncertain wake to re-notify")
+        now = time.time()
+        db.execute("""INSERT INTO mhb_wake_history
+            (notification_id,project,harness,role,session,prior_state,prior_attempts,
+             prior_started_at,prior_updated_at,action,action_at)
+            VALUES(?,?,?,?,?,?,?,?,?,'renotify',?)""",
+            (notification_id, project, harness, role, session, row[0], row[1],
+             row[2], row[3], now))
+        changed = db.execute("""UPDATE mhb_wake_attempts SET state='retryable',attempts=0,
+            updated_at=? WHERE notification_id=? AND project=? AND harness=? AND role=?
+            AND session=? AND state=?""",
+            (now, notification_id, project, harness, role, session, row[0])).rowcount
+        if changed != 1:
+            raise ValueError("wake attempt changed during recovery; reread its status")
+        db.execute("""DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=?
+            AND session=? AND notification_id=?""",
+            (project, harness, role, session, notification_id))
+        db.commit()
+    finally:
+        db.close()
+    return {"id": notification_id, "status": "retry-authorized"}
 
 
 def main(argv=None):
@@ -512,18 +710,27 @@ def main(argv=None):
     parser.add_argument("--role", choices=sorted(ROLES))
     parser.add_argument("--once", action="store_true", help="run one polling cycle")
     parser.add_argument("--show-attempts", action="store_true", help="show recent wake attempts")
+    parser.add_argument("--renotify", metavar="NOTIFICATION_ID",
+                        help="re-arm one accepted wake after verifying the bound session is idle and the ID unprocessed")
     parser.add_argument("--reconcile", metavar="NOTIFICATION_ID",
                         help="reconcile an ambiguous wake after inspecting the native session")
     parser.add_argument("--outcome", choices=("sent", "not-sent"),
                         help="required with --reconcile; not-sent permits a bounded retry")
     parser.add_argument("--session", help="exact native session for role-specific reconciliation")
     args = parser.parse_args(argv)
-    if args.show_attempts or args.reconcile:
+    if args.show_attempts or args.reconcile or args.renotify:
         cfg = config.load()
         selected_project = cfg.resolve(Path.cwd(), args.project)
         store = config.open_store(cfg)
         if args.show_attempts:
             print(json.dumps(list_attempts(store, selected_project), sort_keys=True), flush=True)
+            return 0
+        if args.renotify:
+            if not (args.harness and args.role and args.session):
+                parser.error("--renotify requires --harness, --role, and --session")
+            print(json.dumps(renotify(store, selected_project, args.renotify,
+                                      harness=args.harness, role=args.role, session=args.session),
+                             sort_keys=True), flush=True)
             return 0
         if not args.outcome:
             parser.error("--reconcile requires --outcome")

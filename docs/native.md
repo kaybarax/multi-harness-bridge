@@ -155,13 +155,36 @@ busy/draft/active-user deferral is retried on a later poll and does not consume
 the bounded rejection attempt count.
 
 Inspect recent sends with `multi-harness-wake --project my-project
---show-attempts`. After checking the exact native session, resolve an ambiguous
-attempt with `--reconcile NOTIFICATION_UUID --outcome sent` or
-`--outcome not-sent`. If multiple role attempts for that ID are unresolved,
-also supply `--harness`, `--role`, and `--session` from the status output. An
-active send cannot be reconciled; wait for its 75 second maximum window to
-expire and inspect it again. `not-sent` permits only the remaining bounded
-retry; it does not change the mailbox item or acknowledge it.
+--show-attempts`. A bound session receives one wake at a time: later IDs wait
+until the current ID is claimed and finished, followed by a short cooldown. The
+current Codex queue adapter has no identity-verified desktop-idle signal, so
+this cooldown reduces turn overlap but does not prove the host is idle. The
+lane is durable across dispatcher restarts and applies independently to each
+project, harness, role, and session.
+
+For an ambiguous `sending` attempt, inspect the exact native session and use
+`--reconcile NOTIFICATION_UUID --outcome sent` or `--outcome not-sent`. If
+multiple role attempts for that ID are unresolved, also supply `--harness`,
+`--role`, and `--session` from the status output. An active send cannot be
+reconciled; wait for its 75 second maximum window to expire and inspect it
+again. `not-sent` permits only the remaining bounded retry; it does not change
+the mailbox item or acknowledge it.
+
+For a previously accepted wake whose message is still pending and unprocessed,
+first verify that the exact bound native session is idle and the ID has not
+already been handled. Re-arm only that ID with the actual harness, role, and
+session for the route:
+
+```sh
+multi-harness-wake --project my-project --renotify NOTIFICATION_UUID \
+  --harness codex --role inbox --session BOUND_SESSION
+```
+
+The previous accepted attempt remains in the wake history; the re-notify
+command does not claim or acknowledge the mailbox item.
+Legacy successful sends remain unchanged and are never automatically re-sent;
+new notifications continue through the serialized lane. Other sessions
+continue independently.
 
 ## Duplicate and uncertain sends
 
