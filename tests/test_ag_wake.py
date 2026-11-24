@@ -329,6 +329,81 @@ def test_desktop_propagation_uses_declared_entry_automatically(native_fixture, m
     assert (root / ".agents/skills/workflow-entry/index.json").is_file()
 
 
+def test_propagation_accepts_unique_active_workspace_subset_but_roles_stay_exact(native_fixture, monkeypatch):
+    from multi_harness_bridge import ag_inbox
+
+    cfg, summary_db, roots, sessions, projects = native_fixture
+    docs, dev = roots["alpha"], roots["alpha"].parent / "development"
+    dev.mkdir()
+    scoped_cfg = config.Config(cfg.root, {"alpha": (docs, dev), "beta": cfg.projects["beta"]})
+    monkeypatch.setenv("MHB_ANTIGRAVITY_SUMMARIES_DB", str(summary_db))
+    multi_session = str(uuid.uuid4())
+    with sqlite3.connect(summary_db) as db:
+        db.execute("INSERT INTO conversation_summaries VALUES (?,?,?,?,?)",
+                   (multi_session, "Earlier project workspace set", json.dumps([str(docs), str(dev)]),
+                    projects["alpha"], "antigravity"))
+    assert ag_wake._desktop_propagation_summary(
+        "alpha", multi_session, cfg=scoped_cfg, event_roots={docs, dev}, active_workspace=str(docs)
+    )["active_workspace"] == docs
+    assert ag_wake._desktop_propagation_summary(
+        "alpha", multi_session, cfg=scoped_cfg, event_roots={docs, dev}
+    ) is None
+    source = docs / ".claude/skills/source-workflow/SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nname: source-workflow\n---\nReview the active workspace.\n")
+    event = {"toolCall": {"name": "mcp_mhb_alpha_propagate_skills", "args": {"sources": ["claude"]}},
+             "conversationId": sessions["alpha"], "workspacePaths": [str(docs)],
+             "lastUserInput": "propagate skills from Claude",
+             "artifactDirectoryPath": str(summary_db.parent / "brain" / sessions["alpha"])}
+
+    grant = ag_inbox.before_tool(scoped_cfg, "alpha", event)["overwrite"]["desktop_grant"]
+    report = ag_inbox.invoke(scoped_cfg, "alpha", "propagate_skills", grant)
+
+    assert report["active_workspace"] == str(docs)
+    assert report["destination"] == str(docs / ".agents/skills")
+    assert (docs / ".agents/skills/source-workflow/SKILL.md").is_file()
+    assert not (dev / ".agents/skills/source-workflow").exists()
+    assert ag_wake._desktop_summary("alpha", sessions["alpha"], cfg=scoped_cfg) is None
+    with pytest.raises(PermissionError, match="registered project"):
+        ag_inbox.before_tool(scoped_cfg, "alpha", {**event,
+            "toolCall": {"name": "mcp_mhb_alpha_take_coordinator", "args": {}}})
+    stale_grant = ag_inbox.before_tool(scoped_cfg, "alpha", event)["overwrite"]["desktop_grant"]
+    with sqlite3.connect(summary_db) as db:
+        db.execute("UPDATE conversation_summaries SET workspace_uris=? WHERE conversation_id=?",
+                   (json.dumps([str(docs), str(dev)]), sessions["alpha"]))
+    with pytest.raises(PermissionError, match="changed during propagation"):
+        ag_inbox.invoke(scoped_cfg, "alpha", "propagate_skills", stale_grant)
+
+
+def test_propagation_rejects_foreign_or_ambiguous_native_workspace(native_fixture, monkeypatch):
+    from multi_harness_bridge import ag_inbox
+
+    cfg, summary_db, roots, sessions, projects = native_fixture
+    docs, dev = roots["alpha"], roots["alpha"].parent / "development"
+    dev.mkdir()
+    scoped_cfg = config.Config(cfg.root, {"alpha": (docs, dev), "beta": cfg.projects["beta"]})
+    monkeypatch.setenv("MHB_ANTIGRAVITY_SUMMARIES_DB", str(summary_db))
+    event = {"toolCall": {"name": "mcp_mhb_alpha_propagate_skills", "args": {"sources": ["claude"]}},
+             "conversationId": sessions["alpha"], "workspacePaths": [str(roots["beta"])],
+             "lastUserInput": "propagate skills from Claude",
+             "artifactDirectoryPath": str(summary_db.parent / "brain" / sessions["alpha"])}
+    with pytest.raises(PermissionError, match="registered project"):
+        ag_inbox.before_tool(scoped_cfg, "alpha", event)
+
+    ambiguous_cfg = config.Config(cfg.root, {**scoped_cfg.projects, "duplicate": (docs,)})
+    event["workspacePaths"] = [str(docs)]
+    with pytest.raises(PermissionError, match="registered project"):
+        ag_inbox.before_tool(ambiguous_cfg, "alpha", event)
+
+
+def test_propagation_uses_canonical_harness_identifiers():
+    from multi_harness_bridge import ag_inbox
+
+    assert ag_inbox._explicit_skill_sources("propagate skills from Devin") == ["devin"]
+    with pytest.raises(PermissionError, match="supported harnesses"):
+        ag_inbox._explicit_skill_sources("propagate skills from devin_local")
+
+
 def test_fanout_desktop_grant_is_fenced_at_invoke_after_handoff(native_fixture, monkeypatch):
     from multi_harness_bridge import ag_inbox
 

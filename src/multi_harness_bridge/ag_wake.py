@@ -138,6 +138,80 @@ def _desktop_summary(project, conversation, *, cfg=None, db_path=None):
     return {"title": row[0], "roots": roots, "project_id": expected_id}
 
 
+def _desktop_propagation_summary(project, conversation, *, cfg=None, event_roots=None,
+                                 active_workspace=None, db_path=None):
+    """Verify propagation from one unambiguous registered native workspace.
+
+    Unlike role ownership, skill propagation can target one workspace in a
+    multi-workspace project. The native event must still match the conversation
+    summary exactly, and its roots must map to one registered MHB project.
+    """
+    cfg = cfg or config.load()
+    cfg.require(project)
+    conversation = _uuid(conversation, "Antigravity conversation ID")
+    path = Path(db_path).expanduser().resolve() if db_path else _summary_path()
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as db:
+            row = db.execute("""SELECT title,workspace_uris,project_id,app_data_dir
+                FROM conversation_summaries WHERE conversation_id=?""", (conversation,)).fetchone()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Unable to inspect Antigravity conversation summary ({type(exc).__name__})") from None
+    if (not row or not isinstance(row[0], str) or not row[0].strip()
+            or row[3] != "antigravity"):
+        return None
+    try:
+        values = json.loads(row[1])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+        return None
+    native_roots = {_local_path(value) for value in values}
+    if None in native_roots or len(native_roots) != len(values):
+        return None
+    configured = {name: set(roots) for name, roots in cfg.projects.items()}
+    candidates = [name for name, roots in configured.items() if native_roots.issubset(roots)]
+    if len(candidates) != 1 or candidates[0] != project:
+        return None
+    project_id = row[2]
+    try:
+        _uuid(project_id, "Antigravity project ID")
+        existing_ids = _project_ids(cfg, path)
+    except ValueError:
+        return None
+    if any(name != project and native_id == project_id for name, native_id in existing_ids.items()):
+        return None
+    try:
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)) as db:
+            rows = db.execute("""SELECT workspace_uris FROM conversation_summaries
+                WHERE project_id=? AND app_data_dir='antigravity'""", (project_id,)).fetchall()
+    except sqlite3.Error as exc:
+        raise ValueError(f"Unable to verify Antigravity project identity ({type(exc).__name__})") from None
+    for (workspace_uris,) in rows:
+        try:
+            values = json.loads(workspace_uris)
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(values, list) or not values or not all(isinstance(value, str) for value in values):
+            return None
+        roots = {_local_path(value) for value in values}
+        if None in roots:
+            return None
+        owners = [name for name, registered in configured.items() if roots.issubset(registered)]
+        if len(owners) != 1 or owners[0] != project:
+            return None
+    if event_roots is not None and set(event_roots) != native_roots:
+        return None
+    active = _local_path(active_workspace) if isinstance(active_workspace, str) else active_workspace
+    if active is None:
+        if len(native_roots) != 1:
+            return None
+        active = next(iter(native_roots))
+    if active not in native_roots or active not in configured[project]:
+        return None
+    return {"title": row[0], "roots": native_roots, "project_id": project_id,
+            "active_workspace": active}
+
+
 def _native_role_snapshot(cfg=None, *, summary_db=None):
     """Validate native role bindings and collision-free project identity mappings."""
     cfg = cfg or config.load()
