@@ -51,6 +51,10 @@ confirm that workspace but cannot redirect a native invocation to another
 registered root. Codex, Devin, and Antigravity use `.agents/skills`; Claude
 uses `.claude/skills`.
 
+Use canonical harness identifiers in commands and source lists: `codex`,
+`claude`, `devin`, and `antigravity`. The Devin Desktop Local UI uses the
+`devin` identifier; `devin_local` is not a supported harness alias.
+
 ## Propagating project skills
 
 Name source harnesses explicitly:

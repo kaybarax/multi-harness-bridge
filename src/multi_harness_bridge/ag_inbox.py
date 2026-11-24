@@ -74,12 +74,20 @@ def before_tool(cfg, project, event):
     if tool is None:
         return {"decision":"allow"}
     session = event.get("conversationId")
-    summary = ag_wake._desktop_summary(project, session, cfg=cfg)
-    roots = {ag_wake._local_path(p) for p in event.get("workspacePaths", [])}
+    raw_roots = event.get("workspacePaths", [])
+    roots = {ag_wake._local_path(p) for p in raw_roots} if isinstance(raw_roots, list) else set()
+    active_workspace = event.get("workspace") or event.get("workspacePath")
+    if tool == "propagate_skills":
+        summary = ag_wake._desktop_propagation_summary(
+            project, session, cfg=cfg, event_roots=roots,
+            active_workspace=active_workspace,
+        )
+    else:
+        summary = ag_wake._desktop_summary(project, session, cfg=cfg)
     brain = ag_wake._summary_path().parent / "brain" / session
     artifact = ag_wake._local_path(event.get("artifactDirectoryPath"))
     transcript = ag_wake._local_path(event.get("transcriptPath"))
-    if (not summary or roots != set(cfg.projects[project])
+    if (not summary or tool != "propagate_skills" and roots != set(cfg.projects[project])
             or (artifact != brain and transcript != brain/".system_generated/logs/transcript.jsonl")
             or (transcript and any(p in {"antigravity-cli","antigravity-ide"} for p in transcript.parts))):
         raise PermissionError("Native Desktop conversation and registered project must agree")
@@ -95,14 +103,7 @@ def before_tool(cfg, project, event):
         if (not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied)
                 or supplied != sources):
             raise PermissionError("Tool skill sources must exactly match the current user request")
-        active = event.get("workspace") or event.get("workspacePath")
-        if active is None:
-            if len(roots) != 1:
-                raise PermissionError("The active workspace is ambiguous; select one workspace in the native conversation")
-            active = next(iter(roots))
-        active = active if isinstance(active, Path) else ag_wake._local_path(active)
-        if active not in roots:
-            raise PermissionError("Active workspace is not part of the verified native project")
+        active = summary["active_workspace"]
         requested_workspace = args.get("workspace")
         if requested_workspace and ag_wake._local_path(requested_workspace) != active:
             raise PermissionError("Requested destination does not match the active native workspace")
@@ -113,6 +114,8 @@ def before_tool(cfg, project, event):
             raise PermissionError("Propagation mode must match the active project's declaration")
         args["mode"] = selected_mode
         args["workspace"] = str(active)
+        args["_native_roots"] = sorted(str(root) for root in summary["roots"])
+        args["_native_project_id"] = summary["project_id"]
     else:
         roles = config.open_store(cfg).roles(project, "antigravity")
         if session not in roles.values() or tool in COORDINATOR_TOOLS and session != roles["coordinator"]:
@@ -140,7 +143,15 @@ def invoke(cfg, project, tool, grant):
     session, data, title = row
     args = json.loads(data)
     store = config.open_store(cfg)
-    if not ag_wake._desktop_summary(project, session, cfg=cfg):
+    if tool == "propagate_skills":
+        summary = ag_wake._desktop_propagation_summary(
+            project, session, cfg=cfg, active_workspace=args.get("workspace"))
+        if (not summary or set(args.get("_native_roots", [])) != {str(root) for root in summary["roots"]}
+                or args.get("_native_project_id") != summary["project_id"]):
+            raise PermissionError("Desktop project workspace changed during propagation")
+    else:
+        summary = ag_wake._desktop_summary(project, session, cfg=cfg)
+    if not summary:
         raise PermissionError("Desktop session changed during tool call")
     if tool == "propagate_skills":
         if args.get("mode") == "entry":

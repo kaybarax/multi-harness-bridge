@@ -82,6 +82,15 @@ roles can process the exact notification assigned to them. The Inbox
 forwards it durably. The Coordinator receives an exact lease and uses
 `acknowledge` to record receipt.
 
+Skill propagation can use one active workspace from a native Desktop project
+whose verified workspace set is a unique subset of one registered MHB
+project. The hook requires the event workspace set to match the conversation
+summary, the selected active root to be registered to that project, and the
+native project ID to remain unambiguous. If several native roots are open, the
+event must identify the active root. Propagation grants bind the conversation,
+native project ID, workspace set, active root and explicit source list through
+the tool call. Role changes continue to require the exact registered root set.
+
 An explicit takeover with a quoted title can use the optional macOS
 Accessibility helper to rename the verified conversation. The sidecar and
 mailbox delivery require no Accessibility permissions.
