@@ -51,10 +51,12 @@ def digest(path):
 
 def _blockers(skill, target):
     foreign = set(HARNESS_DIRS) - {target}
-    for p in _files(skill):
+    files = _files(skill) if skill.is_dir() else (skill,)
+    for p in files:
         if p.suffix.lower() not in (".md", ".txt", ".py", ".js", ".sh", ".ps1", ".json", ".toml"):
             continue
-        words = p.relative_to(skill).as_posix() + "\n" + p.read_text(encoding="utf-8", errors="replace")
+        relative = p.relative_to(skill).as_posix() if skill.is_dir() else p.name
+        words = relative + "\n" + p.read_text(encoding="utf-8", errors="replace")
         for host in sorted(foreign):
             if re.search(r"(?<![\w])" + re.escape(host) + r"(?![\w])", words, re.I):
                 return [f"{p.name} references {host}. Supply a reviewed variant for {target}."]
@@ -72,7 +74,7 @@ def _manifest(path):
     return data
 
 
-def _inventory(roots, harnesses, target, manifest):
+def _inventory(roots, harnesses, target, manifest, *, include_managed=False):
     inventory = defaultdict(list)
     review = []
     for root in roots:
@@ -88,20 +90,21 @@ def _inventory(roots, harnesses, target, manifest):
             allowed = (*roots, *registered)
             local = root / HARNESS_DIRS[host]
             for directory in (local, *registered, GLOBAL_DIRS[host]):
+                provenance = "shared" if directory == root / ".agents/skills" else host
                 for item in _skills(directory):
                     src = item.resolve()
                     if not any(src.is_relative_to(r) for r in allowed):
                         if directory != GLOBAL_DIRS[host]:
                             review.append({"skill":item.name, "status":"external-link-needs-registration"})
                         continue
-                    if item.parent.resolve() == target and item.name in manifest:
+                    if not include_managed and item.parent.resolve() == target and item.name in manifest:
                         continue
                     try:
                         fingerprint = digest(src)
                     except ValueError as exc:
                         review.append({"skill":item.name, "status":"blocked-review", "reason":str(exc)})
                         continue
-                    inventory[item.name].append((src, fingerprint, host))
+                    inventory[item.name].append((src, fingerprint, provenance))
     return inventory, review
 
 
@@ -125,7 +128,29 @@ def _replace(source, dest):
     return backup
 
 
-def _install(project, harnesses, target_host, project_roots, builtin, cfg=None):
+def resolve_workspace(project, cfg, workspace=None):
+    """Resolve the registered workspace containing the active project checkout."""
+    cfg.require(project)
+    roots = tuple(path.resolve() for path in cfg.projects[project])
+    if workspace is None:
+        if len(roots) != 1:
+            raise ValueError("This project has multiple workspaces; provide the active workspace")
+        active = roots[0]
+    else:
+        active = Path(workspace).expanduser().resolve(strict=True)
+    if not active.is_dir() or cfg.resolve(active, project) != project:
+        raise ValueError("The active workspace does not belong to the registered project")
+    candidates = [root for root in roots if active.is_relative_to(root)]
+    if not candidates:
+        raise ValueError("The active workspace is outside the registered project workspaces")
+    workspace_root = max(candidates, key=lambda root: len(root.parts))
+    if any(workspace_root.is_relative_to(other.resolve()) or other.resolve().is_relative_to(workspace_root)
+           for name, group in cfg.projects.items() if name != project for other in group):
+        raise ValueError("Skill destination needs a workspace exclusive to this project")
+    return workspace_root, roots
+
+
+def _install(project, harnesses, target_host, project_roots, builtin, cfg=None, workspace=None):
     cfg = cfg or config.load()
     cfg.require(project)
     if target_host not in HARNESS_DIRS or (not builtin and (not harnesses or set(harnesses)-set(HARNESS_DIRS))):
@@ -133,9 +158,9 @@ def _install(project, harnesses, target_host, project_roots, builtin, cfg=None):
     roots = tuple(p.resolve() for p in cfg.projects[project])
     if project_roots and tuple(Path(p).resolve() for p in project_roots) != roots:
         raise ValueError("Workspace roots must match the registered project")
-    target = (roots[0]/HARNESS_DIRS[target_host]).resolve()
-    if not target.is_relative_to(roots[0]) or any(target.is_relative_to(other) for slug, group in cfg.projects.items()
-            if slug != project for other in group if other.resolve() == roots[0]):
+    workspace, roots = resolve_workspace(project, cfg, workspace)
+    target = (workspace/HARNESS_DIRS[target_host]).resolve()
+    if not target.is_relative_to(workspace):
         raise ValueError("Skill destination needs a workspace exclusive to this project")
     lock_key = hashlib.sha256(os.fsencode(target)).hexdigest()
     lock_root = Path(tempfile.gettempdir()) / "multi-harness-bridge-skill-locks" / lock_key
@@ -148,7 +173,8 @@ def _install(project, harnesses, target_host, project_roots, builtin, cfg=None):
         else:
             inventory, review = _inventory(roots, harnesses, target, manifest)
         report = {"project":project, "from":list(harnesses), "to":target_host, "destination":str(target),
-                  "registered_workspaces":[str(p) for p in roots], "skills":[], "conflicts":[], "review":review}
+                  "active_workspace":str(workspace), "registered_workspaces":[str(p) for p in roots],
+                  "skills":[], "conflicts":[], "review":review}
         for name, entries in sorted(inventory.items()):
             sources = sorted({str(p) for p, _, _ in entries})
             if len({fingerprint for _, fingerprint, _ in entries}) > 1:
@@ -217,9 +243,10 @@ def _install(project, harnesses, target_host, project_roots, builtin, cfg=None):
         return report
 
 
-def install(project, source_harnesses, target_harness, *, project_roots=None, cfg=None):
-    return _install(project, tuple(dict.fromkeys(source_harnesses)), target_harness, project_roots, False, cfg)
+def install(project, source_harnesses, target_harness, *, project_roots=None, workspace=None, cfg=None):
+    return _install(project, tuple(dict.fromkeys(source_harnesses)), target_harness, project_roots, False, cfg,
+                    workspace=workspace)
 
 
-def bootstrap(project, target_harness, *, project_roots=None, cfg=None):
-    return _install(project, (), target_harness, project_roots, True, cfg)
+def bootstrap(project, target_harness, *, project_roots=None, workspace=None, cfg=None):
+    return _install(project, (), target_harness, project_roots, True, cfg, workspace=workspace)

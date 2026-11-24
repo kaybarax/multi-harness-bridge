@@ -46,9 +46,10 @@ or `multi-harness-skills --install-native --to claude`. This explicit operator
 selection is accepted only for installation. `--to` cannot select the caller
 for role transfers or mailbox operations.
 
-Project selection comes from the current workspace. A hint only disambiguates
-matching registered roots. Codex, Devin, and Antigravity use `.agents/skills`;
-Claude uses `.claude/skills`.
+Project selection comes from the current native workspace. `--workspace` may
+confirm that workspace but cannot redirect a native invocation to another
+registered root. Codex, Devin, and Antigravity use `.agents/skills`; Claude
+uses `.claude/skills`.
 
 ## Propagating project skills
 
@@ -65,6 +66,15 @@ same-name skills are deduplicated; differing copies are reported as
 are preserved. `.multi-harness-skills.json` records source paths and hashes.
 Review the result's `conflicts` and `review` arrays. Devin and Antigravity
 propagation requires a reviewed variant; unsupported variants are blocked.
+
+When the active workspace commits `.mhb/project-skills.json`, this same request
+automatically provisions the configured one-entry project skill. The entry and
+index are pinned to their checked-in hashes; indexed procedures are verified
+before the entry is installed. Candidates from the selected sources remain in
+the report. Source-only skills are marked `needs-project-review` and are never
+imported by the installer. See [Skill propagation](propagation.md#one-project-entry)
+for the declaration format, cross-workspace dependency rules, and
+`mhb skill-entry refresh PROJECT` hash-maintenance command.
 
 ## Native role transfer and mailbox
 

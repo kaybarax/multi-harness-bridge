@@ -1,4 +1,5 @@
 import json
+import hashlib
 import shutil
 import sqlite3
 import subprocess
@@ -291,6 +292,41 @@ def test_desktop_hook_take_forward_and_receipt(native_fixture, monkeypatch, tmp_
     import asyncio
     pytest.importorskip("mcp")
     assert set(ag_inbox.TOOLS) == {t.name for t in asyncio.run(ag_inbox.make_server(cfg,"alpha").list_tools())}
+
+
+def test_desktop_propagation_uses_declared_entry_automatically(native_fixture, monkeypatch):
+    from multi_harness_bridge import ag_inbox
+
+    cfg, summary_db, roots, sessions, projects = native_fixture
+    monkeypatch.setenv("MHB_ANTIGRAVITY_SUMMARIES_DB", str(summary_db))
+    root = roots["alpha"]
+    entry_dir = root / "agents/skills/workflow-entry"
+    entry_dir.mkdir(parents=True)
+    entry = entry_dir / "SKILL.md"
+    entry.write_text("---\nname: workflow-entry\n---\nRead the adjacent index.\n")
+    index = entry_dir / "index.json"
+    index.write_text(json.dumps({"version": 1, "procedures": []}))
+    declaration = root / ".mhb/project-skills.json"
+    declaration.parent.mkdir()
+    declaration.write_text(json.dumps({
+        "version": 1,
+        "entry": {"name": "workflow-entry", "path": entry.relative_to(root).as_posix(),
+                  "sha256": hashlib.sha256(entry.read_bytes()).hexdigest()},
+        "index": {"path": index.relative_to(root).as_posix(),
+                  "sha256": hashlib.sha256(index.read_bytes()).hexdigest()},
+    }))
+    event = {"toolCall": {"name": "mcp_mhb_alpha_propagate_skills",
+                           "args": {"sources": ["claude"]}},
+             "conversationId": sessions["alpha"], "workspacePaths": [str(root)],
+             "lastUserInput": "propagate skills from Claude",
+             "artifactDirectoryPath": str(summary_db.parent / "brain" / sessions["alpha"])}
+
+    grant = ag_inbox.before_tool(cfg, "alpha", event)["overwrite"]["desktop_grant"]
+    report = ag_inbox.invoke(cfg, "alpha", "propagate_skills", grant)
+
+    assert report["skills"][0]["skill"] == "workflow-entry"
+    assert report["skills"][0]["status"] == "installed"
+    assert (root / ".agents/skills/workflow-entry/index.json").is_file()
 
 
 def test_fanout_desktop_grant_is_fenced_at_invoke_after_handoff(native_fixture, monkeypatch):

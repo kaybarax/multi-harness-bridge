@@ -1,4 +1,5 @@
 import json
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -73,6 +74,111 @@ def test_harness_identity_must_be_adapter_supplied(monkeypatch):
         monkeypatch.delenv(marker, raising=False)
     with pytest.raises(ValueError, match="trusted native harness identity"):
         skills.invoking_harness()
+
+
+def test_caller_supplied_harness_environment_is_not_identity_evidence(monkeypatch):
+    monkeypatch.setenv("MULTI_HARNESS_BRIDGE_HARNESS", "codex")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+
+    with pytest.raises(ValueError, match="not confirmed"):
+        skills.invoking_harness()
+
+
+def test_cli_auto_selects_declared_entry_from_verified_active_workspace(tmp_path, monkeypatch, capsys):
+    from multi_harness_bridge import role_adapters
+
+    docs, dev = tmp_path / "docs", tmp_path / "dev"
+    docs.mkdir()
+    dev.mkdir()
+    entry_dir = dev / "agents/skills/workflow-entry"
+    entry_dir.mkdir(parents=True)
+    entry = entry_dir / "SKILL.md"
+    entry.write_text("---\nname: workflow-entry\n---\nRead index.json.\n")
+    procedure = entry_dir / "review.md"
+    procedure.write_text("Review the current work.\n")
+    index = entry_dir / "index.json"
+    index.write_text(json.dumps({"version": 1, "procedures": [{
+        "name": "review", "path": procedure.relative_to(dev).as_posix(),
+        "sha256": hashlib.sha256(procedure.read_bytes()).hexdigest(),
+    }]}))
+    (dev / ".mhb").mkdir()
+    (dev / ".mhb/project-skills.json").write_text(json.dumps({
+        "version": 1,
+        "entry": {"name": "workflow-entry", "path": entry.relative_to(dev).as_posix(),
+                  "sha256": hashlib.sha256(entry.read_bytes()).hexdigest()},
+        "index": {"path": index.relative_to(dev).as_posix(),
+                  "sha256": hashlib.sha256(index.read_bytes()).hexdigest()},
+    }))
+    cfg = Config(tmp_path / "state", {"sample": (docs, dev)})
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setattr(skills, "invoking_harness", lambda: "codex")
+    monkeypatch.setenv("CODEX_THREAD_ID", "native-thread")
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint=None: role_adapters.Invocation(
+        "sample", "codex", "native-thread", "", dev, proof="fixture-native"))
+    monkeypatch.chdir(docs)
+
+    skills.main(["--from", "claude"])
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["destination"] == str(dev / ".agents/skills/workflow-entry")
+    assert (dev / ".agents/skills/workflow-entry/SKILL.md").is_file()
+    assert not (docs / ".agents/skills/workflow-entry").exists()
+
+
+def test_cli_workspace_hint_cannot_override_native_workspace(tmp_path, monkeypatch):
+    from multi_harness_bridge import role_adapters
+
+    docs, dev = tmp_path / "docs", tmp_path / "dev"
+    docs.mkdir()
+    dev.mkdir()
+    cfg = Config(tmp_path / "state", {"sample": (docs, dev)})
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setattr(skills, "invoking_harness", lambda: "codex")
+    monkeypatch.setenv("CODEX_THREAD_ID", "native-thread")
+    monkeypatch.setattr(skills, "_native_invocation", lambda host, hint=None: role_adapters.Invocation(
+        "sample", "codex", "native-thread", "", dev, proof="fixture-native"))
+    monkeypatch.chdir(dev)
+
+    with pytest.raises(SystemExit):
+        skills.main(["--from", "claude", "--workspace", str(docs)])
+
+
+def test_devin_workspace_comes_from_verified_native_session_adapter(tmp_path, monkeypatch):
+    from multi_harness_bridge import role_adapters
+
+    docs, dev = tmp_path / "docs", tmp_path / "dev"
+    docs.mkdir()
+    dev.mkdir()
+    cfg = Config(tmp_path / "state", {"sample": (docs, dev)})
+    monkeypatch.setattr(role_adapters, "devin_native_invocation", lambda role, project_hint=None:
+                        role_adapters.Invocation("sample", "devin", "acp/devin-cli/session", role or "",
+                                                 dev, proof="fixture-native"))
+    monkeypatch.chdir(docs)
+
+    project, active = skills._active_project_workspace(cfg, "devin")
+
+    assert project == "sample"
+    assert active == dev
+    with pytest.raises(ValueError, match="active native workspace"):
+        skills._active_project_workspace(cfg, "devin", workspace_hint=docs)
+
+
+def test_explicit_bootstrap_target_keeps_shell_operator_path(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "project"
+    root.mkdir()
+    cfg = Config(tmp_path / "state", {"sample": (root,)})
+    monkeypatch.setattr(skills.config, "load", lambda: cfg)
+    monkeypatch.setattr(skills, "install_native", lambda project, host, cfg: {"host": host, "status": "ok"})
+    for marker in ("MULTI_HARNESS_BRIDGE_HARNESS", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID",
+                   "CLAUDECODE", "DEVIN_SESSION_ID", "DEVIN_LOCAL_SESSION_ID", "MHB_ANTIGRAVITY_EVENT"):
+        monkeypatch.delenv(marker, raising=False)
+    monkeypatch.chdir(root)
+
+    skills.main(["--bootstrap", "--to", "devin"])
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["destination"].endswith("/.agents/skills")
+    assert result["native"] == {"host": "devin", "status": "ok"}
 
 
 def test_mailbox_uses_bound_native_session_and_exact_lease(tmp_path, monkeypatch):

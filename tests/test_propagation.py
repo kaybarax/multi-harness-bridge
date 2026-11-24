@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import json
 
 import pytest
 
@@ -61,3 +62,34 @@ def test_failed_replacement_keeps_previous_tree(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="publish failure"):
         propagation.install("orchard", ["claude"], "devin")
     assert propagation.digest(dest) == old_hash
+
+
+def test_multiple_registered_workspaces_use_the_active_root_and_require_it(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    dev = tmp_path / "dev"
+    docs.mkdir()
+    dev.mkdir()
+    skill(dev / ".claude/skills", "portable")
+    monkeypatch.setenv("MHB_HOME", str(tmp_path / "state"))
+    config.register("sample", [docs, dev])
+
+    report = propagation.install("sample", ["claude"], "codex", workspace=dev)
+    assert report["active_workspace"] == str(dev)
+    assert (dev / ".agents/skills/release-review/SKILL.md").is_file()
+    assert not (docs / ".agents/skills/release-review").exists()
+    with pytest.raises(ValueError, match="multiple workspaces"):
+        propagation.install("sample", ["claude"], "codex")
+
+
+def test_shared_directory_source_provenance_is_not_guessed_as_one_host(tmp_path, monkeypatch):
+    root = tmp_path / "project"
+    source = skill(root / ".agents/skills", "portable")
+    monkeypatch.setenv("MHB_HOME", str(tmp_path / "state"))
+    config.register("sample", [root])
+
+    report = propagation.install("sample", ["codex"], "claude")
+
+    assert report["skills"][0]["status"] == "installed"
+    manifest = json.loads((root / ".claude/skills/.multi-harness-skills.json").read_text())
+    assert manifest["release-review"]["source_harnesses"] == ["shared"]
+    assert source.is_dir()

@@ -15,7 +15,8 @@ from . import config
 from .wake import WAKE_RELAY_PROMPT, record_agent_relay
 
 from .propagation import (BUILTIN_ROOT, HARNESS_DIRS, MANIFEST, _blockers, _skills,
-                          bootstrap, digest, install)
+                          bootstrap, digest, install, resolve_workspace)
+from . import project_entry
 
 
 def invoking_harness() -> str:
@@ -28,8 +29,8 @@ def invoking_harness() -> str:
     }
     detected = [name for name, present in markers.items() if present]
     if value in HARNESS_DIRS:
-        if detected and detected != [value]:
-            raise ValueError("Configured native harness identity conflicts with active host markers")
+        if detected != [value]:
+            raise ValueError("Configured native harness identity is not confirmed by active host markers")
         return value
     if len(detected) == 1:
         return detected[0]
@@ -56,6 +57,38 @@ def _native_invocation(host, project_hint=None, *, requested_role=None):
     if host == "devin":
         raise ValueError("Use this project's mhb_roles_<slug> native ACP tools for Devin role and mailbox operations")
     raise ValueError("Use this project's mhb_<slug> native Desktop MCP tools for Antigravity role and mailbox operations")
+
+
+def _active_project_workspace(cfg, host, project_hint=None, workspace_hint=None):
+    """Resolve the active workspace from native proof or cwd; hints may only confirm it."""
+    active = Path.cwd().expanduser().resolve(strict=True)
+    native_project = None
+    if host is None and workspace_hint is not None:
+        active = Path(workspace_hint).expanduser().resolve(strict=True)
+    has_native_session = (host == "codex" and bool(os.environ.get("CODEX_THREAD_ID"))
+                          or host == "claude" and bool(os.environ.get("CLAUDE_CODE_SESSION_ID")))
+    if has_native_session:
+        invocation = _native_invocation(host, project_hint)
+        if invocation.harness != host:
+            raise ValueError("Native workspace proof belongs to another harness")
+        active = Path(invocation.workspace).expanduser().resolve(strict=True)
+        native_project = invocation.project
+    elif host == "devin":
+        from . import role_adapters
+        invocation = role_adapters.devin_native_invocation(None, project_hint=project_hint)
+        active = Path(invocation.workspace).expanduser().resolve(strict=True)
+        native_project = invocation.project
+    elif host == "antigravity":
+        raise ValueError("Use the verified Antigravity Desktop propagate_skills tool")
+    project = cfg.resolve(active, project_hint)
+    if native_project is not None and project != native_project:
+        raise ValueError("Native workspace proof and project selection disagree")
+    workspace_root, _ = resolve_workspace(project, cfg, active)
+    if workspace_hint is not None:
+        hinted_root, _ = resolve_workspace(project, cfg, workspace_hint)
+        if hinted_root != workspace_root:
+            raise ValueError("--workspace must match the active native workspace")
+    return project, workspace_root
 
 
 def cfg_context_path(host, session=None):
@@ -204,6 +237,8 @@ def main(argv=None):
     parser.add_argument("--project")
     parser.add_argument("--to", choices=sorted(HARNESS_DIRS))
     parser.add_argument("--bootstrap", action="store_true", help="Install packaged bridge skills")
+    parser.add_argument("--workspace", type=Path,
+                        help="Confirm a native workspace or select one for an explicit shell setup command")
     parser.add_argument("--install-native", action="store_true", help="Install supported host-local hook/helper")
     parser.add_argument("--take", choices=("coordinator", "bridge"), help="Transfer the current verified native chat to this role")
     parser.add_argument("--hint", help="Disambiguate a project matching the current native workspace")
@@ -222,9 +257,17 @@ def main(argv=None):
         if args.mailbox or args.take:
             if args.to:
                 raise ValueError("--to cannot select a caller for role transfer or mailbox operations")
+            if args.workspace:
+                raise ValueError("--workspace cannot select a caller for role transfer or mailbox operations")
             host = invoking_harness()
         elif args.bootstrap or args.install_native:
-            host = args.to or invoking_harness()
+            try:
+                caller = invoking_harness()
+            except ValueError:
+                if not args.to:
+                    raise
+                caller = None
+            host = args.to or caller
         else:
             host = invoking_harness()
             if args.to and args.to != host:
@@ -259,9 +302,11 @@ def main(argv=None):
             outcome["title"] = role_adapters.apply_native_title(invocation)
             print(json.dumps(outcome, indent=2))
             return
-        project = cfg.resolve(Path.cwd(), args.project)
+        caller = host if not (args.bootstrap or args.install_native) else caller
+        project, active_workspace = _active_project_workspace(
+            cfg, caller, args.project or args.hint, args.workspace)
         if args.bootstrap:
-            result = bootstrap(project, host)
+            result = bootstrap(project, host, workspace=active_workspace)
             try:
                 result["native"] = install_native(project, host, cfg)
             except (OSError, ValueError, RuntimeError) as exc:
@@ -272,7 +317,13 @@ def main(argv=None):
         else:
             if not args.sources:
                 raise ValueError("--from requires one or more source harnesses")
-            print(json.dumps(install(project, args.sources, host), indent=2))
+            if (active_workspace / project_entry.DECLARATION).is_file():
+                result = project_entry.install(project, args.sources, host, workspace=active_workspace, cfg=cfg)
+            else:
+                result = install(project, args.sources, host, workspace=active_workspace, cfg=cfg)
+            print(json.dumps(result, indent=2))
+            if result.get("status") in {"missing-dependency", "ambiguous-dependency", "stale-dependency"}:
+                parser.exit(1, f"multi-harness-skills: {result['status']}: {result['review'][0]['detail']}\n")
     except (OSError, ValueError, KeyError) as exc:
         parser.error(str(exc))
 

@@ -77,7 +77,7 @@ The [architecture guide](docs/architecture.md) explains the design and failure b
 | Inspect a route | `mhb status PROJECT HARNESS`, `mhb pending PROJECT`, `mhb trace PROJECT MESSAGE_ID` |
 | Stop or resume | Ask the current coordinator or use `mhb stop PROJECT HARNESS` and `mhb resume PROJECT HARNESS` |
 | Rotate chats | Open a new project chat and invoke `take coordinator` or `take bridge`. Outstanding work stays in the queue. |
-| Reuse project skills | Invoke `propagate skills from Codex and Claude` in the destination. Reviewed adaptations, content hashes and local-edit conflicts are documented in [Skill propagation](docs/propagation.md). |
+| Reuse project skills | Invoke `propagate skills from Codex and Claude` in the active workspace. A committed `.mhb/project-skills.json` opts that workspace into one reviewed project entry; otherwise propagation keeps its per-skill behavior. See [Skill propagation](docs/propagation.md). |
 | Connect another client | Use a role-scoped MCP server on stdio or authenticated A2A v1 JSON-RPC on loopback. See [Mailbox protocols](docs/protocol.md). |
 | Diagnose delayed delivery | Inspect the queue lease, native wake result, inbox forwarding, coordinator read and provider receipt in sequence. See [Operations](docs/operations.md). |
 | Wake a busy Codex coordinator | Enable the agent relay with `mhb option set PROJECT codex coordinator_wake agent-relay`; the inbox agent injects the wake into the coordinator's active turn. See [Native wake](docs/native.md). |
