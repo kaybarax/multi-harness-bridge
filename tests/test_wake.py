@@ -646,6 +646,69 @@ def test_expired_lease_does_not_release_wake_lane_without_exact_recovery(tmp_pat
     assert calls == [first["id"], first["id"]]
 
 
+def test_renotify_rechecks_pending_inside_transaction_and_preserves_finish_lane(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    store.bind("sample", "devin", "inbox", "devin-inbox")
+    store.bind("sample", "devin", "coordinator", "devin-coordinator")
+    first = store.send_fanout("sample", "codex", ["devin"], "first", "first",
+                              session="codex-coordinator")["deliveries"][0]
+    second = store.send_fanout("sample", "codex", ["devin"], "second", "second",
+                               session="codex-coordinator")["deliveries"][0]
+    monkeypatch.setattr(wake, "_default_wake", lambda *_args, **_kwargs: None)
+    assert wake.wake_one(store, *route, commands={}) == {"id": first["id"], "status": "sent"}
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 60)
+
+    real_ledger = wake._ledger
+    injected = False
+
+    class InterleavingConnection:
+        def __init__(self, db):
+            self.db = db
+
+        @property
+        def row_factory(self):
+            return self.db.row_factory
+
+        @row_factory.setter
+        def row_factory(self, factory):
+            self.db.row_factory = factory
+
+        def execute(self, statement, *parameters):
+            nonlocal injected
+            if statement == "BEGIN IMMEDIATE" and not injected:
+                injected = True
+                claimed = store.claim(*route, message_id=first["id"])
+                assert claimed
+                assert store.finish(*route, first["id"], claimed["lease"])
+            return self.db.execute(statement, *parameters)
+
+        def commit(self):
+            return self.db.commit()
+
+        def close(self):
+            return self.db.close()
+
+    monkeypatch.setattr(wake, "_ledger", lambda path: InterleavingConnection(real_ledger(path)))
+    with pytest.raises(ValueError, match="not pending and unclaimed"):
+        wake.renotify(store, "sample", first["id"], harness="codex", role="inbox",
+                      session="codex-inbox")
+    assert injected
+    with sqlite3.connect(store.path) as db:
+        stage = db.execute("SELECT stage FROM messages WHERE id=?", (first["id"],)).fetchone()
+        attempt = db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
+                             (first["id"],)).fetchone()
+        lane = db.execute("SELECT notification_id,state FROM mhb_wake_sessions").fetchone()
+    assert stage == ("inbox",)
+    assert attempt == ("sent",)
+    assert lane == (first["id"], "cooldown")
+    monkeypatch.setattr(wake, "_ledger", real_ledger)
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": second["id"], "status": "held", "reason": "session-busy"}
+
+
 def test_fast_native_claim_and_finish_preserve_cooldown_lane(tmp_path, monkeypatch):
     store = Store(tmp_path / "bridge.sqlite3")
     route = ("sample", "codex", "inbox", "codex-inbox")

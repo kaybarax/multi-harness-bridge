@@ -661,16 +661,20 @@ def renotify(store, project, notification_id, *, harness, role, session):
         uuid.UUID(notification_id)
     except (ValueError, TypeError):
         raise ValueError("notification id must be a UUID") from None
-    if store.roles(project, harness).get(role) != session:
-        raise ValueError("the supplied session is not the currently bound role")
-    if not store.status(project, harness).get("enabled"):
-        raise ValueError("mailbox is stopped")
-    if not store.pending(project, harness, role, session, message_id=notification_id):
-        raise ValueError("notification is not pending and unclaimed for this exact role")
-    db = _ledger(store.path)
-    try:
+    store._validate_claim(project, harness, role, session)
+    with store._route_guard(project), closing(_ledger(store.path)) as db:
+        db.row_factory = sqlite3.Row
         db.execute("BEGIN IMMEDIATE")
-        lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+        # Recheck binding, stop state and exact unleased queue ownership while
+        # holding the writer lock. A concurrent claim/finish can no longer
+        # invalidate the operator's precondition between validation and reset.
+        if not store._can_pickup(db, project, harness, role, session):
+            raise ValueError("the supplied session is no longer the enabled bound role")
+        pending = store._pending_rows(db, project, harness, role, time.time(),
+                                     notification_id).fetchone()
+        if pending is None:
+            raise ValueError("notification is not pending and unclaimed for this exact role")
+        lane = db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
             WHERE project=? AND harness=? AND role=? AND session=?""",
             (project, harness, role, session)).fetchone()
         if lane and lane[0] != notification_id:
@@ -694,12 +698,13 @@ def renotify(store, project, notification_id, *, harness, role, session):
             (now, notification_id, project, harness, role, session, row[0])).rowcount
         if changed != 1:
             raise ValueError("wake attempt changed during recovery; reread its status")
-        db.execute("""DELETE FROM mhb_wake_sessions WHERE project=? AND harness=? AND role=?
-            AND session=? AND notification_id=?""",
-            (project, harness, role, session, notification_id))
+        if lane:
+            removed = db.execute("""DELETE FROM mhb_wake_sessions WHERE project=? AND harness=?
+                AND role=? AND session=? AND notification_id=? AND state=? AND updated_at=?""",
+                (project, harness, role, session, notification_id, lane[1], lane[2])).rowcount
+            if removed != 1:
+                raise ValueError("wake lane changed during recovery; reread its status")
         db.commit()
-    finally:
-        db.close()
     return {"id": notification_id, "status": "retry-authorized"}
 
 
