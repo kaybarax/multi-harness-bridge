@@ -100,7 +100,15 @@ active dispatch record for the current native turn, role, and notification.
 An exact native turn can still finish after its ACP connection times out if the
 bound route and pickup lease remain valid. A `session_locked` response to
 `session/load` defers the wake before prompt submission and leaves it eligible
-when that chat is available again.
+when that chat is available again. The driver also checks the bound chat's
+daemon state with `devin list --format json --process-model daemon` and reads
+its recent native transcript before loading and again just before submitting
+the prompt. A running or waiting native turn defers pickup. If the transcript
+has a recent user prompt or tool activity without a terminal assistant result,
+the dispatcher holds the wake for up to five minutes after that activity.
+An unreadable transcript defers pickup until it can be verified. ACP v1 uses
+separate state and submission operations, so a user turn can start between
+the final check and submission.
 The ACP client checks the native session, pending tool-call ID, server, tool,
 and exact notification ID for permission requests. It checks native tool
 results and the durable queue even when Devin handles approval internally.

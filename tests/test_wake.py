@@ -212,9 +212,18 @@ def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False, minimal=
                           "arguments": args}}]}
         db.executemany("INSERT INTO message_nodes VALUES(?,?,?,?)",
                        [(row_id, session_id, json.dumps(native_call), time.time()) for row_id in (0, 1)])
+        db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)", (2, session_id,
+                   json.dumps({"role": "assistant", "metadata": {"finish_reason": "stop"}}), time.time()))
     executable = tmp_path / "fake-devin"
     executable.write_text("""#!/usr/bin/env python3
 import json,os,sys
+if sys.argv[1] == 'list':
+ if os.environ.get('MHB_FAKE_LIST_UNAVAILABLE')=='1': sys.exit(1)
+ assert sys.argv[2:] == ['--format', 'json', '--process-model', 'daemon']
+ print(json.dumps([{'id':'other-session','working_directory':os.getcwd(),'state':'running'},
+                   {'id':'session-123','working_directory':os.getcwd(),
+                    'state':os.environ.get('MHB_FAKE_STATE','idle')}]),flush=True)
+ sys.exit(0)
 for line in sys.stdin:
  request=json.loads(line)
  with open(os.environ['MHB_CAPTURE'],'a') as capture: capture.write(json.dumps(request)+'\\n')
@@ -338,6 +347,65 @@ def test_devin_acp_session_lock_defers_before_prompt_then_resumes_same_session(t
     monkeypatch.delenv("MHB_FAKE_LOCKED")
     assert devin_acp.wake("sample", "coordinator", session, notification_id,
                           workspace, native_db=native_db)["stopReason"] == "end_turn"
+
+
+def test_devin_acp_rechecks_idle_after_load_and_before_prompt(tmp_path, monkeypatch):
+    import json
+
+    session, workspace, notification_id, native_db, capture = _fake_devin(tmp_path, monkeypatch)
+    monkeypatch.setenv("MHB_FAKE_STATE", "running")
+    with pytest.raises(wake.WakeDeferred, match="native turn is active .*running"):
+        devin_acp.wake("sample", "coordinator", session, notification_id, workspace, native_db=native_db)
+    assert not capture.exists()
+
+    def native_turn_started():
+        monkeypatch.setenv("MHB_FAKE_STATE", "waiting")
+        return True
+
+    monkeypatch.setenv("MHB_FAKE_STATE", "attached")
+    with pytest.raises(wake.WakeDeferred, match="native turn is active .*waiting"):
+        devin_acp.wake("sample", "coordinator", session, notification_id, workspace,
+                       native_db=native_db, before_prompt=native_turn_started)
+    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert [call["method"] for call in calls] == ["initialize", "session/load"]
+    monkeypatch.setenv("MHB_FAKE_STATE", "idle")
+    assert devin_acp.wake("sample", "coordinator", session, notification_id,
+                          workspace, native_db=native_db)["stopReason"] == "end_turn"
+
+
+@pytest.mark.parametrize("tail,age,held", [
+    ([{"role": "user"}], 0, True),
+    ([{"role": "assistant", "tool_calls": [{"id": "call", "name": "get_output"}]}], 0, True),
+    ([{"role": "tool", "tool_call_id": "call"}], 0, True),
+    ([{"role": "user", "content": "Multi Harness Bridge native wake. Prior notice"}], 0, True),
+    ([{"role": "assistant", "metadata": {"finish_reason": "stop"}}, {"role": "system"}], 0, False),
+    ([{"role": "user"}], int(devin_acp.TURN_ACTIVITY_SECONDS) + 1, False),
+])
+def test_devin_acp_activity_fallback_keeps_recent_unfinished_turns(tmp_path, monkeypatch, tail, age, held):
+    import json
+
+    session, workspace, notification_id, native_db, capture = _fake_devin(tmp_path, monkeypatch)
+    monkeypatch.setenv("MHB_FAKE_LIST_UNAVAILABLE", "1")
+    with sqlite3.connect(native_db) as db:
+        db.executemany("INSERT INTO message_nodes VALUES(?,?,?,?)", [
+            (row_id, session, json.dumps(message), time.time() - age)
+            for row_id, message in enumerate(tail, 3)
+        ])
+    if held:
+        with pytest.raises(wake.WakeDeferred, match="recent unfinished turn"):
+            devin_acp.wake("sample", "coordinator", session, notification_id, workspace, native_db=native_db)
+        assert not capture.exists()
+    else:
+        assert devin_acp.wake("sample", "coordinator", session, notification_id,
+                              workspace, native_db=native_db)["stopReason"] == "end_turn"
+
+
+def test_devin_acp_defers_if_exact_turn_transcript_is_unavailable(tmp_path, monkeypatch):
+    session, workspace, notification_id, native_db, capture = _fake_devin(tmp_path, monkeypatch)
+    native_db.unlink()
+    with pytest.raises(wake.WakeDeferred, match="activity is unreadable"):
+        devin_acp.wake("sample", "coordinator", session, notification_id, workspace, native_db=native_db)
+    assert not capture.exists()
 
 
 def test_devin_routed_finish_permission_requires_a_persisted_pickup(tmp_path, monkeypatch):

@@ -23,6 +23,8 @@ NATIVE_DB = Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
 WAKE_TIMEOUT = 20.0
 ROUTED_COORDINATOR_TIMEOUT = 45.0
 NATIVE_WAKE_SECONDS = 2 * STALE_WAKE_SECONDS
+TURN_ACTIVITY_SECONDS = 300.0
+SESSION_LIST_TIMEOUT = 2.0
 WAKE_PREFIX = "Multi Harness Bridge native wake. "
 PICKUP_TOOL = "pickup_wake"
 FINISH_TOOL = "finish_wake"
@@ -127,7 +129,7 @@ def _native_message_time(message, fallback):
     return fallback
 
 
-def _native_messages(session, workspace, since, native_db):
+def _native_messages(session, workspace, since, native_db, *, require_readable=False):
     db_path = Path(native_db or os.environ.get("MHB_DEVIN_SESSIONS_DB") or NATIVE_DB).expanduser().resolve()
     expected_native_id = session.removeprefix("acp/devin-cli/")
     try:
@@ -136,28 +138,78 @@ def _native_messages(session, workspace, since, native_db):
             columns = {row[1] for row in db.execute("PRAGMA table_info(message_nodes)")}
             required = {"row_id", "session_id", "chat_message", "created_at"}
             if not required <= columns:
+                if require_readable:
+                    raise WakeDeferred("Devin session activity is unavailable before prompt submission")
                 return []
             sessions = db.execute("SELECT id,working_directory FROM sessions WHERE id IN (?,?)",
                                   (expected_native_id, "acp/devin-cli/" + expected_native_id)).fetchall()
             if len(sessions) != 1 or not isinstance(sessions[0][1], str):
+                if require_readable:
+                    raise WakeDeferred("Devin session activity cannot be matched to the bound chat")
                 return []
             native_id, directory = sessions[0]
             if Path(directory).resolve() != Path(workspace).resolve():
+                if require_readable:
+                    raise WakeDeferred("Devin session activity does not match the bound workspace")
                 return []
             rows = db.execute("""SELECT row_id,chat_message,created_at FROM message_nodes
                 WHERE session_id=? AND created_at>=? ORDER BY row_id""",
                 (native_id, math.floor(since))).fetchall()
     except (OSError, sqlite3.Error):
+        if require_readable:
+            raise WakeDeferred("Devin session activity is unreadable before prompt submission") from None
         return []
     messages = []
     for row in rows:
         try:
             message = json.loads(row["chat_message"])
         except (TypeError, json.JSONDecodeError):
+            if require_readable:
+                raise WakeDeferred("Devin session activity contains an unreadable recent message") from None
             continue
         if isinstance(message, dict) and _native_message_time(message, row["created_at"]) >= since:
             messages.append((row["row_id"], message))
     return messages
+
+
+def _session_list_state(executable, session, workspace):
+    """Read the installed CLI's per-session daemon state for this exact workspace."""
+    try:
+        result = subprocess.run([executable, "list", "--format", "json", "--process-model", "daemon"],
+                                cwd=workspace, stdin=subprocess.DEVNULL, capture_output=True,
+                                timeout=SESSION_LIST_TIMEOUT, check=False)
+        entries = json.loads(result.stdout) if result.returncode == 0 else None
+        if not isinstance(entries, list):
+            return None
+        matches = [entry for entry in entries if isinstance(entry, dict)
+                   and _same_session(entry.get("id"), session)]
+        if len(matches) != 1:
+            return None
+        observed = matches[0].get("working_directory")
+        if isinstance(observed, str) and Path(observed).resolve() == Path(workspace).resolve():
+            return matches[0].get("state")
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    return None
+
+
+def _require_idle_turn(executable, session, workspace, native_db):
+    state = _session_list_state(executable, session, workspace)
+    if state in ("running", "waiting", "busy"):
+        raise WakeDeferred(f"Devin native turn is active ({state})")
+    # An attached session can be idle. Replay metadata and system context by
+    # themselves do not establish that the current turn has finished.
+    since = time.time() - TURN_ACTIVITY_SECONDS
+    messages = _native_messages(session, workspace, since, native_db, require_readable=True)
+    latest = next((message for _, message in reversed(messages)
+                   if message.get("role") in {"user", "assistant", "tool"}), None)
+    if latest is None:
+        return
+    metadata = latest.get("metadata") or {}
+    if (latest.get("role") == "assistant" and not latest.get("tool_calls")
+            and isinstance(metadata, dict) and metadata.get("finish_reason") == "stop"):
+        return
+    raise WakeDeferred("Devin native transcript has a recent unfinished turn")
 
 
 def _native_call_args(session, workspace, server_name, tool_call_id, tool, *,
@@ -546,6 +598,7 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
     routed_coordinator = role == "coordinator" and item is not None and "request_id" in item
     native_server = server_name(project)
     native_session = session.removeprefix("acp/devin-cli/")
+    _require_idle_turn(executable, native_session, workspace, native_db)
     try:
         proc = _start(executable, workspace)
     except OSError as exc:
@@ -572,6 +625,9 @@ def wake(project, role, session, notification_id, workspace, *, before_prompt=No
             raise WakeDeferred("Devin wake was stopped or rebound before prompt submission")
         prompt = _wake_prompt(native_server, notification_id, routed_coordinator)
         state, pending = {"allowed": 0}, {}
+        _require_idle_turn(executable, native_session, workspace, native_db)
+        if time.monotonic() >= client.deadline:
+            raise WakeDeferred("Devin ACP deadline expired before prompt submission")
         submitted_at = time.time()
         handler = _permission_handler(server_name=native_server, expected_session=native_session,
                                       workspace=workspace, notification_id=notification_id,
