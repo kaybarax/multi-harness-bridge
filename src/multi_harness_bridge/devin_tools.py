@@ -133,17 +133,19 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                 actual = args.get("arguments") or {}
                 if not isinstance(actual, dict):
                     continue
-                user_turn = next(((at, _devin_user_command(item)) for prior_id, at, item in reversed(messages[:index])
-                                  if prior_id < row_id and item.get("role") == "user"), (None, None))
-                user_at, user = user_turn
+                user_turn = next(((prior_id, at, _devin_user_command(item))
+                                  for prior_id, at, item in reversed(messages[:index])
+                                  if prior_id < row_id and item.get("role") == "user"), (None, None, None))
+                user_row_id, user_at, user = user_turn
                 if role_command:
-                    from .role_adapters import _parse
+                    from .role_adapters import _parse_details
                     try:
-                        title = _parse(user, role_command)
+                        title, orchestrator = _parse_details(user, role_command)
                     except ValueError:
                         continue
                 else:
                     title = None
+                    orchestrator = False
                 try:
                     workspace = Path(session["working_directory"]).expanduser().resolve(strict=True)
                     if config.load().resolve(workspace) != project:
@@ -151,9 +153,14 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
                 except (OSError, ValueError):
                     continue
                 session_id = sid if sid.startswith("acp/devin-cli/") else f"acp/devin-cli/{sid}"
+                request_id = hashlib.sha256(
+                    f"devin\0{project}\0{session_id}\0{user_row_id}".encode("utf-8")
+                ).hexdigest()
                 key = (session_id, call_id)
                 candidate = {"session": session_id, "workspace": workspace, "title": title,
-                             "actual_args": actual, "call_id": call_id, "user_prompt": user, "user_at": user_at}
+                             "orchestrator": orchestrator,
+                             "request_id": request_id, "actual_args": actual, "call_id": call_id,
+                             "user_prompt": user, "user_at": user_at}
                 if key in matches and matches[key] != candidate:
                     conflicts.add(key)
                 matches[key] = candidate
@@ -202,11 +209,17 @@ def make_role_server(cfg, project):
         nonce = secrets.token_urlsafe(32)
         with closing(sqlite3.connect(cfg.database)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS devin_role_challenges(challenge_hash TEXT PRIMARY KEY,project TEXT,session TEXT,workspace TEXT,role TEXT,expires REAL,used INTEGER DEFAULT 0)")
+            db.execute("CREATE TABLE IF NOT EXISTS devin_role_challenge_proofs(challenge_hash TEXT PRIMARY KEY,orchestrator INTEGER NOT NULL,request_id TEXT NOT NULL)")
             db.execute("DELETE FROM devin_role_challenges WHERE expires<=? OR used=1", (time.time(),))
+            db.execute("DELETE FROM devin_role_challenge_proofs WHERE challenge_hash NOT IN (SELECT challenge_hash FROM devin_role_challenges)")
+            digest = hashlib.sha256(nonce.encode()).hexdigest()
             db.execute("INSERT INTO devin_role_challenges VALUES(?,?,?,?,?,?,0)",
-                       (hashlib.sha256(nonce.encode()).hexdigest(), project,
+                       (digest, project,
                         call["session"], str(call["workspace"]), role, time.time()+120))
-        return {"challenge": nonce, "expires_in_seconds": 120}
+            db.execute("INSERT INTO devin_role_challenge_proofs VALUES(?,?,?)",
+                       (digest, int(call.get("orchestrator", False)), call["request_id"]))
+        return {"challenge": nonce, "expires_in_seconds": 120,
+                "orchestrator": bool(call.get("orchestrator", False))}
 
     def take(role, challenge):
         if not isinstance(challenge, str) or len(challenge) != 43:
@@ -215,21 +228,39 @@ def make_role_server(cfg, project):
         call = _native_call(project, tool, {"challenge": challenge}, role_command=role)
         digest = hashlib.sha256(challenge.encode()).hexdigest()
         with closing(sqlite3.connect(cfg.database)) as db, db:
+            db.execute("CREATE TABLE IF NOT EXISTS devin_role_challenge_proofs(challenge_hash TEXT PRIMARY KEY,orchestrator INTEGER NOT NULL,request_id TEXT NOT NULL)")
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT session,workspace,role,expires,used FROM devin_role_challenges WHERE challenge_hash=? AND project=?", (digest,project)).fetchone()
-            if not row or row[0] != call["session"] or row[1] != str(call["workspace"]) or row[2] != role or row[3] <= time.time() or row[4]:
+            proof = db.execute("SELECT orchestrator,request_id FROM devin_role_challenge_proofs WHERE challenge_hash=?", (digest,)).fetchone()
+            if (not row or row[0] != call["session"] or row[1] != str(call["workspace"])
+                    or row[2] != role or row[3] <= time.time() or row[4]
+                    or (proof is None and call.get("orchestrator", False))
+                    or (proof is not None and (bool(proof[0]) != bool(call.get("orchestrator", False))
+                                               or proof[1] != call["request_id"]))):
                 raise PermissionError("Role challenge is expired, used, or belongs to another native session")
             db.execute("UPDATE devin_role_challenges SET used=1,role=? WHERE challenge_hash=?", (role,digest))
         try:
-            roles = store.bind(project,"devin",role_values[role],call["session"], take=True)
+            if role == "coordinator":
+                takeover = store.take_coordinator(project, "devin", call["session"],
+                                                  designate=bool(call.get("orchestrator", False)),
+                                                  request_id=call["request_id"])
+                roles = takeover["roles"]
+                orchestrator_status = takeover["orchestrator"]
+            else:
+                roles = store.bind(project,"devin",role_values[role],call["session"], take=True)
         except Exception:
             with closing(sqlite3.connect(cfg.database)) as db, db:
                 db.execute("UPDATE devin_role_challenges SET used=0 WHERE challenge_hash=? AND expires>?",
                            (digest, time.time()))
             raise
+        else:
+            with closing(sqlite3.connect(cfg.database)) as db, db:
+                db.execute("DELETE FROM devin_role_challenge_proofs WHERE challenge_hash=?", (digest,))
         title = call.get("title")
         result = {"project":project,"harness":"devin","role":role_values[role],"session":call["session"],"roles":roles,
                   "status":store.status(project,"devin"),"pending":store.pending_overview(project,"devin",20)}
+        if role == "coordinator":
+            result["orchestrator"] = orchestrator_status
         if title:
             from .devin_acp import rename
             try:
@@ -254,7 +285,8 @@ def make_role_server(cfg, project):
         roles=store.roles(project,"devin")
         role=next((r for r,v in roles.items() if v==call["session"]),None)
         if role is None: raise PermissionError("Current native chat is not bound to this project")
-        return {"roles":roles,"status":store.status(project,"devin"),"role":role}
+        return {"roles":roles,"status":store.status(project,"devin"),"role":role,
+                "orchestrator":store.orchestrator_status(project)}
 
     @server.tool()
     def pickup_notification(notification_id: str | None = None) -> dict:

@@ -226,7 +226,12 @@ def test_devin_fanout_tracks_native_caller_across_both_roots(tmp_path, monkeypat
     assert fanout(**args) == original
 
 
-def test_devin_role_takeover_challenge_binds_exact_native_session(tmp_path, monkeypatch):
+@pytest.mark.parametrize(("prompt", "expect_orchestrator"), [
+    ("take coordinator", False),
+    ("take coordinator -orc", True),
+])
+def test_devin_role_takeover_challenge_binds_exact_native_session(tmp_path, monkeypatch,
+                                                                  prompt, expect_orchestrator):
     import types
     class FakeServer:
         def __init__(self, name, instructions=""):
@@ -251,14 +256,24 @@ def test_devin_role_takeover_challenge_binds_exact_native_session(tmp_path, monk
         db.execute("CREATE TABLE message_nodes(session_id TEXT,row_id INTEGER,chat_message TEXT,created_at REAL)")
         db.execute("INSERT INTO sessions VALUES(?,?,?,?,0)", ("native-id", str(workspace), "[]", "chat"))
         db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)", ("native-id", 1,
-            json.dumps({"role":"user","content":"take coordinator"}), time.time()))
+            json.dumps({"role":"user","content":prompt}), time.time()))
         prepare = {"role":"assistant","tool_calls":[{"id":"prepare-id","name":"mcp_call_tool","arguments":{
             "server_name":"mhb_roles_sample","tool_name":"prepare_role_handoff","arguments":{}}}]}
         db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)", ("native-id", 2, json.dumps(prepare), time.time()))
     monkeypatch.setenv("MHB_DEVIN_SESSIONS_DB", str(native))
     server = devin_tools.make_role_server(cfg, "sample")
     prepared = server.tools["prepare_role_handoff"]()
+    assert prepared["orchestrator"] is expect_orchestrator
     challenge = prepared["challenge"]
+    with sqlite3.connect(cfg.database) as db:
+        assert len(list(db.execute("PRAGMA table_info(devin_role_challenges)"))) == 7
+        db.execute("INSERT INTO devin_role_challenges VALUES(?,?,?,?,?,?,?)",
+                   ("legacy-expired", "sample", "old-session", str(workspace),
+                    "coordinator", time.time()-1, 0))
+        if not expect_orchestrator:
+            # Simulate a still-valid pre-upgrade plain challenge: its original
+            # seven-column row has no companion proof table or opt-in record.
+            db.execute("DROP TABLE devin_role_challenge_proofs")
     with sqlite3.connect(native) as db:
         db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)", ("native-id", 3,
             json.dumps({"role":"tool","tool_call_id":"prepare-id","content":json.dumps(prepared)}), time.time()))
@@ -268,3 +283,11 @@ def test_devin_role_takeover_challenge_binds_exact_native_session(tmp_path, monk
     result = server.tools["take_coordinator"](challenge)
     assert result["roles"]["coordinator"] == "acp/devin-cli/native-id"
     assert result["role"] == "coordinator"
+    assert result["orchestrator"]["status"] == ("active" if expect_orchestrator else "never_designated")
+    with sqlite3.connect(native) as db:
+        status_call = {"role":"assistant","tool_calls":[{"id":"status-id","name":"mcp_call_tool","arguments":{
+            "server_name":"mhb_roles_sample","tool_name":"bridge_status","arguments":{}}}]}
+        db.execute("INSERT INTO message_nodes VALUES(?,?,?,?)",
+                   ("native-id", 5, json.dumps(status_call), time.time()))
+    status = server.tools["bridge_status"]()
+    assert status["orchestrator"]["status"] == ("active" if expect_orchestrator else "never_designated")

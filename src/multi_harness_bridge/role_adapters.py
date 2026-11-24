@@ -36,24 +36,41 @@ class Invocation:
     workspace: Path
     title: str | None = None
     proof: str = ""
+    orchestrator: bool = False
+    invocation_key: str | None = None
 
 
-def _parse(prompt: str, role: str):
+def _parse_details(prompt: str, role: str):
     if role is None:
-        return None
+        return None, False
     if role not in {"coordinator", "inbox", "bridge"} or not isinstance(prompt, str):
         raise ValueError("A direct native role command is required")
     match = _COMMAND.fullmatch(prompt.strip())
     expected = "bridge" if role in {"inbox", "bridge"} else "coordinator"
     if not match or match[1].lower() != expected:
         raise ValueError("The current user turn must explicitly invoke this role")
-    value = match[2]
-    if value is None:
-        return None
+    value = (match[2] or "").strip()
+    # The opt-in is a standalone token outside an optional quoted title. This
+    # keeps a title such as "-orc" as ordinary title text.
+    orchestrator = False
+    leading_flag = re.match(r"-orc(?:[ \t]+|$)", value)
+    if leading_flag:
+        value, orchestrator = value[leading_flag.end():].strip(), True
+    elif re.search(r"[ \t]+-orc$", value):
+        value, orchestrator = re.sub(r"[ \t]+-orc$", "", value).strip(), True
+    if orchestrator and role != "coordinator":
+        raise ValueError("-orc is only valid for coordinator takeover")
+    if not value:
+        return None, orchestrator
     pairs = {'"': '"', "'": "'", "“": "”", "‘": "’"}
     if len(value) < 3 or value[0] not in pairs or value[-1] != pairs[value[0]] or not value[1:-1].strip() or len(value[1:-1]) > 240:
         raise ValueError("Optional title must be enclosed in matching quotes and contain 1–240 characters")
-    return value[1:-1]
+    return value[1:-1], orchestrator
+
+
+def _parse(prompt: str, role: str):
+    """Compatibility helper returning only the optional quoted title."""
+    return _parse_details(prompt, role)[0]
 
 
 def _resolve(workspace, hint=None):
@@ -81,9 +98,21 @@ def bind(store, invocation: Invocation):
             session = str(uuid.UUID(session))
         except (ValueError, TypeError, AttributeError):
             raise ValueError("Invalid native chat session identity") from None
-    store.bind(project, invocation.harness, invocation.role, session, take=True)
+    if invocation.role == "coordinator":
+        result = store.take_coordinator(
+            project, invocation.harness, session,
+            designate=invocation.orchestrator,
+            request_id=invocation.invocation_key,
+        )
+        roles = result["roles"]
+        orchestrator = result["orchestrator"]
+    else:
+        store.bind(project, invocation.harness, invocation.role, session, take=True)
+        roles = store.roles(project, invocation.harness)
+        orchestrator = None
     return {"project": project, "harness": invocation.harness, "role": invocation.role,
-            "session": session, **store.roles(project, invocation.harness)}
+            "session": session, **roles,
+            **({"orchestrator": orchestrator} if orchestrator is not None else {})}
 
 
 def apply_native_title(invocation: Invocation, *, codex_home=None):
@@ -206,6 +235,7 @@ def codex_invocation(role=None, *, thread_id=None, home=None, cwd=None, project_
         if not rollout.is_relative_to(native_root) or workspace != actual:
             raise ValueError("Codex session or workspace does not match the current native conversation")
         latest = ""
+        latest_turn_key = None
         with rollout.open(encoding="utf-8") as stream:
             for line in stream:
                 try:
@@ -222,9 +252,11 @@ def codex_invocation(role=None, *, thread_id=None, home=None, cwd=None, project_
                         latest = content
                     elif isinstance(content, list):
                         latest = "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
-        title = _parse(_codex_skill_text(latest), role)
+                    latest_turn_key = hashlib.sha256(line.encode("utf-8")).hexdigest()
+        title, orchestrator = _parse_details(_codex_skill_text(latest), role)
         project, _ = _resolve(workspace, project_hint)
-        return Invocation(project, "codex", thread_id, role or "", workspace, title, "codex-current-user-turn")
+        return Invocation(project, "codex", thread_id, role or "", workspace, title,
+                          "codex-current-user-turn", orchestrator, latest_turn_key)
     except (OSError, sqlite3.Error, KeyError, TypeError) as exc:
         raise ValueError(f"Codex native invocation could not be verified ({type(exc).__name__})") from None
 
@@ -257,9 +289,12 @@ def claude_invocation(role, hook_context, *, project_hint=None, cwd=None, expect
         raise ValueError("Claude native project path verifier is unavailable") from None
     if transcript.parent != expected_parent or not transcript.is_relative_to(config_root / "projects"):
         raise ValueError("Claude transcript is not in the native project session directory")
-    _parse(prompt, role)
+    title, orchestrator = _parse_details(prompt, role)
     project, _ = _resolve(workspace, project_hint)
-    return Invocation(project, "claude", session, role or "", workspace, _parse(prompt, role), "claude-user-prompt-submit")
+    return Invocation(project, "claude", session, role or "", workspace, title,
+                      "claude-user-prompt-submit", orchestrator,
+                      hashlib.sha256((session + "\0" + str(hook_context.get("captured_at", ""))
+                                      + "\0" + prompt).encode("utf-8")).hexdigest())
 
 
 def claude_hook_main(state_home=None):
@@ -375,12 +410,21 @@ def install_claude_hook(workspace: Path, *, state_home=None):
             "settings": str(settings)}
 
 
-def devin_invocation(role, *, session_id, workspace, direct_user_prompt, project_hint=None):
+def devin_invocation(role, *, session_id, workspace, direct_user_prompt, project_hint=None,
+                     native_turn_id=None):
     """Consume fields from a trusted Devin ACP invocation adapter, never MCP args."""
-    title = _parse(direct_user_prompt, role)
+    title, orchestrator = _parse_details(direct_user_prompt, role)
     root = Path(workspace).expanduser().resolve(strict=True)
     project, _ = _resolve(root, project_hint)
-    return Invocation(project, "devin", session_id, role, root, title, "deven-acp-direct-user-turn")
+    invocation_key = None
+    if orchestrator:
+        if not isinstance(native_turn_id, str) or not native_turn_id.strip():
+            raise ValueError("Devin -orc requires a stable native user-turn identity")
+        invocation_key = hashlib.sha256(
+            f"devin\0{project}\0{session_id}\0{native_turn_id}".encode("utf-8")
+        ).hexdigest()
+    return Invocation(project, "devin", session_id, role, root, title,
+                      "devin-acp-direct-user-turn", orchestrator, invocation_key)
 
 
 def devin_native_invocation(role=None, *, native_db=None, project_hint=None, max_age_seconds=180):
@@ -403,7 +447,7 @@ def devin_native_invocation(role=None, *, native_db=None, project_hint=None, max
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(message, dict):
-            by_session.setdefault(row["session_id"], []).append(message)
+            by_session.setdefault(row["session_id"], []).append((row["row_id"], message))
     candidates = []
     for session in sessions:
         sid = session["id"]
@@ -426,19 +470,24 @@ def devin_native_invocation(role=None, *, native_db=None, project_hint=None, max
         registered = config.load().projects[project]
         if not roots.intersection(registered):
             continue
-        latest_user = next((m for m in reversed(by_session.get(sid, [])) if m.get("role") == "user"), None)
+        latest_user = next(((row_id, message) for row_id, message in reversed(by_session.get(sid, []))
+                            if message.get("role") == "user"), None)
         if latest_user is None:
             continue
-        prompt = latest_user.get("content", "")
+        user_row_id, latest_user_message = latest_user
+        prompt = latest_user_message.get("content", "")
         if isinstance(prompt, list):
             prompt = "\n".join(part.get("text", "") for part in prompt if isinstance(part, dict) and isinstance(part.get("text"), str))
         try:
-            title = _parse(prompt, role)
+            title, orchestrator = _parse_details(prompt, role)
         except ValueError:
             continue
         session_id = sid if sid.startswith("acp/devin-cli/") else f"acp/devin-cli/{sid}"
+        invocation_key = hashlib.sha256(
+            f"devin\0{project}\0{session_id}\0{user_row_id}".encode("utf-8")
+        ).hexdigest()
         candidates.append(Invocation(project, "devin", session_id, role or "", workspace, title,
-                                     "devin-fresh-native-user-message"))
+                                     "devin-fresh-native-user-message", orchestrator, invocation_key))
     unique = {(x.project, x.session): x for x in candidates}
     if len(unique) != 1:
         raise ValueError("Devin native invocation did not resolve to one fresh project session")
@@ -449,7 +498,7 @@ def antigravity_invocation(role, event, *, resolve_native_conversation, project_
     """Check Desktop event against the host's native conversation resolver."""
     if not isinstance(event, dict):
         raise ValueError("Antigravity native event is required")
-    title = _parse((event.get("lastUserInput") or "").removeprefix("@"), role)
+    title, orchestrator = _parse_details((event.get("lastUserInput") or "").removeprefix("@"), role)
     conversation = event.get("conversationId")
     if not isinstance(conversation, str) or not conversation:
         raise ValueError("Antigravity current conversation identity is unavailable")
@@ -458,14 +507,21 @@ def antigravity_invocation(role, event, *, resolve_native_conversation, project_
         raise ValueError("Antigravity event does not match the current native conversation")
     workspace = Path(native.get("workspace", "")).expanduser().resolve(strict=True)
     project, _ = _resolve(workspace, project_hint)
-    return Invocation(project, "antigravity", conversation, role, workspace, title, "antigravity-native-event-and-conversation")
+    invocation_key = None
+    if orchestrator:
+        from . import ag_wake
+        from .ag_inbox import _orchestrator_request_id
+        brain = ag_wake._summary_path().parent / "brain" / conversation
+        invocation_key = _orchestrator_request_id(event, brain, conversation)
+    return Invocation(project, "antigravity", conversation, role, workspace, title,
+                      "antigravity-native-event-and-conversation", orchestrator, invocation_key)
 
 
 def antigravity_native_invocation(role, event, *, summaries_db=None, project_hint=None):
     """Resolve an Antigravity conversation from its local native summary DB."""
     if not isinstance(event, dict):
         raise ValueError("Antigravity native event is required")
-    title = _parse((event.get("lastUserInput") or "").removeprefix("@"), role)
+    title, orchestrator = _parse_details((event.get("lastUserInput") or "").removeprefix("@"), role)
     conversation = event.get("conversationId")
     if not isinstance(conversation, str) or not conversation:
         raise ValueError("Antigravity current conversation identity is unavailable")
@@ -493,8 +549,14 @@ def antigravity_native_invocation(role, event, *, summaries_db=None, project_hin
         project, _ = _resolve(workspace, project_hint)
         if project != matches[0][0]:
             raise ValueError("Antigravity native project mapping does not match the workspace")
+        invocation_key = None
+        if orchestrator:
+            from . import ag_wake
+            from .ag_inbox import _orchestrator_request_id
+            brain = ag_wake._summary_path().parent / "brain" / conversation
+            invocation_key = _orchestrator_request_id(event, brain, conversation)
         return Invocation(project, "antigravity", conversation, role or "", workspace, title,
-                          "antigravity-local-native-summary")
+                          "antigravity-local-native-summary", orchestrator, invocation_key)
     db_path = Path(summaries_db or os.environ.get("MHB_ANTIGRAVITY_SUMMARIES_DB", ""))
     if not db_path.is_file():
         raise ValueError("Antigravity native conversation summary database is unavailable")
@@ -517,6 +579,13 @@ def antigravity_native_invocation(role, event, *, summaries_db=None, project_hin
             raise ValueError("Antigravity conversation has ambiguous workspace roots")
         workspace = next(iter(roots))
         project, _ = _resolve(workspace, project_hint)
-        return Invocation(project, "antigravity", conversation, role or "", workspace, title, "antigravity-local-native-summary")
+        invocation_key = None
+        if orchestrator:
+            from .ag_wake import _summary_path
+            from .ag_inbox import _orchestrator_request_id
+            invocation_key = _orchestrator_request_id(event, _summary_path().parent / "brain" / conversation,
+                                                      conversation)
+        return Invocation(project, "antigravity", conversation, role or "", workspace, title,
+                          "antigravity-local-native-summary", orchestrator, invocation_key)
     except (sqlite3.Error, OSError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError(f"Antigravity native invocation could not be verified ({type(exc).__name__})") from None

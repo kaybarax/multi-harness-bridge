@@ -31,6 +31,7 @@ class Store:
             if version == SCHEMA_VERSION:
                 if db.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
                     self._ensure_wal(db)
+                self._ensure_orchestrator_schema(db)
                 return
             self._ensure_wal(db)
             db.execute("BEGIN IMMEDIATE")
@@ -122,6 +123,7 @@ class Store:
         db.execute("""CREATE INDEX message_ready
             ON messages(project,pickup_harness,stage,created)""")
         db.execute("CREATE INDEX replies ON messages(project,reply_to)")
+        Store._ensure_orchestrator_schema(db)
         db.execute("""CREATE TABLE IF NOT EXISTS delivery_events(
             message_id TEXT NOT NULL, at REAL NOT NULL, event TEXT NOT NULL,
             attempt INTEGER NOT NULL, PRIMARY KEY(message_id,event,attempt))""")
@@ -135,6 +137,35 @@ class Store:
                      WHEN OLD.stage='outbound' THEN 'routed'
                      ELSE 'forwarded' END,
                 NEW.attempts); END""")
+
+    @staticmethod
+    def _ensure_orchestrator_schema(db):
+        """Install additive project-owner state without changing queue row formats."""
+        db.execute("""CREATE TABLE IF NOT EXISTS project_orchestrators (
+            project TEXT PRIMARY KEY, harness TEXT NOT NULL, session TEXT NOT NULL,
+            revision INTEGER NOT NULL, changed REAL NOT NULL,
+            valid INTEGER NOT NULL DEFAULT 1 CHECK(valid IN (0,1)))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS orchestrator_events (
+            project TEXT NOT NULL, revision INTEGER NOT NULL, event TEXT NOT NULL,
+            harness TEXT, session TEXT, previous_harness TEXT, previous_session TEXT,
+            at REAL NOT NULL, PRIMARY KEY(project,revision))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS role_take_requests (
+            project TEXT NOT NULL, request_id TEXT NOT NULL, harness TEXT NOT NULL,
+            session TEXT NOT NULL, designate INTEGER NOT NULL, PRIMARY KEY(project,request_id))""")
+        db.execute("""CREATE TRIGGER IF NOT EXISTS stale_orchestrator_on_coordinator_rebind
+            AFTER UPDATE OF session ON bindings
+            WHEN OLD.role='coordinator' AND OLD.session<>NEW.session AND EXISTS(
+                SELECT 1 FROM project_orchestrators WHERE project=OLD.project
+                AND harness=OLD.harness AND session=OLD.session AND valid=1)
+            BEGIN
+                UPDATE project_orchestrators SET valid=0,
+                    revision=(SELECT COALESCE(MAX(revision),0)+1 FROM orchestrator_events WHERE project=OLD.project),
+                    changed=CAST(strftime('%s','now') AS REAL)
+                WHERE project=OLD.project AND harness=OLD.harness AND session=OLD.session;
+                INSERT INTO orchestrator_events(project,revision,event,previous_harness,previous_session,at)
+                    SELECT OLD.project,COALESCE(MAX(revision),0)+1,'stale',OLD.harness,OLD.session,
+                    CAST(strftime('%s','now') AS REAL) FROM orchestrator_events WHERE project=OLD.project;
+            END""")
 
     def _connect(self):
         db = sqlite3.connect(self.path, timeout=DB_TIMEOUT_SECONDS, isolation_level="DEFERRED")
@@ -156,7 +187,8 @@ class Store:
         provider = self.bindings_provider
         return provider.guard(project) if provider is not None else nullcontext()
 
-    def bind(self, project, harness, role, session, *, take=False):
+    def bind(self, project, harness, role, session, *, take=False, designate=False,
+             request_id=None):
         project, harness, session = (
             self._name(project, "project"),
             self._name(harness, "harness"),
@@ -164,10 +196,22 @@ class Store:
         )
         if role not in ROLES:
             raise ValueError("role must be coordinator or inbox")
+        if request_id is not None:
+            request_id = self._name(request_id, "request_id")
+            if role != "coordinator":
+                raise ValueError("request_id is supported only for coordinator takeovers")
         if self._managed_route(project, harness):
             raise ValueError("use the native role picker for this managed route")
         with closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
+            if request_id is not None:
+                previous_request = db.execute(
+                    "SELECT harness,session,designate FROM role_take_requests WHERE project=? AND request_id=?",
+                    (project, request_id)).fetchone()
+                if previous_request:
+                    if tuple(previous_request) != (harness, session, int(bool(designate))):
+                        raise ValueError("coordinator invocation key was reused for a different request")
+                    return self._roles(db, project, harness)
             db.execute(
                 "INSERT INTO control(project,harness,enabled,explicit) VALUES(?,?,0,0) ON CONFLICT(project,harness) DO NOTHING",
                 (project, harness),
@@ -176,8 +220,23 @@ class Store:
                 "SELECT session FROM bindings WHERE project=? AND harness=? AND role=?",
                 (project, harness, role),
             ).fetchone()
+            owner_before = self._owner_row(db, project) if role == "coordinator" else None
+            owner_was_active = bool(owner_before and owner_before["harness"] == harness
+                                    and old and owner_before["session"] == old[0]
+                                    and owner_before["valid"])
+            if designate and owner_was_active and old and old[0] != session:
+                # A deliberate transfer replaces the owner directly; suppress
+                # the binding trigger's stale transition for the old owner.
+                db.execute("UPDATE project_orchestrators SET valid=0 WHERE project=?", (project,))
             resume = take and role == "inbox"
             if old and old[0] == session and not resume:
+                if designate:
+                    if role != "coordinator":
+                        raise ValueError("only a coordinator can be designated as project orchestrator")
+                    self._set_orchestrator(db, project, harness, session, "designated")
+                if request_id is not None:
+                    db.execute("INSERT INTO role_take_requests(project,request_id,harness,session,designate) VALUES(?,?,?,?,?)",
+                               (project, request_id, harness, session, int(bool(designate))))
                 return self._roles(db, project, harness)
             if old and old[0] != session:
                 active = db.execute(
@@ -212,7 +271,213 @@ class Store:
                 "UPDATE control SET enabled=CASE WHEN explicit=0 AND ?=1 THEN 1 ELSE enabled END WHERE project=? AND harness=?",
                 (int(complete), project, harness),
             )
+            if role == "coordinator" and old is not None and old[0] != session:
+                self._record_implicit_owner_change(db, project, harness, session)
+                if owner_was_active and not designate:
+                    owner_after = self._owner_row(db, project)
+                    if owner_after:
+                        self._enqueue_orchestrator_notices(db, project, harness, session,
+                                                           owner_after["revision"], "stale")
+            if designate:
+                if role != "coordinator":
+                    raise ValueError("only a coordinator can be designated as project orchestrator")
+                self._set_orchestrator(db, project, harness, session, "designated")
+            if request_id is not None:
+                db.execute("INSERT INTO role_take_requests(project,request_id,harness,session,designate) VALUES(?,?,?,?,?)",
+                           (project, request_id, harness, session, int(bool(designate))))
             return self._roles(db, project, harness)
+
+    def take_coordinator(self, project, harness, session, *, designate=False,
+                         request_id=None):
+        """Apply a verified coordinator takeover and optional project election.
+
+        Local bindings and designation share one transaction. Native providers
+        own their binding handoff; for those routes this verifies the live role
+        under their exclusive lock before updating only the project record.
+        """
+        project, harness, session = (self._name(project, "project"),
+                                    self._name(harness, "harness"),
+                                    self._name(session, "session"))
+        if self._managed_route(project, harness):
+            with self.bindings_provider.guard(project, exclusive=True):
+                if self.bindings_provider.roles(project, harness).get("coordinator") != session:
+                    raise ValueError("session is not the current native coordinator")
+                with closing(self._connect()) as db, db:
+                    db.execute("BEGIN IMMEDIATE")
+                    if request_id is not None:
+                        request_id = self._name(request_id, "request_id")
+                        prior = db.execute("SELECT harness,session,designate FROM role_take_requests WHERE project=? AND request_id=?",
+                                           (project, request_id)).fetchone()
+                        if prior:
+                            if tuple(prior) != (harness, session, int(bool(designate))):
+                                raise ValueError("coordinator invocation key was reused for a different request")
+                            return self._take_result_db(db, project, harness, session)
+                    if not designate:
+                        self._record_implicit_owner_change(db, project, harness, session)
+                    if designate:
+                        self._set_orchestrator(db, project, harness, session, "designated")
+                    if request_id is not None:
+                        db.execute("INSERT INTO role_take_requests(project,request_id,harness,session,designate) VALUES(?,?,?,?,?)",
+                                   (project, request_id, harness, session, int(bool(designate))))
+                    return self._take_result_db(db, project, harness, session)
+        self.bind(project, harness, "coordinator", session, take=True,
+                  designate=designate, request_id=request_id)
+        with closing(self._connect()) as db:
+            db.execute("BEGIN")
+            return self._take_result_db(db, project, harness, session)
+
+    @staticmethod
+    def _owner_row(db, project):
+        return db.execute("SELECT harness,session,revision,valid FROM project_orchestrators WHERE project=?",
+                          (project,)).fetchone()
+
+    def _set_orchestrator(self, db, project, harness, session, event):
+        previous = self._owner_row(db, project)
+        if previous and (previous["harness"], previous["session"]) == (harness, session) and previous["valid"]:
+            return previous["revision"]
+        revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM orchestrator_events WHERE project=?",
+                              (project,)).fetchone()[0]
+        now = time.time()
+        db.execute("""INSERT INTO project_orchestrators(project,harness,session,revision,changed,valid)
+            VALUES(?,?,?,?,?,1) ON CONFLICT(project) DO UPDATE SET harness=excluded.harness,
+            session=excluded.session,revision=excluded.revision,changed=excluded.changed,valid=1""",
+                   (project, harness, session, revision, now))
+        db.execute("""INSERT INTO orchestrator_events
+            (project,revision,event,harness,session,previous_harness,previous_session,at)
+            VALUES(?,?,?,?,?,?,?,?)""",
+                   (project, revision, event, harness, session,
+                    previous["harness"] if previous else None,
+                    previous["session"] if previous else None, now))
+        self._enqueue_orchestrator_notices(db, project, harness, session, revision,
+                                           "designated")
+        return revision
+
+    def _record_implicit_owner_change(self, db, project, harness, new_session):
+        owner = self._owner_row(db, project)
+        if owner and owner["harness"] == harness and owner["session"] != new_session and owner["valid"]:
+            revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM orchestrator_events WHERE project=?",
+                                  (project,)).fetchone()[0]
+            now = time.time()
+            db.execute("UPDATE project_orchestrators SET revision=?,changed=?,valid=0 WHERE project=?",
+                       (revision, now, project))
+            db.execute("""INSERT INTO orchestrator_events
+                (project,revision,event,harness,session,previous_harness,previous_session,at)
+                VALUES(?,?,'stale',NULL,NULL,?,?,?)""",
+                       (project, revision, owner["harness"], owner["session"], now))
+            self._enqueue_orchestrator_notices(db, project, harness, new_session, revision, "stale")
+
+    def _enqueue_orchestrator_notices(self, db, project, sender, session, revision, state):
+        """Durably route notices through the existing harness mailbox controls."""
+        try:
+            self._require_free_text_sender(db, project, sender, session)
+        except (ValueError, RuntimeError, sqlite3.Error):
+            return
+        recipients = {row[0] for row in db.execute(
+            "SELECT DISTINCT harness FROM bindings WHERE project=?", (project,))}
+        if self.bindings_provider is not None:
+            recipients.update({"codex", "claude", "devin", "antigravity"})
+        recipients.discard(sender)
+        body = (f"The project board owner is {state}. This change concerns {sender}. "
+                f"Check project status for designation revision {revision}.")
+        for recipient in sorted(recipients):
+            try:
+                self._require_bound_route(db, project, recipient)
+                if not self._enabled(db, project, recipient):
+                    continue
+            except (ValueError, RuntimeError, sqlite3.Error):
+                continue
+            request_id = str(uuid.uuid4())
+            key = f"mhb-orchestrator-{request_id}"
+            db.execute("INSERT INTO free_text_requests(id,project,sender,key,body) VALUES(?,?,?,?,?)",
+                       (request_id, project, sender, key, body))
+            self._enqueue_routed(db, request_id, project, sender, recipient, body, key, session)
+
+    def _project_orchestrator(self, db, project):
+        owner = self._owner_row(db, project)
+        if owner is None:
+            last_event = db.execute("SELECT event FROM orchestrator_events WHERE project=? ORDER BY revision DESC LIMIT 1",
+                                    (project,)).fetchone()
+            return {"status": "cleared" if last_event and last_event[0] == "cleared" else "never_designated",
+                    "harness": None, "session": None}
+        active = bool(owner["valid"]) and self._roles(db, project, owner["harness"]).get("coordinator") == owner["session"]
+        return {"status": "active" if active else "stale", "harness": owner["harness"],
+                "session": owner["session"], "revision": owner["revision"]}
+
+    def _take_result_db(self, db, project, harness, session):
+        return {"project": project, "harness": harness, "session": session,
+                "roles": self._roles(db, project, harness),
+                "orchestrator": self._project_orchestrator(db, project)}
+
+    def project_status(self, project):
+        """Return live coordinator bindings and the optional project owner."""
+        self._name(project, "project")
+        with self._route_guard(project), closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self._observe_owner_staleness(db, project)
+            harnesses = {row[0] for row in db.execute(
+                "SELECT DISTINCT harness FROM bindings WHERE project=?", (project,))}
+            if self.bindings_provider is not None:
+                harnesses.update({"codex", "claude", "devin", "antigravity"})
+            coordinators = {name: self._roles(db, project, name).get("coordinator")
+                            for name in sorted(harnesses)}
+            return {"project": project, "coordinators": coordinators,
+                    "orchestrator": self._project_orchestrator(db, project),
+                    "orchestrator_events": [dict(row) for row in db.execute(
+                        "SELECT revision,event,harness,session,previous_harness,previous_session,at "
+                        "FROM orchestrator_events WHERE project=? ORDER BY revision", (project,))]}
+
+    def orchestrator_status(self, project):
+        """Read only the project owner, without querying every peer binding."""
+        self._name(project, "project")
+        with self._route_guard(project), closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            self._observe_owner_staleness(db, project)
+            return self._project_orchestrator(db, project)
+
+    def _observe_owner_staleness(self, db, project):
+        owner = self._owner_row(db, project)
+        if owner is None:
+            return
+        if not owner["valid"]:
+            return
+        current = self._roles(db, project, owner["harness"]).get("coordinator")
+        if current == owner["session"]:
+            return
+        revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM orchestrator_events WHERE project=?",
+                              (project,)).fetchone()[0]
+        now = time.time()
+        db.execute("UPDATE project_orchestrators SET valid=0,revision=?,changed=? WHERE project=?",
+                   (revision, now, project))
+        db.execute("""INSERT INTO orchestrator_events
+            (project,revision,event,previous_harness,previous_session,at)
+            VALUES(?,?,'stale',?,?,?)""", (project, revision, owner["harness"], owner["session"], now))
+        if current:
+            self._enqueue_orchestrator_notices(db, project, owner["harness"], current, revision, "stale")
+
+    def clear_orchestrator(self, project):
+        """Clear project designation while keeping all harness bindings intact."""
+        self._name(project, "project")
+        with self._route_guard(project), closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            owner = self._owner_row(db, project)
+            if owner is None:
+                return {"project": project, "cleared": False,
+                        "orchestrator": self._project_orchestrator(db, project)}
+            revision = db.execute("SELECT COALESCE(MAX(revision),0)+1 FROM orchestrator_events WHERE project=?",
+                                  (project,)).fetchone()[0]
+            now = time.time()
+            db.execute("DELETE FROM project_orchestrators WHERE project=?", (project,))
+            db.execute("""INSERT INTO orchestrator_events
+                (project,revision,event,harness,session,previous_harness,previous_session,at)
+                VALUES(?,?,'cleared',NULL,NULL,?,?,?)""",
+                       (project, revision, owner["harness"], owner["session"], now))
+            roles = self._roles(db, project, owner["harness"])
+            sender_session = roles.get("coordinator")
+            if sender_session:
+                self._enqueue_orchestrator_notices(db, project, owner["harness"], sender_session,
+                                                   revision, "cleared")
+            return {"project": project, "cleared": True,
+                    "orchestrator": {"status": "cleared", "harness": None, "session": None}}
 
     def roles(self, project, harness):
         with self._route_guard(project), closing(self._connect()) as db:
