@@ -22,9 +22,9 @@ def legacy_fixture(tmp_path):
     watcher = state / "watcher"
     for folder in (docs, dev, watcher):
         folder.mkdir(parents=True)
-    cfg = config.register("maple", (docs, dev), tmp_path / "state")
+    cfg = config.register("example-project", (docs, dev), tmp_path / "state")
     config.atomic_json(cfg.root / "legacy.json", {
-        "version": 1, "project": "maple", "installation": str(installation),
+        "version": 1, "project": "example-project", "installation": str(installation),
     })
     (state / "project-bindings.lock").touch()
     roles = {host: [str(uuid4()), str(uuid4())] for host in ("codex", "claude", "antigravity")}
@@ -69,47 +69,47 @@ def test_store_uses_legacy_authority_and_keeps_mailboxes_separate(tmp_path):
     coordinator, inbox = roles["codex"]
     legacy_mailbox = state / "mailbox.sqlite3"
     before = legacy_mailbox.read_bytes()
-    request = store.send_fanout("maple", "codex", ["devin", "antigravity"],
+    request = store.send_fanout("example-project", "codex", ["devin", "antigravity"],
                                 "synthetic message", "split", session=coordinator)
-    item = store.claim("maple", "codex", "inbox", inbox)
+    item = store.claim("example-project", "codex", "inbox", inbox)
     assert item["request_id"] == request["request_id"]
-    assert store.finish("maple", "codex", "inbox", inbox, item["id"], item["lease"])
+    assert store.finish("example-project", "codex", "inbox", inbox, item["id"], item["lease"])
     new_coordinator = str(uuid4())
     (state / "watcher/codex.thread").write_text(new_coordinator)
     with pytest.raises(ValueError, match="current coordinator"):
-        store.send_fanout("maple", "codex", ["devin"], "retired", "retired", session=coordinator)
-    assert store.send_fanout("maple", "codex", ["devin", "antigravity"],
+        store.send_fanout("example-project", "codex", ["devin"], "retired", "retired", session=coordinator)
+    assert store.send_fanout("example-project", "codex", ["devin", "antigravity"],
                              "synthetic message", "split", session=new_coordinator)["request_id"] == request["request_id"]
     assert legacy_mailbox.read_bytes() == before
     with pytest.raises(ValueError, match="native"):
-        store.set_enabled("maple", "codex", False, session=new_coordinator)
+        store.set_enabled("example-project", "codex", False, session=new_coordinator)
 
 
 def test_legacy_controls_and_role_disagreement_are_observed_at_call_time(tmp_path):
     cfg, state, roles = legacy_fixture(tmp_path)
     store = config.open_store(cfg)
     provider = legacy.load(cfg)
-    assert provider.enabled("maple", "claude")
+    assert provider.enabled("example-project", "claude")
     (state / "watcher/claude-only").touch()
-    assert not store.status("maple", "codex")["enabled"]
-    assert store.status("maple", "claude")["enabled"]
+    assert not store.status("example-project", "codex")["enabled"]
+    assert store.status("example-project", "claude")["enabled"]
     (state / "watcher/claude.thread").unlink()
     (state.parent / "receiver-health.json").write_text(json.dumps({"coordinator_session": "local_" + roles["claude"][0]}))
-    assert store.roles("maple", "claude")["coordinator"] == roles["claude"][0]
+    assert store.roles("example-project", "claude")["coordinator"] == roles["claude"][0]
     native_devin = state / "devin-local-relay.sqlite3"
     write_db(native_devin, None, (("UPDATE transport_control SET enabled=?", (0,)),))
-    assert not store.status("maple", "devin")["enabled"]
+    assert not store.status("example-project", "devin")["enabled"]
     write_db(native_devin, None, (("UPDATE inbox_binding SET session=?", ("new-devin-inbox",)),))
     with pytest.raises(RuntimeError, match="disagree"):
-        store.roles("maple", "devin")
+        store.roles("example-project", "devin")
     write_db(state / "mailbox.sqlite3", None, (
         ("UPDATE harness_bindings SET receiver=? WHERE actor='devin_local'", ("new-devin-inbox",)),
     ))
-    assert store.roles("maple", "devin")["inbox"] == "acp/devin-cli/new-devin-inbox"
-    assert not store.status("maple", "devin")["enabled"]
+    assert store.roles("example-project", "devin")["inbox"] == "acp/devin-cli/new-devin-inbox"
+    assert not store.status("example-project", "devin")["enabled"]
     (state / "role-handoff.pending.json").touch()
     with pytest.raises(RuntimeError, match="recovery"):
-        store.roles("maple", "devin")
+        store.roles("example-project", "devin")
 
 
 def test_devin_wake_resolves_the_bound_sessions_actual_workspace(tmp_path, monkeypatch):
@@ -118,7 +118,7 @@ def test_devin_wake_resolves_the_bound_sessions_actual_workspace(tmp_path, monke
     docs, dev, outside = (tmp_path / name for name in ("docs", "dev", "other"))
     for root in (docs, dev, outside):
         root.mkdir()
-    cfg = config.register("maple", (docs, dev), tmp_path / "state")
+    cfg = config.register("example-project", (docs, dev), tmp_path / "state")
     native_db = tmp_path / "native.sqlite3"
     write_db(native_db, "CREATE TABLE sessions(id,working_directory,hidden)", (
         ("INSERT INTO sessions VALUES(?,?,0)", ("coordinator", str(dev))),
@@ -126,10 +126,10 @@ def test_devin_wake_resolves_the_bound_sessions_actual_workspace(tmp_path, monke
         ("INSERT INTO sessions VALUES(?,?,1)", ("retired", str(docs))),
     ))
     monkeypatch.setenv("MHB_DEVIN_SESSIONS_DB", str(native_db))
-    assert wake._devin_workspace(cfg, "maple", "acp/devin-cli/coordinator") == dev
+    assert wake._devin_workspace(cfg, "example-project", "acp/devin-cli/coordinator") == dev
     for name in ("foreign", "retired", "missing"):
         with pytest.raises(wake.WakeDeferred, match="no verified working directory"):
-            wake._devin_workspace(cfg, "maple", f"acp/devin-cli/{name}")
+            wake._devin_workspace(cfg, "example-project", f"acp/devin-cli/{name}")
 
 
 def test_legacy_handoff_refreshes_both_manifests_after_rotation(tmp_path):
@@ -139,22 +139,22 @@ def test_legacy_handoff_refreshes_both_manifests_after_rotation(tmp_path):
 
     cfg, state, roles = legacy_fixture(tmp_path)
     installation = state.parent
-    roots = cfg.projects["maple"]
+    roots = cfg.projects["example-project"]
     legacy_python = str(installation / ".venv/bin/python")
     route_script = str(installation / "devin_local_route_mcp.py")
     for root in roots:
         path = root / reconcile.DEVIN_MANIFEST
         path.parent.mkdir()
         config.atomic_json(path, {"mcpServers": {
-            "devin-maple-role-handoff": {
-                "command": legacy_python, "args": [route_script, "role-handoff", "maple"],
+            "devin-example-project-role-handoff": {
+                "command": legacy_python, "args": [route_script, "role-handoff", "example-project"],
             },
-            "devin-maple-route-inbox": {
-                "command": legacy_python, "args": [route_script, "inbox", "maple", roles["devin"][1]],
+            "devin-example-project-route-inbox": {
+                "command": legacy_python, "args": [route_script, "inbox", "example-project", roles["devin"][1]],
             },
             "unrelated": {"enabled": False},
         }})
-    assert len(reconcile.reconcile_devin(cfg, "maple", apply=True)) == 2
+    assert len(reconcile.reconcile_devin(cfg, "example-project", apply=True)) == 2
 
     def stock_refresh(*args):
         raise AssertionError("The compatibility handler must replace the single-root refresh")
@@ -172,11 +172,11 @@ def test_legacy_handoff_refreshes_both_manifests_after_rotation(tmp_path):
         assert module._refresh_role_manifest(SimpleNamespace(name=project, workspace=roots[1]), None)
         for root in roots:
             servers = json.loads((root / reconcile.DEVIN_MANIFEST).read_text())["mcpServers"]
-            assert servers["devin-maple-route-inbox"]["args"][-1] == new_inbox
-            assert servers["devin-maple-role-handoff"]["args"][-1] == "serve-handoff"
+            assert servers["devin-example-project-route-inbox"]["args"][-1] == new_inbox
+            assert servers["devin-example-project-role-handoff"]["args"][-1] == "serve-handoff"
             assert servers["unrelated"] == {"enabled": False}
-        assert not reconcile.reconcile_devin(cfg, "maple")
+        assert not reconcile.reconcile_devin(cfg, "example-project")
 
     module.serve_role_handoff = simulate_native_handoff
-    legacy_devin.serve_handoff(cfg, "maple", route_module=module)
+    legacy_devin.serve_handoff(cfg, "example-project", route_module=module)
     assert module._refresh_role_manifest is stock_refresh

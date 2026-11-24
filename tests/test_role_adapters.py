@@ -140,7 +140,7 @@ def test_claude_hook_explicit_project_home_overrides_ambient_environment(tmp_pat
     cfg_root = tmp_path / "private bridge state"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    config.register("maple", (workspace,), cfg_root)
+    config.register("example-project", (workspace,), cfg_root)
     ambient = tmp_path / "different-home"
     monkeypatch.setenv("MHB_HOME", str(ambient))
     monkeypatch.setattr(adapters, "_native_claude_hook_payload", lambda payload: True)
