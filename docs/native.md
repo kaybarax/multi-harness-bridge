@@ -35,8 +35,8 @@ native binding. A verifier refusal is a safe retryable preflight failure.
 The `wake` executable receives its arguments directly (no shell expansion),
 must target that verified session through its native host, and returns zero
 only after the host confirms acceptance. Exit code 2 or 3 explicitly means
-the host deferred before submission and is safe for a bounded retry. Other
-nonzero codes and timeouts are ambiguous and held for reconciliation. `{body}` is a fixed ID-only wake
+the host deferred before submission and the dispatcher can retry on a later poll. Other
+nonzero codes and timeouts can leave the wake uncertain until the recovery window. `{body}` is a fixed ID-only wake
 prompt. The queued message body is never copied into a native prompt or process
 argument. Supported placeholders are
 `project`, `harness`, `role`, `session`, `notification_id`, and `body`.
@@ -85,8 +85,9 @@ rejects the queue `WAKE_PROMPT` wording for cross-thread sends. Only after that 
 succeeds does the agent run `--mailbox relay-confirm --message-id <id>`, which
 records the relay in the wake ledger and suppresses the fallback queue for
 that notification. A failed or skipped tool call leaves the fallback eligible:
-past the grace window the normal `codex queue` path still delivers, so a
-forgotten confirm costs at most a harmless duplicate wake. Claude Code uses its in-session
+past the grace window the normal `codex queue` path can deliver. An unconfirmed
+relay reservation holds that session until it finishes or reaches the recovery window.
+Claude Code uses its in-session
 `mhb monitor PROJECT claude ROLE SESSION` subscription by default. It prints
 JSON hints for the bound session and never invokes a detached model turn. A
 detached `claude --resume SESSION --print PROMPT` wake is available only when
@@ -96,6 +97,10 @@ and submits a fixed ID-only `session/prompt` to the exact bound session. The
 resumed Desktop session uses the installed `mhb_roles_<project>` server. Its
 `pickup_wake(notification_id)` and `finish_wake` tools require a matching
 active dispatch record for the current native turn, role, and notification.
+An exact native turn can still finish after its ACP connection times out if the
+bound route and pickup lease remain valid. A `session_locked` response to
+`session/load` defers the wake before prompt submission and leaves it eligible
+when that chat is available again.
 The ACP client checks the native session, pending tool-call ID, server, tool,
 and exact notification ID for permission requests. It checks native tool
 results and the durable queue even when Devin handles approval internally.
@@ -151,24 +156,25 @@ service arguments.
 
 Install one service per registered project. Run `multi-harness-wake` once
 manually for that project's workspace before enabling the service. A native
-busy/draft/active-user deferral is retried on a later poll and does not consume
-the bounded rejection attempt count.
+busy, draft, or active-user deferral can retry on a later poll without spending
+an attempt. Other definite rejections retry with a delay that grows from two
+seconds to one minute. There is no attempt limit.
 
 Inspect recent sends with `multi-harness-wake --project my-project
---show-attempts`. A bound session receives one wake at a time: later IDs wait
-until the current ID is claimed and finished, followed by a short cooldown. The
-current Codex queue adapter has no identity-verified desktop-idle signal, so
-this cooldown reduces turn overlap but does not prove the host is idle. The
-lane is durable across dispatcher restarts and applies independently to each
-project, harness, role, and session.
+--show-attempts`. Each row includes the exact notification ID, attempt and lane
+states, queue stage, lease deadline, earliest time-based retry eligibility, and
+the number of automatic recoveries. A bound session receives one dispatch at a
+time. Finishing the current stage starts a short cooldown. The lane survives
+dispatcher restarts and applies independently to each project, harness, role,
+and session. The cooldown gives the native turn time to exit.
 
 For an ambiguous `sending` attempt, inspect the exact native session and use
 `--reconcile NOTIFICATION_UUID --outcome sent` or `--outcome not-sent`. If
 multiple role attempts for that ID are unresolved, also supply `--harness`,
-`--role`, and `--session` from the status output. An active send cannot be
-reconciled; wait for its 75 second maximum window to expire and inspect it
-again. `not-sent` permits only the remaining bounded retry; it does not change
-the mailbox item or acknowledge it.
+`--role`, and `--session` from the status output. A `sending` attempt becomes
+eligible for reconciliation after 135 seconds. `not-sent` re-arms the exact
+wake after backoff and retains its previous attempt count. Both reconciliation
+outcomes record the prior attempt in wake history.
 
 For a previously accepted wake whose message is still pending and unprocessed,
 first verify that the exact bound native session is idle and the ID has not
@@ -180,20 +186,20 @@ multi-harness-wake --project my-project --renotify NOTIFICATION_UUID \
   --harness codex --role inbox --session BOUND_SESSION
 ```
 
-The previous accepted attempt remains in the wake history; the re-notify
-command does not claim or acknowledge the mailbox item.
-Legacy successful sends remain unchanged and are never automatically re-sent;
-new notifications continue through the serialized lane. Other sessions
-continue independently.
+The previous accepted attempt remains in wake history. The exact mailbox item
+stays available for the bound receiver to claim.
 
 ## Duplicate and uncertain sends
 
-Before dispatch the wake driver records a durable per-notification attempt in
-the Store database. A confirmed send is not repeated. A verified pre-submit
-refusal can be retried at most three times. If a host call times out or returns
-an ambiguous result after it may have submitted the prompt, the attempt is
-marked `uncertain` and requires manual reconciliation. Later deliveries for the
-same role remain eligible for a wake. Each wake record identifies the exact
-project, harness, role, and native session. A replacement chat can receive a
-new wake for pending work. The durable queue validates the current binding and
-lease before advancing the message.
+Before dispatch the driver records each attempt in the Store. An ambiguous
+native result leaves an `uncertain` attempt. After 135 seconds a dispatcher can
+recover an aged `sending`, `uncertain`, `sent`, or `claimed` lane. It waits for
+any active lease on the bound route. If the exact notification is still pending,
+the next attempt preserves its previous state and timestamps in wake history.
+If the queue already advanced, the dispatcher gives the native turn its cooldown
+and moves on to later work. A replacement chat can receive a wake for pending
+work after the previous lease expires.
+
+A late host can display another notice for the same ID. The exact-ID claim
+and lease allow each durable queue stage to advance once. A late dispatcher
+result can only finalize the reservation that produced it.

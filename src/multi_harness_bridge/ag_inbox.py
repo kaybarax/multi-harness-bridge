@@ -89,30 +89,10 @@ def _orchestrator_request_id(event, brain, session):
     return f"antigravity:{session}:{step}"
 
 
-def _explicit_skill_request(prompt):
-    """Read the operation and explicit source list from this direct Desktop turn."""
-    import re
-    if not isinstance(prompt, str):
-        raise PermissionError("Name the skill sources in the current user request")
-    match = re.fullmatch(
-        r"\s*(?:please\s+)?(?:@|/)?propagate(?:-skills|\s+(skills|one project entry))\s+from\s+(.+?)\s*[.!]?\s*",
-        prompt, re.IGNORECASE,
-    )
-    if not match:
-        raise PermissionError("The current user request must explicitly name skill sources")
-    allowed = "codex|claude|devin|antigravity"
-    if not re.fullmatch(rf"\s*(?:{allowed})(?:\s*(?:,|and|\+)\s*(?:{allowed}))*\s*",
-                        match.group(2), re.IGNORECASE):
-        raise PermissionError("Skill source list must name supported harnesses explicitly")
-    sources = [item.lower() for item in re.findall(allowed, match.group(2), re.IGNORECASE)]
-    if len(sources) != len(set(sources)):
-        raise PermissionError("Duplicate skill sources are not allowed")
-    return ("entry" if (match.group(1) or "").lower() == "one project entry" else "copy", sources)
-
-
 def _explicit_skill_sources(prompt):
     """Compatibility helper for callers that only need the requested sources."""
-    return _explicit_skill_request(prompt)[1]
+    from .propagation import explicit_skill_request
+    return explicit_skill_request(prompt)[1]
 
 
 def before_tool(cfg, project, event):
@@ -159,7 +139,8 @@ def before_tool(cfg, project, event):
         if orchestrator:
             request_id = _orchestrator_request_id(event, brain, session)
     elif tool == "propagate_skills":
-        mode, sources = _explicit_skill_request(event.get("lastUserInput"))
+        from .propagation import explicit_skill_request
+        mode, sources = explicit_skill_request(event.get("lastUserInput"))
         supplied = args.get("sources")
         if (not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied)
                 or supplied != sources):

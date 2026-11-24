@@ -63,6 +63,38 @@ def legacy_fixture(tmp_path):
     return cfg, state, roles
 
 
+def test_portable_devin_defers_to_either_legacy_dispatcher_without_spending_an_attempt(tmp_path, monkeypatch):
+    import fcntl
+    from multi_harness_bridge import legacy, wake
+
+    cfg, state, roles = legacy_fixture(tmp_path)
+    store = config.open_store(cfg)
+    project = "example-project"
+    route = (project, "devin", "inbox", f"acp/devin-cli/{roles['devin'][1]}")
+    item = store.send(project, "codex", "devin", "portable message", "stable-id")
+    launched = []
+
+    def launch(_harness, values, *, before_prompt):
+        assert before_prompt()
+        for name in legacy.DEVIN_WAKE_LOCKS:
+            with (state / name).open("rb") as contender, pytest.raises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        launched.append(values["notification_id"])
+
+    monkeypatch.setattr(wake, "_default_wake", launch)
+    for name in legacy.DEVIN_WAKE_LOCKS:
+        with (state / name).open("a") as legacy_dispatcher:
+            fcntl.flock(legacy_dispatcher, fcntl.LOCK_EX)
+            with pytest.raises(wake.WakeDeferred, match="legacy Devin dispatcher"):
+                wake.wake_one(store, *route, commands={})
+            attempts, = wake.list_attempts(store, project)
+            assert (attempts["attempts"], attempts["state"]) == (0, "retryable")
+    assert wake.wake_one(store, *route, commands={}) == {"id": item["id"], "status": "sent"}
+    assert launched == [item["id"]]
+    with sqlite3.connect(state / "mailbox.sqlite3") as db:
+        assert db.execute("SELECT body FROM messages").fetchall() == [("untouched legacy payload",)]
+
+
 def test_store_uses_legacy_authority_and_keeps_mailboxes_separate(tmp_path):
     cfg, state, roles = legacy_fixture(tmp_path)
     store = config.open_store(cfg)

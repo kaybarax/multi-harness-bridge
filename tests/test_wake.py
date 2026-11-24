@@ -92,7 +92,7 @@ def test_uncertain_wake_is_not_retried(tmp_path, monkeypatch):
     assert calls == [1]
 
 
-def test_wake_ledger_makes_uncertain_permanent(tmp_path):
+def test_wake_ledger_holds_a_fresh_uncertain_attempt(tmp_path):
     db = wake._ledger(tmp_path / "store.sqlite")
     item = {"id": str(uuid.uuid4())}
     try:
@@ -104,7 +104,7 @@ def test_wake_ledger_makes_uncertain_permanent(tmp_path):
         db.close()
 
 
-def test_explicit_host_rejection_retries_at_most_three_times(tmp_path, monkeypatch):
+def test_explicit_host_rejection_retries_with_backoff_and_no_attempt_cap(tmp_path, monkeypatch):
     store = FakeStore(tmp_path / "store.sqlite")
     calls = []
     monkeypatch.setattr(wake, "_verify", lambda *_: None)
@@ -112,15 +112,19 @@ def test_explicit_host_rejection_retries_at_most_three_times(tmp_path, monkeypat
         calls.append(1)
         raise wake.WakeRejected("not accepted")
     monkeypatch.setattr(wake, "_launch", reject)
+    now = [time.time()]
+    monkeypatch.setattr(wake.time, "time", lambda: now[0])
     entry = {"verify": ["fake-verify"], "wake": ["fake-wake"]}
-    for _ in range(3):
+    for attempt in range(5):
         with pytest.raises(wake.WakeRejected):
             wake.wake_one(store, "sample", "codex", "inbox", "native-session-1",
                           commands={"codex": entry})
-    result = wake.wake_one(store, "sample", "codex", "inbox", "native-session-1",
-                           commands={"codex": entry})
-    assert result["status"] == "retryable"
-    assert calls == [1, 1, 1]
+        now[0] += min(wake.RETRY_MAX_SECONDS,
+                      wake.RETRY_BASE_SECONDS * 2 ** min(attempt, 5))
+    with pytest.raises(wake.WakeRejected):
+        wake.wake_one(store, "sample", "codex", "inbox", "native-session-1",
+                      commands={"codex": entry})
+    assert len(calls) == 6
 
 
 def test_safe_defer_refunds_attempt_budget(tmp_path, monkeypatch):
@@ -156,6 +160,7 @@ def test_wake_skips_held_predecessors_without_resending_them(tmp_path, monkeypat
         with db:
             db.execute("UPDATE mhb_wake_attempts SET state=?, attempts=?", (state, attempts))
             if state == "retryable":
+                db.execute("UPDATE mhb_wake_attempts SET updated_at=?", (time.time() - 120,))
                 db.execute("DELETE FROM mhb_wake_sessions")
             else:
                 db.execute("UPDATE mhb_wake_sessions SET state=?", (state,))
@@ -174,14 +179,11 @@ def test_wake_skips_held_predecessors_without_resending_them(tmp_path, monkeypat
         assert first_result == {"id": next_id, "status": "held", "reason": "session-busy"}
         assert calls == []
     else:
-        assert first_result == {"id": next_id, "status": "sent"}
-        assert calls == [next_id]
+        assert first_result == {"id": older["id"], "status": "sent"}
+        assert calls == [older["id"]]
     assert store.pending(*route)["id"] == older["id"]
-    if state in {"sent", "uncertain"}:
-        assert wake.wake_one(store, *route, commands={}) == {
-            "id": next_id, "status": "held", "reason": "session-busy"}
-    else:
-        assert wake.wake_one(store, *route, commands={}) == {"id": older["id"], "status": state}
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": next_id, "status": "held", "reason": "session-busy"}
 
 
 def _fake_devin(tmp_path, monkeypatch, *, refuse_args=False, eof=False, minimal=False):
@@ -218,7 +220,12 @@ for line in sys.stdin:
  with open(os.environ['MHB_CAPTURE'],'a') as capture: capture.write(json.dumps(request)+'\\n')
  method=request['method']
  if method=='initialize': result={'agentCapabilities':{'loadSession':True}}
- elif method=='session/load': result={}
+ elif method=='session/load':
+  if os.environ.get('MHB_FAKE_LOCKED')=='1':
+   print(json.dumps({'jsonrpc':'2.0','id':request['id'],'error':{
+      'code':-32000,'data':{'cognition.ai/errorKind':'session_locked'}}}),flush=True)
+   continue
+  result={}
  elif method=='session/prompt':
   if os.environ.get('MHB_FAKE_EOF')=='1': sys.exit(0)
   call={'sessionUpdate':'tool_call','toolCallId':'call-1'}
@@ -316,6 +323,21 @@ def test_devin_acp_eof_after_prompt_is_uncertain(tmp_path, monkeypatch):
     with pytest.raises(TimeoutError, match="uncertain"):
         devin_acp.wake("sample", "coordinator", session, notification_id,
                        workspace, native_db=native_db)
+
+
+def test_devin_acp_session_lock_defers_before_prompt_then_resumes_same_session(tmp_path, monkeypatch):
+    import json
+
+    session, workspace, notification_id, native_db, capture = _fake_devin(tmp_path, monkeypatch)
+    monkeypatch.setenv("MHB_FAKE_LOCKED", "1")
+    with pytest.raises(wake.WakeDeferred, match="session_locked"):
+        devin_acp.wake("sample", "coordinator", session, notification_id,
+                       workspace, native_db=native_db)
+    calls = [json.loads(line) for line in capture.read_text().splitlines()]
+    assert [call["method"] for call in calls] == ["initialize", "session/load"]
+    monkeypatch.delenv("MHB_FAKE_LOCKED")
+    assert devin_acp.wake("sample", "coordinator", session, notification_id,
+                          workspace, native_db=native_db)["stopReason"] == "end_turn"
 
 
 def test_devin_routed_finish_permission_requires_a_persisted_pickup(tmp_path, monkeypatch):
@@ -431,12 +453,13 @@ def test_reconcile_requires_one_unresolved_nonactive_attempt(tmp_path):
     with db:
         db.execute("""INSERT INTO mhb_wake_attempts
             (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
-            VALUES(?,?,?,?,?,'uncertain',1,?,?)""",
+            VALUES(?,?,?,?,?,'uncertain',7,?,?)""",
             (item_id, "sample", "devin", "coordinator", "session-a", now, now))
     db.close()
     assert wake.reconcile(store, "sample", item_id, "not-sent")["status"] == "retryable"
     db = wake._ledger(store.path)
     with db:
+        assert db.execute("SELECT attempts FROM mhb_wake_attempts").fetchone()[0] == 7
         db.execute("UPDATE mhb_wake_attempts SET state='uncertain' WHERE notification_id=?", (item_id,))
         db.execute("""INSERT INTO mhb_wake_attempts
             (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
@@ -463,7 +486,7 @@ def test_reconcile_refuses_active_wake_and_recovers_stale_sending(tmp_path):
     db = wake._ledger(store.path)
     with db:
         db.execute("UPDATE mhb_wake_attempts SET updated_at=? WHERE notification_id=?",
-                   (now - wake.MAX_COMMAND_TIMEOUT - 20, item_id))
+                   (now - wake.STALE_WAKE_SECONDS - 1, item_id))
     db.close()
     assert wake.reconcile(store, "sample", item_id, "not-sent")["status"] == "retryable"
 
@@ -644,6 +667,104 @@ def test_expired_lease_does_not_release_wake_lane_without_exact_recovery(tmp_pat
             WHERE notification_id=?""", (first["id"],)).fetchone() == ("sent", "renotify")
     assert wake.wake_one(store, *route, commands={}) == {"id": first["id"], "status": "sent"}
     assert calls == [first["id"], first["id"]]
+
+
+@pytest.mark.parametrize("state,lane_state", [
+    ("sending", "sending"), ("uncertain", "uncertain"), ("sent", "sent"),
+    ("sent", "claimed"), ("sent", None),
+])
+def test_stale_wake_retries_exact_still_pending_message(tmp_path, monkeypatch, state, lane_state):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    message = store.send("sample", "codex", "codex", "needs pickup", "same")
+    db = wake._ledger(store.path)
+    try:
+        assert wake._reserve(db, message, *route)[0]
+        missed = store.claim(*route, message_id=message["id"]) if lane_state == "claimed" else None
+        with db:
+            old = time.time() - wake.STALE_WAKE_SECONDS - 1
+            db.execute("UPDATE mhb_wake_attempts SET state=?,updated_at=?", (state, old))
+            if lane_state is None:
+                db.execute("DELETE FROM mhb_wake_sessions")
+            else:
+                db.execute("UPDATE mhb_wake_sessions SET state=?,updated_at=?", (lane_state, old))
+            if missed:
+                db.execute("UPDATE messages SET deadline=? WHERE id=?", (old, message["id"]))
+    finally:
+        db.close()
+
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    assert wake.wake_one(store, *route, commands={}) == {"id": message["id"], "status": "sent"}
+    assert calls == [message["id"]]
+    claim = store.claim(*route, message_id=message["id"])
+    assert claim and store.claim(*route, message_id=message["id"]) is None
+    if missed:
+        assert not store.finish(*route, message["id"], missed["lease"])
+    assert store.finish(*route, message["id"], claim["lease"])
+    assert not store.finish(*route, message["id"], claim["lease"])
+    report, = wake.list_attempts(store, "sample")
+    assert report["automatic_retries"] == 1
+    assert report["lane_state"] == "cooldown"
+    assert report["queue_stage"] == "coordinator"
+    assert report["retry_eligible_at"] is None
+
+
+def test_late_finalizer_cannot_rewrite_a_replacement_attempt_or_lane(tmp_path):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "devin", "inbox", "devin-inbox")
+    store.bind("sample", "devin", "inbox", "devin-inbox")
+    store.bind("sample", "devin", "coordinator", "devin-coordinator")
+    message = store.send("sample", "codex", "devin", "Pending wake", "message")
+    db = wake._ledger(store.path)
+    try:
+        before, _, _ = wake._reserve(db, message, *route, store=store)
+        with db:
+            old = time.time() - wake.STALE_WAKE_SECONDS - 1
+            db.execute("UPDATE mhb_wake_attempts SET updated_at=?", (old,))
+            db.execute("UPDATE mhb_wake_sessions SET updated_at=?", (old,))
+        replacement, _, _ = wake._reserve(db, message, *route, store=store)
+        assert replacement > before
+        with db:
+            wake._finalize_attempt(db, message["id"], *route, before, "retryable", True)
+            assert tuple(db.execute("SELECT state,attempts,started_at FROM mhb_wake_attempts").fetchone()) == (
+                "sending", 2, replacement)
+            assert tuple(db.execute("SELECT state,updated_at FROM mhb_wake_sessions").fetchone()) == (
+                "sending", replacement)
+    finally:
+        db.close()
+
+
+def test_stale_uncertain_lane_keeps_active_claimed_message_busy(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    route = ("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "inbox", "codex-inbox")
+    store.bind("sample", "codex", "coordinator", "codex-coordinator")
+    message = store.send("sample", "codex", "codex", "needs pickup", "same")
+    db = wake._ledger(store.path)
+    try:
+        assert wake._reserve(db, message, *route)[0]
+        with db:
+            old = time.time() - wake.STALE_WAKE_SECONDS - 1
+            db.execute("UPDATE mhb_wake_attempts SET state='uncertain',updated_at=?", (old,))
+            db.execute("UPDATE mhb_wake_sessions SET state='uncertain',updated_at=?", (old,))
+    finally:
+        db.close()
+    store.send("sample", "codex", "codex", "second", "second")
+    assert store.claim(*route, message_id=message["id"])
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda *_args, **_kwargs: calls.append("unexpected"))
+    pending = store.pending(*route, for_wake=True)
+    ledger = wake._ledger(store.path)
+    try:
+        assert not wake._reserve(ledger, pending, *route, store=store)[0]
+    finally:
+        ledger.close()
+    assert calls == []
 
 
 def test_renotify_rechecks_pending_inside_transaction_and_preserves_finish_lane(tmp_path, monkeypatch):
@@ -865,7 +986,7 @@ def test_stale_lane_reconciliation_uses_active_server_role_wrapper(tmp_path, mon
     assert lane == (old["id"], "cooldown")
 
 
-def test_uncertain_completed_legacy_wake_is_never_auto_reconciled_or_resent(tmp_path, monkeypatch):
+def test_stale_uncertain_completed_legacy_wake_releases_lane_without_resending(tmp_path, monkeypatch):
     store = Store(tmp_path / "bridge.sqlite3")
     for harness in ("codex", "devin"):
         store.bind("sample", harness, "inbox", f"{harness}-inbox")
@@ -915,6 +1036,13 @@ def test_uncertain_completed_legacy_wake_is_never_auto_reconciled_or_resent(tmp_
     assert lane == (old["id"], "uncertain")
     assert attempt == ("uncertain",)
     assert calls == []
+    with sqlite3.connect(store.path) as db:
+        aged = time.time() - wake.STALE_WAKE_SECONDS - 1
+        db.execute("UPDATE mhb_wake_sessions SET updated_at=? WHERE notification_id=?", (aged, old["id"]))
+        db.execute("UPDATE mhb_wake_attempts SET updated_at=? WHERE notification_id=?", (aged, old["id"]))
+    assert wake.wake_one(store, *route, commands={})["status"] == "held"
+    assert wake.wake_one(store, *route, commands={}) == {"id": fresh["id"], "status": "sent"}
+    assert calls == [fresh["id"]]
 
 
 def test_legacy_sent_backlog_does_not_resend_or_block_new_stage_work(tmp_path, monkeypatch):

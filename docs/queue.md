@@ -80,8 +80,8 @@ The store uses SQLite WAL mode, full synchronous commits, transactions, and a
 schema version guard. At startup, a recognized portable database in another
 journal mode is switched back to WAL. Each Store connection has a ten-second
 busy timeout. Write operations serialize across threads and processes.
-Leases retry expired queue work. The native wake adapter separately records
-successful and uncertain external delivery attempts; an uncertain external
-send is never repeated automatically, while the queue record remains
-claimable and can be reconciled by its assistant. Keep the database on a
+Leases let the bound receiver reclaim expired queue work. The native wake
+dispatcher records attempts separately and can retry a stale ID-only notice
+when its exact queue stage remains pending and unleased. A current lease is
+required to advance a queue stage. Keep the database on a
 filesystem that supports SQLite locking semantics.
