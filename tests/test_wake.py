@@ -735,6 +735,188 @@ def test_fast_native_claim_and_finish_preserve_cooldown_lane(tmp_path, monkeypat
         "id": second["id"], "status": "held", "reason": "session-busy"}
 
 
+def test_legacy_store_completion_reconciles_inbox_and_coordinator_lanes(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    for harness in ("codex", "devin"):
+        store.bind("sample", harness, "inbox", f"{harness}-inbox")
+        store.bind("sample", harness, "coordinator", f"{harness}-coordinator")
+    inbox_route = ("sample", "devin", "inbox", "devin-inbox")
+    coordinator_route = ("sample", "devin", "coordinator", "devin-coordinator")
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 30)
+
+    def old_store_finish(message_id, role, current_stage, next_stage):
+        # Reproduce a previously loaded MCP Store: it advances the authoritative
+        # message row and triggers delivery_events without touching wake lanes.
+        with sqlite3.connect(store.path) as db:
+            db.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            changed = db.execute("""UPDATE messages SET attempts=attempts+1,
+                lease='legacy-lease',lease_role=?,lease_session=?,deadline=?,updated=?
+                WHERE id=? AND stage=?""",
+                (role, f"devin-{role}", now + 30, now, message_id, current_stage)).rowcount
+            assert changed == 1
+            db.execute("""UPDATE messages SET stage=?,lease=NULL,lease_role=NULL,
+                lease_session=NULL,deadline=NULL,updated=? WHERE id=? AND lease='legacy-lease'""",
+                (next_stage, time.time(), message_id))
+
+    old = store.send("sample", "codex", "devin", "old", "old")
+    assert wake.wake_one(store, *inbox_route, commands={}) == {"id": old["id"], "status": "sent"}
+    old_store_finish(old["id"], "inbox", "inbox", "coordinator")
+    assert wake.wake_one(store, *coordinator_route, commands={}) == {"id": old["id"], "status": "sent"}
+    old_store_finish(old["id"], "coordinator", "coordinator", "done")
+
+    # A live same-route lease keeps the stale inbox lane held even though its
+    # own message has advanced. Once that lease finishes, reconciliation ages
+    # the old lane and starts a fresh cooldown.
+    busy = store.send("sample", "codex", "devin", "busy", "busy")
+    fresh_inbox = store.send("sample", "codex", "devin", "fresh inbox", "fresh-inbox")
+    active = store.claim(*inbox_route, message_id=busy["id"])
+    assert wake.wake_one(store, *inbox_route, commands={}) == {
+        "id": fresh_inbox["id"], "status": "held", "reason": "session-busy"}
+    assert store.finish(*inbox_route, busy["id"], active["lease"])
+    assert wake.wake_one(store, *inbox_route, commands={}) == {
+        "id": fresh_inbox["id"], "status": "held", "reason": "session-busy"}
+    with sqlite3.connect(store.path) as db:
+        lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+            WHERE project='sample' AND harness='devin' AND role='inbox'""").fetchone()
+    assert lane == (old["id"], "cooldown")
+    with sqlite3.connect(store.path) as db:
+        db.execute("""UPDATE mhb_wake_sessions SET updated_at=?
+            WHERE project='sample' AND harness='devin' AND role='inbox'""",
+            (time.time() - wake.TURN_COOLDOWN_SECONDS - 1,))
+    assert wake.wake_one(store, *inbox_route, commands={}) == {
+        "id": fresh_inbox["id"], "status": "sent"}
+
+    busy_coordinator = store.claim(*coordinator_route, message_id=busy["id"])
+    assert store.finish(*coordinator_route, busy["id"], busy_coordinator["lease"])
+    fresh_coordinator = store.send("sample", "codex", "devin", "fresh coordinator", "fresh-coordinator")
+    old_store_finish(fresh_coordinator["id"], "inbox", "inbox", "coordinator")
+    assert wake.wake_one(store, *coordinator_route, commands={}) == {
+        "id": fresh_coordinator["id"], "status": "held", "reason": "session-busy"}
+    with sqlite3.connect(store.path) as db:
+        stage = db.execute("SELECT stage FROM messages WHERE id=?", (old["id"],)).fetchone()
+        attempt = db.execute("""SELECT state FROM mhb_wake_attempts
+            WHERE notification_id=? AND harness='devin' AND role='coordinator'""",
+            (old["id"],)).fetchone()
+        db.execute("""UPDATE mhb_wake_sessions SET updated_at=?
+            WHERE project='sample' AND harness='devin' AND role='coordinator'""",
+            (time.time() - wake.TURN_COOLDOWN_SECONDS - 1,))
+    assert stage == ("done",)
+    assert attempt == ("sent",)
+    assert wake.wake_one(store, *coordinator_route, commands={}) == {
+        "id": fresh_coordinator["id"], "status": "sent"}
+    assert calls == [old["id"], old["id"], fresh_inbox["id"], fresh_coordinator["id"]]
+
+
+def test_stale_lane_reconciliation_uses_active_server_role_wrapper(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    base = Store(tmp_path / "bridge.sqlite3")
+    base.bind("sample", "codex", "inbox", "codex-inbox")
+    base.bind("sample", "codex", "coordinator", "codex-coordinator")
+    base.bind("sample", "devin", "inbox", "devin-inbox")
+    base.bind("sample", "devin", "coordinator", "devin-coordinator")
+    old = base.send("sample", "codex", "devin", "old", "old")
+    route = ("sample", "devin", "inbox", "devin-inbox")
+    monkeypatch.setattr(wake, "_default_wake", lambda *_args, **_kwargs: None)
+    assert wake.wake_one(base, *route, commands={}) == {"id": old["id"], "status": "sent"}
+    with sqlite3.connect(base.path) as db:
+        now = time.time()
+        db.execute("""UPDATE messages SET attempts=attempts+1,lease='legacy',lease_role='inbox',
+            lease_session='devin-inbox',deadline=?,updated=? WHERE id=?""",
+            (now + 30, now, old["id"]))
+        db.execute("""UPDATE messages SET stage='coordinator',lease=NULL,lease_role=NULL,
+            lease_session=NULL,deadline=NULL,updated=? WHERE id=?""", (time.time(), old["id"]))
+    fresh = base.send("sample", "codex", "devin", "fresh", "fresh")
+
+    class Provider:
+        guarded = False
+
+        def handles(self, project, harness):
+            return project == "sample" and harness == "devin"
+
+        @contextmanager
+        def guard(self, project):
+            assert not self.guarded
+            self.guarded = True
+            try:
+                yield
+            finally:
+                self.guarded = False
+
+        def roles(self, project, harness):
+            assert self.guarded
+            return {"inbox": "devin-inbox", "coordinator": "devin-coordinator"}
+
+        def enabled(self, project, harness):
+            assert self.guarded
+            return True
+
+    wrapped = Store(base.path, bindings_provider=Provider())
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 60)
+    result = wake.wake_one(wrapped, *route, commands={})
+    assert result == {"id": fresh["id"], "status": "held", "reason": "session-busy"}
+    with sqlite3.connect(base.path) as db:
+        lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+            WHERE project='sample' AND harness='devin' AND role='inbox'""").fetchone()
+    assert lane == (old["id"], "cooldown")
+
+
+def test_uncertain_completed_legacy_wake_is_never_auto_reconciled_or_resent(tmp_path, monkeypatch):
+    store = Store(tmp_path / "bridge.sqlite3")
+    for harness in ("codex", "devin"):
+        store.bind("sample", harness, "inbox", f"{harness}-inbox")
+        store.bind("sample", harness, "coordinator", f"{harness}-coordinator")
+    old = store.send("sample", "codex", "devin", "old", "old")
+    route = ("sample", "devin", "coordinator", "devin-coordinator")
+    calls = []
+    monkeypatch.setattr(wake, "_default_wake",
+                        lambda _harness, values, *, before_prompt: calls.append(values["notification_id"]))
+    db = wake._ledger(store.path)
+    db.close()
+    with sqlite3.connect(store.path) as db:
+        now = time.time()
+        db.execute("""INSERT INTO mhb_wake_attempts
+            (notification_id,project,harness,role,session,state,attempts,started_at,updated_at)
+            VALUES(?,?,?,?,?,'uncertain',1,?,?)""",
+            (old["id"], "sample", "devin", "coordinator", "devin-coordinator", now, now))
+        db.execute("""INSERT INTO mhb_wake_sessions
+            (project,harness,role,session,notification_id,state,updated_at)
+            VALUES('sample','devin','coordinator','devin-coordinator',?,'uncertain',?)""",
+            (old["id"], now))
+    with sqlite3.connect(store.path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        now = time.time()
+        db.execute("""UPDATE messages SET attempts=attempts+1,lease='legacy',lease_role='inbox',
+            lease_session='devin-inbox',deadline=?,updated=? WHERE id=?""",
+            (now + 30, now, old["id"]))
+        db.execute("""UPDATE messages SET stage='coordinator',lease=NULL,lease_role=NULL,
+            lease_session=NULL,deadline=NULL,updated=? WHERE id=?""", (time.time(), old["id"]))
+        db.execute("""UPDATE messages SET attempts=attempts+1,lease='legacy',lease_role='coordinator',
+            lease_session='devin-coordinator',deadline=?,updated=? WHERE id=?""",
+            (now + 30, time.time(), old["id"]))
+        db.execute("""UPDATE messages SET stage='done',lease=NULL,lease_role=NULL,
+            lease_session=NULL,deadline=NULL,updated=? WHERE id=?""", (time.time(), old["id"]))
+    fresh = store.send("sample", "codex", "devin", "fresh", "fresh")
+    with sqlite3.connect(store.path) as db:
+        db.execute("""UPDATE messages SET stage='coordinator',updated=? WHERE id=?""",
+                   (time.time(), fresh["id"]))
+    monkeypatch.setattr(wake, "TURN_COOLDOWN_SECONDS", 0)
+    assert wake.wake_one(store, *route, commands={}) == {
+        "id": fresh["id"], "status": "held", "reason": "session-busy"}
+    with sqlite3.connect(store.path) as db:
+        lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
+            WHERE project='sample' AND harness='devin' AND role='coordinator'""").fetchone()
+        attempt = db.execute("SELECT state FROM mhb_wake_attempts WHERE notification_id=?",
+                             (old["id"],)).fetchone()
+    assert lane == (old["id"], "uncertain")
+    assert attempt == ("uncertain",)
+    assert calls == []
+
+
 def test_legacy_sent_backlog_does_not_resend_or_block_new_stage_work(tmp_path, monkeypatch):
     store = Store(tmp_path / "bridge.sqlite3")
     route = ("sample", "codex", "inbox", "codex-inbox")
