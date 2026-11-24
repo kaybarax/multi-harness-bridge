@@ -229,7 +229,50 @@ def _ledger(db_path):
     return db
 
 
-def _reserve(db, item, project, harness, role, session):
+def _reconcile_completed_lane(db, store, project, harness, role, session, lane, now):
+    """Age a sent lane only after its exact message has left this role's route.
+
+    Older native MCP servers update the authoritative queue row but do not know
+    about ``mhb_wake_sessions``. The exact message stage is therefore the
+    completion signal; any live lease for this bound role still keeps the lane
+    occupied. Uncertain and currently pending notifications remain untouched.
+    """
+    if not store or lane[1] != "sent":
+        return lane
+    db.row_factory = sqlite3.Row
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='messages'").fetchone():
+        return lane
+    if hasattr(store, "_roles"):
+        with store._route_guard(project):
+            roles = store._roles(db, project, harness)
+            enabled = store._enabled(db, project, harness)
+    else:
+        roles = store.roles(project, harness)
+        enabled = store.status(project, harness).get("enabled")
+    if roles.get(role) != session or not enabled:
+        return lane
+    stages = ("outbound", "inbox") if role == "inbox" else ("coordinator",)
+    row = db.execute("""SELECT pickup_harness,stage FROM messages
+        WHERE project=? AND id=?""", (project, lane[0])).fetchone()
+    if not row or (row["pickup_harness"] == harness and row["stage"] in stages):
+        return lane
+    active = db.execute("""SELECT 1 FROM messages WHERE project=? AND pickup_harness=?
+        AND lease_role=? AND lease_session=? AND lease IS NOT NULL AND deadline>?
+        LIMIT 1""", (project, harness, role, session, now)).fetchone()
+    if active:
+        return lane
+    changed = db.execute("""UPDATE mhb_wake_sessions SET state='cooldown',updated_at=?
+        WHERE project=? AND harness=? AND role=? AND session=? AND notification_id=?
+        AND state='sent' AND updated_at=?""",
+        (now, project, harness, role, session, lane[0], lane[2])).rowcount
+    if changed != 1:
+        return db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
+            WHERE project=? AND harness=? AND role=? AND session=?""",
+            (project, harness, role, session)).fetchone()
+    return (lane[0], "cooldown", now)
+
+
+def _reserve(db, item, project, harness, role, session, *, store=None):
     notification_id = item.get("id")
     if not isinstance(notification_id, str):
         raise WakeError("Pending notification has no stable id")
@@ -242,6 +285,8 @@ def _reserve(db, item, project, harness, role, session):
     lane = db.execute("""SELECT notification_id,state,updated_at FROM mhb_wake_sessions
         WHERE project=? AND harness=? AND role=? AND session=?""",
         (project, harness, role, session)).fetchone()
+    if lane:
+        lane = _reconcile_completed_lane(db, store, project, harness, role, session, lane, now)
     if lane:
         if lane[0] == notification_id and lane[1] != "cooldown":
             db.commit()
@@ -340,7 +385,7 @@ def reserve_agent_relay(store, project, harness, role, session, notification_id)
     db = _ledger(store.path)
     try:
         reserved, _, reason = _reserve(db, {"id": notification_id}, project,
-                                       harness, role, session)
+                                       harness, role, session, store=store)
         return reserved, reason
     finally:
         db.close()
@@ -469,7 +514,8 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     refund_attempt = False
     notification_id = item.get("id")
     try:
-        reserved, notification_id, reserve_reason = _reserve(db, item, project, harness, role, session)
+        reserved, notification_id, reserve_reason = _reserve(
+            db, item, project, harness, role, session, store=store)
         if not reserved:
             if reserve_reason == "session-busy":
                 return {"id": notification_id, "status": "held", "reason": "session-busy"}
