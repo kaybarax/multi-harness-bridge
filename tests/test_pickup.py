@@ -52,11 +52,15 @@ def test_forward_pull_moves_both_inbox_stages_without_a_lease(tmp_path):
     store = _store(tmp_path)
     request = store.send_fanout("sample", "codex", ["devin"], "hello", "req", session="codex-coordinator")
     delivery = request["deliveries"][0]["id"]
-    assert store.forward_pull("sample", "codex") == [{"id": delivery, "stage": "inbox"}]
-    assert store.forward_pull("sample", "devin") == [{"id": delivery, "stage": "coordinator"}]
+    assert store.forward_pull("sample", "codex") == [
+        {"id": delivery, "stage": "inbox", "by": "watcher", "on_behalf_of": "codex-inbox"}]
+    assert store.forward_pull("sample", "devin")[0]["stage"] == "coordinator"
     trace = store.trace("sample", delivery)
     assert trace["stage"] == "coordinator" and trace["attempts"] == 0
     assert [e["event"] for e in trace["events"]] == ["enqueued", "routed", "forwarded"]
+    # The audit tells script forwarding apart from a chat's claim and finish.
+    assert [(f["from_stage"], f["actor"], f["on_behalf_of"]) for f in trace["forwarded_by"]] == [
+        ("outbound", "watcher", "codex-inbox"), ("inbox", "watcher", "devin-inbox")]
     # A bridge handover is never blocked: no lease is held.
     store.bind("sample", "devin", "inbox", "devin-inbox-2")
 
@@ -307,3 +311,34 @@ def test_pickup_command_is_the_attachment_point_for_external_role_tools(tmp_path
     assert report["session"] == "chat-1" and report["coordinator_pickup"] == "pull"
     assert report["listener"]["command"].endswith("listen sample claude coordinator chat-1")
     assert report["watcher"]["status"] == "stopped"
+
+
+def test_interrupted_codex_thread_is_paused_not_cold(tmp_path):
+    home = tmp_path / "codex"
+    (home / "sessions").mkdir(parents=True)
+    transcript = home / "sessions" / "t.jsonl"
+    transcript.write_text('{"type":"task_complete"}\n{"text":"<turn_aborted> interrupted"}\n')
+    os.utime(transcript, (time.time() - 600, time.time() - 600))
+    with sqlite3.connect(home / "state_5.sqlite") as db:
+        db.execute("CREATE TABLE threads(id TEXT, rollout_path TEXT)")
+        db.execute("INSERT INTO threads VALUES('thread',?)", (str(transcript),))
+    check = pickup.CodexPickup(codex_home=home).check("thread", "abc", 60)
+    assert check.state == "paused" and check.conditions["queue_paused"] is True
+    assert check.conditions["hint_in_transcript"] is False and check.conditions["idle_seconds"] >= 600
+
+
+def test_fallback_logs_every_condition_and_reports_an_open_that_did_not_deliver(tmp_path, fake_codex):
+    store = _store(tmp_path)
+    message_id = _at_coordinator(store, "devin", "codex")
+    wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+    _aged_attempt(store, message_id, 400)
+    wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+    opened = [e for e in wake.pickup_events(store, "sample") if e["event"] == "fallback-open"]
+    detail = json.loads(opened[0]["detail"])
+    assert detail["unclaimed"] is True and detail["seconds_at_coordinator_stage"] >= 400
+    with sqlite3.connect(store.path) as db:
+        db.execute("UPDATE mhb_pickup_events SET at=at-400 WHERE event='fallback-open'")
+    _aged_attempt(store, message_id, 400)
+    wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+    assert [e["event"] for e in wake.pickup_events(store, "sample", since=-1e12)][-1] == "fallback-undelivered"
+    assert _FakeCodex.opened == ["codex-coordinator"]

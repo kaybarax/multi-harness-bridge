@@ -513,21 +513,29 @@ def _pull_decision(store, project, harness, role, session, item, attempt):
     if check.state == "consumed":
         return "nudge", None
     route = (project, harness, role, session)
+    age = time.time() - float(item.get("updated") or 0)
+    record = json.dumps({"detail": check.detail, "unclaimed": True,
+                         "seconds_at_coordinator_stage": round(age, 1),
+                         **(check.conditions or {})}, sort_keys=True)
     with closing(_ledger(store.path)) as db:
-        opened = db.execute("""SELECT 1 FROM mhb_pickup_events WHERE project=? AND harness=? AND role=?
+        opened = db.execute("""SELECT at FROM mhb_pickup_events WHERE project=? AND harness=? AND role=?
             AND session=? AND notification_id=? AND event='fallback-open' LIMIT 1""",
             (*route, item["id"])).fetchone()
-        age = time.time() - float(item.get("updated") or 0)
         if (check.state == "cold" and not opened and opts["fallback_open"] == "after_wait"
                 and age >= opts["fallback_grace_seconds"]):
-            return "fallback", check.detail
+            return "fallback", record
+        if opened and time.time() - opened[0] >= opts["fallback_grace_seconds"]:
+            event = "fallback-undelivered"  # opened once; the chat still did not take the hint
+        elif check.state == "unknown":
+            event = "fallback-unavailable"
+        else:
+            event = "held-" + check.state
         last = db.execute("""SELECT event FROM mhb_pickup_events WHERE project=? AND harness=?
             AND role=? AND session=? AND notification_id=? ORDER BY at DESC LIMIT 1""",
             (*route, item["id"])).fetchone()
-        event = "fallback-unavailable" if check.state == "unknown" else "held-" + check.state
         if not last or last[0] != event:
             with db:
-                _pickup_event(db, route, item["id"], event, check.detail)
+                _pickup_event(db, route, item["id"], event, record)
     return "hold", f"pull-{check.state}"
 
 

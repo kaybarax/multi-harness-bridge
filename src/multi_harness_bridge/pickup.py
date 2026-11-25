@@ -81,9 +81,14 @@ def is_pull(root, project, harness) -> bool:
 
 @dataclass(frozen=True)
 class ColdCheck:
-    """What an adapter can prove about a hinted chat."""
-    state: str          # "consumed", "busy", "cold" or "unknown"
+    """What an adapter can prove about a hinted chat.
+
+    ``state`` is "consumed", "busy", "cold", "paused" or "unknown";
+    ``conditions`` carries the value of every test behind it, for the log.
+    """
+    state: str
     detail: str = ""
+    conditions: dict | None = None
 
 
 class CoordinatorPickup:
@@ -149,7 +154,9 @@ class CodexPickup(CoordinatorPickup):
     def check(self, session, notification_id, grace_seconds) -> ColdCheck:
         """Read the thread transcript: did the queued hint arrive, and is the thread active?
 
-        Any failure to read means "unknown", which never opens a chat.
+        Any failure to read means "unknown", which never opens a chat. A thread
+        whose last turn was interrupted keeps its queue paused until someone
+        resumes it in the app; opening it would not help, so that is "paused".
         """
         try:
             path = self._rollout(session)
@@ -157,14 +164,23 @@ class CodexPickup(CoordinatorPickup):
             size = stat.st_size
             with path.open("rb") as stream:
                 stream.seek(max(0, size - 1024 * 1024))
-                consumed = notification_id.encode() in stream.read()
+                tail = stream.read()
         except (OSError, ValueError, sqlite3.Error) as exc:
-            return ColdCheck("unknown", f"transcript unreadable ({type(exc).__name__})")
+            return ColdCheck("unknown", f"transcript unreadable ({type(exc).__name__})",
+                             {"transcript_readable": False})
+        idle = round(time.time() - stat.st_mtime, 1)
+        consumed = notification_id.encode() in tail
+        paused = tail.rfind(b"<turn_aborted>") > tail.rfind(b'"task_complete"')
+        conditions = {"transcript_readable": True, "hint_in_transcript": consumed,
+                      "idle_seconds": idle, "grace_seconds": grace_seconds, "queue_paused": paused}
         if consumed:
-            return ColdCheck("consumed", "hint is in the thread transcript")
-        if time.time() - stat.st_mtime < grace_seconds:
-            return ColdCheck("busy", "thread wrote within the grace window")
-        return ColdCheck("cold", "hint not delivered and thread idle for the grace window")
+            return ColdCheck("consumed", "hint is in the thread transcript", conditions)
+        if paused:
+            return ColdCheck("paused", "the thread's last turn was interrupted; its queue waits for Resume",
+                             conditions)
+        if idle < grace_seconds:
+            return ColdCheck("busy", "thread wrote within the grace window", conditions)
+        return ColdCheck("cold", "hint not delivered and thread idle for the grace window", conditions)
 
     def digest_nudge(self, project, session, seq, previous_seq=None):
         import shutil

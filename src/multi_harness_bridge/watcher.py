@@ -257,6 +257,14 @@ def append_feed(store, project, feed_path, state):
             m.reply_to,m.key,m.body FROM delivery_events e JOIN messages m ON m.id=e.message_id
             WHERE e.rowid>? AND m.project=? ORDER BY e.rowid LIMIT 1000""", (cursor, project)).fetchall()
         top = db.execute("SELECT COALESCE(MAX(rowid),0) FROM delivery_events").fetchone()[0]
+        audited = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='stage_forwards'").fetchone()
+        forwards = {}
+        if audited and rows:
+            ids = sorted({row["id"] for row in rows})
+            marks = ",".join("?" * len(ids))
+            for f in db.execute(f"""SELECT message_id,to_stage,actor FROM stage_forwards
+                    WHERE message_id IN ({marks})""", ids):
+                forwards[(f[0], f[1])] = f[2]
     if rows:
         feed_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(feed_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -267,9 +275,12 @@ def append_feed(store, project, feed_path, state):
                 first_line = (row["body"] or "").strip().splitlines()[0] if (row["body"] or "").strip() else ""
                 kind = ("reply" if row["reply_to"] else
                         "notice" if (row["key"] or "").startswith("mhb-orchestrator-") else "request")
-                out.write(json.dumps({"at": row["at"], "event": row["event"], "id": row["id"],
-                                      "sender": row["sender"], "recipient": row["recipient"],
-                                      "kind": kind, "excerpt": first_line[:FEED_EXCERPT]}) + "\n")
+                entry = {"at": row["at"], "event": row["event"], "id": row["id"],
+                         "sender": row["sender"], "recipient": row["recipient"],
+                         "kind": kind, "excerpt": first_line[:FEED_EXCERPT]}
+                if row["event"] == "routed":
+                    entry["by"] = forwards.get((row["id"], "inbox"), "bridge chat")
+                out.write(json.dumps(entry) + "\n")
         state["feed_rowid"] = rows[-1]["rowid"]
     elif top < cursor:
         state["feed_rowid"] = 0  # a replaced database restarts the feed
@@ -402,13 +413,14 @@ def _alert_command():
     return None
 
 
-def raise_alert(project, key, text, state, *, run=subprocess.run):
+def raise_alert(project, key, text, state, *, run=None):
     """Send one alert per failure episode through the configured alert command."""
     alerts = state.setdefault("alerts", {})
     if alerts.get(key):
         return False
     alerts[key] = time.time()
     argv = _alert_command()
+    run = run or subprocess.run
     if argv:
         try:
             run([part.format_map({"project": project, "text": text}) for part in argv],
@@ -467,6 +479,7 @@ def run_pass(cfg, store, project, state, *, log):
             state["digest"][ready["harness"]]["nudge_seq"] = ready["seq"]
         _nudge_digests(store, project, harnesses, state, log)
         _check_listeners(cfg, store, project, harnesses, state, log)
+        _alert_pickup_events(store, project, state, log)
         _save_state(paths(cfg.root, project)["state"],
                     {k: v for k, v in state.items() if not k.startswith("_")})
 
@@ -506,20 +519,50 @@ def _check_listeners(cfg, store, project, harnesses, state, log):
         port = pickup.adapter(harness)
         if port is None or not port.self_listening:
             continue
-        key = f"listener-{harness}"
+        prefix = f"listener-{harness}-"
         session = store.roles(project, harness).get("coordinator")
+        pending = store.pending_details(project, harness, "coordinator", session) if session else []
+        waiting = {item["id"] for item in pending}
+        for key in [k for k in state.get("alerts", {}) if k.startswith(prefix)]:
+            if key[len(prefix):] not in waiting:
+                clear_alert(key, state)  # handled: the episode for that message is over
         listener = pickup.listener_health(cfg.root, project, harness, stale_seconds=LISTENER_STALE_SECONDS)
         if not session or (listener["attached"] and listener.get("session") == session):
-            clear_alert(key, state)
             continue
-        pending = store.pending_details(project, harness, "coordinator", session)
         grace = pickup.settings(cfg.root, project, harness)["fallback_grace_seconds"]
-        overdue = [item for item in pending if time.time() - float(item.get("updated") or 0) >= grace]
-        if overdue and raise_alert(project, key, (
-                f"The {harness} coordinator listener is not attached and {len(overdue)} message(s) "
-                f"are waiting. Type take coordinator in the {harness} coordinator chat to repair it."),
-                state):
-            log({"event": "fallback-report", "harness": harness, "waiting": len(overdue)})
+        for item in pending:
+            if time.time() - float(item.get("updated") or 0) < grace:
+                continue
+            # One alert per stuck message, never one per pass.
+            if raise_alert(project, prefix + item["id"], (
+                    f"A {harness} message from {item['sender']} ({item['id'][:8]}) has waited over "
+                    f"{grace} s because the {harness} coordinator listener is not attached. Fix: retype "
+                    f"take coordinator in the {harness} coordinator chat."), state):
+                log({"event": "fallback-report", "harness": harness, "id": item["id"]})
+
+
+ALERT_EVENTS = {
+    "held-paused": "its last turn was interrupted, so its queue is paused. Fix: open that chat and press Resume.",
+    "fallback-undelivered": "it was opened once but did not take the hint. Fix: open that chat and check it is idle.",
+    "fallback-unavailable": "the bridge cannot read its state, so it will not open it. Fix: check that chat.",
+}
+
+
+def _alert_pickup_events(store, project, state, log):
+    """Turn new pull-mode problems recorded by the dispatcher into one alert each."""
+    since = float(state.get("pickup_events_at", 0) or 0)
+    try:
+        events = wake.pickup_events(store, project, since)
+    except (OSError, sqlite3.Error):
+        return
+    for event in events:
+        state["pickup_events_at"] = max(float(state.get("pickup_events_at", 0) or 0), event["at"])
+        reason = ALERT_EVENTS.get(event["event"])
+        if reason and raise_alert(project, f"{event['event']}-{event['notification_id']}", (
+                f"A {event['harness']} message ({event['notification_id'][:8]}) is waiting for the "
+                f"{event['harness']} {event['role']} chat: {reason}"), state):
+            log({"event": "alert", "reason": event["event"], "harness": event["harness"],
+                 "id": event["notification_id"]})
 
 
 def main(argv=None):

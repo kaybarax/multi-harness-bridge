@@ -865,7 +865,7 @@ class Store:
         )
         return True
 
-    def forward_pull(self, project, harness, *, limit=100):
+    def forward_pull(self, project, harness, *, limit=100, actor="watcher"):
         """Advance this harness's inbox stages without a model turn.
 
         Used only when the harness collects coordinator mail itself
@@ -873,7 +873,10 @@ class Store:
         this harness move to ``inbox`` and unleased ``inbox`` items addressed to
         it move to ``coordinator``, in one transaction and without a lease, so a
         role handover is never blocked. Both roles must be bound and pickup
-        enabled, as for an inbox claim. Returns the forwarded message IDs.
+        enabled, as for an inbox claim. Each move is recorded in
+        ``stage_forwards`` with the acting process and the inbox session it
+        acted for, so an audit can tell script forwarding from chat forwarding.
+        Returns the forwarded message IDs.
         """
         project, harness = self._name(project, "project"), self._name(harness, "harness")
         with self._route_guard(project), closing(self._connect()) as db, db:
@@ -881,6 +884,7 @@ class Store:
             roles = self._roles(db, project, harness)
             if not all(roles.get(role) for role in ROLES) or not self._enabled(db, project, harness):
                 return []
+            self._ensure_forward_audit(db)
             now = time.time()
             rows = db.execute(
                 """SELECT id,stage FROM messages WHERE project=? AND pickup_harness=?
@@ -894,8 +898,19 @@ class Store:
                     deadline=NULL,updated=? WHERE id=? AND stage=? AND (lease IS NULL OR deadline<=?)""",
                     (next_stage, now, row["id"], row["stage"], now)).rowcount
                 if changed:
-                    moved.append({"id": row["id"], "stage": next_stage})
+                    db.execute("""INSERT INTO stage_forwards(message_id,project,harness,from_stage,to_stage,
+                        actor,on_behalf_of,at) VALUES(?,?,?,?,?,?,?,?)""",
+                        (row["id"], project, harness, row["stage"], next_stage, actor, roles["inbox"], now))
+                    moved.append({"id": row["id"], "stage": next_stage, "by": actor,
+                                  "on_behalf_of": roles["inbox"]})
             return moved
+
+    @staticmethod
+    def _ensure_forward_audit(db):
+        db.execute("""CREATE TABLE IF NOT EXISTS stage_forwards (
+            message_id TEXT NOT NULL, project TEXT NOT NULL, harness TEXT NOT NULL,
+            from_stage TEXT NOT NULL, to_stage TEXT NOT NULL, actor TEXT NOT NULL,
+            on_behalf_of TEXT, at REAL NOT NULL)""")
 
     def status(self, project, harness):
         with self._route_guard(project), closing(self._connect()) as db, db:
@@ -956,7 +971,11 @@ class Store:
                     "events": [dict(event) for event in db.execute(
                         "SELECT at,event,attempt FROM delivery_events WHERE message_id=? ORDER BY rowid", (message_id,))],
                     "replies": [r[0] for r in db.execute(
-                        "SELECT id FROM messages WHERE project=? AND reply_to=? ORDER BY created,id", (project,message_id))]}
+                        "SELECT id FROM messages WHERE project=? AND reply_to=? ORDER BY created,id", (project,message_id))],
+                    "forwarded_by": [dict(f) for f in db.execute(
+                        "SELECT from_stage,to_stage,actor,on_behalf_of,at FROM stage_forwards WHERE message_id=? ORDER BY at",
+                        (message_id,))] if db.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='stage_forwards'").fetchone() else []}
 
     @staticmethod
     def _validate_claim(project, harness, role, session):

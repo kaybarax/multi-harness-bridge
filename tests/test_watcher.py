@@ -136,10 +136,32 @@ def test_missing_listener_with_overdue_mail_alerts_once(tmp_path, monkeypatch):
         db.execute("UPDATE messages SET updated=? WHERE id=?", (time.time() - 999, message["id"]))
     calls = []
     monkeypatch.setattr(watcher, "_alert_command", lambda: ["alert", "{project}", "{text}"])
+    monkeypatch.setattr(watcher.subprocess, "run", lambda argv, **_: calls.append(argv))
     state, logs = {}, []
     for _ in range(2):
         watcher._check_listeners(cfg, store, "sample", ["claude"], state, logs.append)
-    assert [entry["event"] for entry in logs] == ["fallback-report"]
-    watcher.clear_alert("listener-claude", state)
+    assert [entry["event"] for entry in logs] == ["fallback-report"]  # once per message, not per pass
+    assert len(calls) == 1 and "Fix: retype take coordinator" in calls[0][2]
+    calls.clear()
+    claimed = store.claim("sample", "claude", "coordinator", "claude-coordinator")
+    store.finish("sample", "claude", "coordinator", "claude-coordinator", claimed["id"], claimed["lease"])
+    watcher._check_listeners(cfg, store, "sample", ["claude"], state, logs.append)
+    assert not any(k.startswith("listener-claude-") for k in state["alerts"])
     assert watcher.raise_alert("sample", "k", "text", state, run=lambda argv, **_: calls.append(argv))
     assert calls[0][:2] == ["alert", "sample"]
+
+
+def test_dispatcher_problems_become_one_alert_each(tmp_path, monkeypatch):
+    cfg, store = _project(tmp_path, monkeypatch)
+    from multi_harness_bridge import wake
+    route = ("sample", "codex", "coordinator", "codex-coordinator")
+    with __import__("contextlib").closing(wake._ledger(store.path)) as db, db:
+        wake._pickup_event(db, route, "11111111-2222-4333-8444-555555555555", "held-paused", "{}")
+        wake._pickup_event(db, route, "11111111-2222-4333-8444-555555555555", "held-busy", "{}")
+    sent = []
+    monkeypatch.setattr(watcher, "_alert_command", lambda: ["alert", "{text}"])
+    monkeypatch.setattr(watcher.subprocess, "run", lambda argv, **_: sent.append(argv))
+    state, logs = {}, []
+    watcher._alert_pickup_events(store, "sample", state, logs.append)
+    watcher._alert_pickup_events(store, "sample", state, logs.append)
+    assert len(sent) == 1 and "press Resume" in sent[0][1]
