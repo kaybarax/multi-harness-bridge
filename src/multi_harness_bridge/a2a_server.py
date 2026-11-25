@@ -25,7 +25,7 @@ def application(config, port):
         async def execute(self, context, event_queue):
             try:
                 command = json.loads(get_message_text(context.message))
-                result = await asyncio.to_thread(dispatch, config, bearer.get(), command)
+                result = await asyncio.to_thread(dispatch, config, bearer.get(), command, remote=True)
             except (ValueError, TypeError, PermissionError, RuntimeError) as exc:
                 result = {"error": str(exc)}
             await event_queue.enqueue_event(new_text_message(json.dumps(result)))

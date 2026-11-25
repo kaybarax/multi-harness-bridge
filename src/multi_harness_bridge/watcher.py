@@ -520,6 +520,9 @@ def _clear_resolved_alerts(store, project, state):
     for key, value in list(state.get("alerts", {}).items()):
         record = _alert_record(value)
         message_id, harness = record.get("id"), record.get("harness")
+        if record.get("expires_at") and time.time() > float(record["expires_at"]):
+            clear_alert(key, state)
+            continue
         if not message_id:
             continue
         trace = store.trace(project, message_id)
@@ -658,6 +661,26 @@ def _chat_label(harness, role, session, *, with_title=True):
     return f'{label} "{name}"' if name else label
 
 
+def _alert_loop_cap(cfg, project, event, state, log):
+    """One alert per pair per window when wake-started messages hit the loop cap."""
+    try:
+        detail = json.loads(event.get("detail") or "{}")
+    except json.JSONDecodeError:
+        detail = {}
+    sender, recipient = event["harness"], str(detail.get("recipient") or "a peer")
+    window = max(60, int(detail.get("window_seconds") or 1800))
+    limit = detail.get("limit")
+    pair = "-".join(sorted((sender, recipient)))
+    key = f"loop-{pair}-{int(event['at'] // window)}"
+    text = (f"Messages between {pair.replace('-', ' and ')} reached the loop cap ({limit} wake-started "
+            f"messages in {window // 60} minutes). The bridge refuses more from bridge-started turns "
+            "until the window passes. Fix: look at the exchange in both coordinator chats; a turn you "
+            "start there can still send, or raise loop_cap_messages.")
+    if raise_alert(project, key, text, state, harness=sender, root=cfg.root, external_text=text):
+        state["alerts"][key]["expires_at"] = event["at"] + window
+        log({"event": "alert", "reason": "loop-cap", "harness": sender, "pair": pair})
+
+
 def _alert_pickup_events(cfg, store, project, state, log):
     """Turn new pull-mode problems recorded by the dispatcher into one alert each."""
     since = float(state.get("pickup_events_at", 0) or 0)
@@ -667,6 +690,9 @@ def _alert_pickup_events(cfg, store, project, state, log):
         return
     for event in events:
         state["pickup_events_at"] = max(float(state.get("pickup_events_at", 0) or 0), event["at"])
+        if event["event"] == "loop-cap":
+            _alert_loop_cap(cfg, project, event, state, log)
+            continue
         reason = ALERT_EVENTS.get(event["event"])
         if not reason:
             continue

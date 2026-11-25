@@ -129,6 +129,11 @@ def before_tool(cfg, project, event):
         raise PermissionError("Native Desktop conversation and registered project must agree")
     args = dict(call.get("args") or {})
     args.pop("desktop_grant", None)
+    from . import wake_policy
+    kind, woken = wake_policy.classify("antigravity", text=event.get("lastUserInput"))
+    wake_policy.check(cfg.root, project, "antigravity", kind, wake_policy.tool_action(tool, args),
+                      reply_to=args.get("reply_to"), woken=woken)
+    args["_turn"] = kind
     title = None
     orchestrator = False
     request_id = None
@@ -190,6 +195,8 @@ def invoke(cfg, project, tool, grant):
         db.execute("DELETE FROM ag_hook_grant_proofs WHERE digest=?", (fingerprint,))
     session, data, title = row
     args = json.loads(data)
+    from . import wake_policy
+    sent_from = {"origin": wake_policy.origin(args.pop("_turn", wake_policy.UNKNOWN))}
     orchestrator, request_id = (bool(proof[0]), proof[1]) if proof else (False, None)
     store = config.open_store(cfg)
     if tool == "propagate_skills":
@@ -259,13 +266,13 @@ def invoke(cfg, project, tool, grant):
         return {"enabled":store.set_enabled(project,"antigravity",args["enabled"],session=session)}
     if tool == "send_message":
         return store.send(project,"antigravity",args["recipient"],args["body"],args["key"],
-                          reply_to=args.get("reply_to"),session=session)
+                          reply_to=args.get("reply_to"),session=session,**sent_from)
     if tool == "send_fanout":
         return store.send_fanout(project, "antigravity", args["recipients"], args["body"], args["key"],
-                                 session=session)
+                                 session=session, **sent_from)
     if tool == "reply_free_text":
         return store.reply_free_text(project, "antigravity", args["reply_to"], args["body"], args["key"],
-                                     session=session)
+                                     session=session, **sent_from)
     raise ValueError("Unknown operation")
 
 

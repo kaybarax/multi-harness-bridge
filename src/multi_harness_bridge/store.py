@@ -1101,6 +1101,17 @@ class Store:
                 ).fetchall()
             return [dict(row) for row in rows]
 
+    def picked_up(self, project, message_id, harness, session):
+        """True once this coordinator session holds the message's lease, or it is done."""
+        with closing(self._connect()) as db:
+            row = db.execute("""SELECT stage,lease_role,lease_session,deadline FROM messages
+                WHERE project=? AND id=? AND recipient=?""", (project, message_id, harness)).fetchone()
+        if row is None:
+            return False
+        return row["stage"] == "done" or (row["stage"] == "coordinator" and row["lease_role"] == "coordinator"
+                                          and row["lease_session"] == session
+                                          and (row["deadline"] or 0) > time.time())
+
     def trace(self, project, message_id):
         """Return one message's lifecycle metadata, scoped to its project."""
         self._name(project, "project")

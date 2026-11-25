@@ -144,6 +144,30 @@ def enforce(cfg, host, project, action, *, invocation=None, reply_to=None):
     return kind, woken
 
 
+def caller_host():
+    """The host session this process runs inside: a harness, None (a terminal or a service),
+    or "unknown" when host markers are present but do not identify one host."""
+    try:
+        return invoking_harness()
+    except ValueError as exc:
+        if str(exc).startswith("No trusted native harness identity"):
+            return None
+        return "unknown"
+
+
+def enforce_caller(cfg, project, action, *, reply_to=None):
+    """Apply the wake policy to the calling process's own host turn; returns (kind, woken)."""
+    from . import wake_policy
+    host = caller_host()
+    if host == "unknown":
+        if action in wake_policy.USER_ONLY:
+            raise wake_policy.WakePolicyRefused(
+                "Refused by the bridge's wake policy: the calling host session cannot be identified, "
+                f"so {action} changes need a plain terminal or a turn the user started.")
+        return wake_policy.UNKNOWN, None
+    return enforce(cfg, host, project, action, reply_to=reply_to)
+
+
 _MAILBOX_ACTIONS = {"status": "read", "claim": "read", "finish": "finish", "relay-confirm": "finish",
                     "relay-failed": "finish", "send": "send", "send-fanout": "send", "reply": "reply",
                     "stop": "settings", "resume": "settings"}

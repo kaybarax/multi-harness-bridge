@@ -80,6 +80,28 @@ ACT_TEXT = (WAKE_MARK + " (notification {notification_id}). "
             "skill propagation are refused in this turn.")
 
 
+# The action class of each native MCP tool the bridge serves (Devin, Antigravity).
+TOOL_ACTIONS = {
+    "take_coordinator": ROLE, "take_bridge": ROLE, "prepare_role_handoff": ROLE,
+    "pickup_notification": READ, "pickup_wake": READ, "bridge_status": READ,
+    "acknowledge": FINISH, "finish_wake": FINISH,
+    "send_message": SEND, "send_fanout": SEND, "reply_free_text": REPLY,
+    "set_pickup": SETTINGS, "propagate_skills": PROPAGATE, "bridge_digest": READ,
+}
+
+
+def tool_action(tool, args=None):
+    """The action class of one tool call; unknown tools are treated as settings (refused from wakes)."""
+    args = args or {}
+    if tool == "send_message" and args.get("reply_to"):
+        return REPLY
+    if tool == "bridge_digest" and args.get("action", "show") != "show":
+        return SETTINGS
+    if tool == "finish_wake" and args.get("reply"):
+        return REPLY
+    return TOOL_ACTIONS.get(tool, SETTINGS)
+
+
 class WakePolicyRefused(PermissionError):
     """The current turn may not perform this bridge action."""
 
@@ -133,9 +155,9 @@ def classify_text(text):
     return bridge_turn(text) or (USER, None)
 
 
-def classify(harness, **evidence):
+def classify(host, /, **evidence):
     """Classify the current turn through the host's registered source; fail closed."""
-    source = _TURN_SOURCES.get(harness)
+    source = _TURN_SOURCES.get(host)
     if source is None:
         return UNKNOWN, None
     try:

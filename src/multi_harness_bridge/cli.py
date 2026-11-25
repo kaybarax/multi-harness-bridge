@@ -151,32 +151,13 @@ def _action(args):
     return "read"
 
 
-def _caller_host():
-    """The host session this command runs inside, None for a terminal or a service."""
-    from .skills import invoking_harness
-    try:
-        return invoking_harness()
-    except ValueError as exc:
-        if str(exc).startswith("No trusted native harness identity"):
-            return None
-        return "unknown"
-
-
 def _enforce(config, args):
     """Refuse what the wake policy does not allow from the calling host turn."""
-    from . import skills, wake_policy
-    host = _caller_host()
-    action = _action(args)
+    from . import skills
     project = getattr(args, "project", None)
-    if host == "unknown":
-        if action in wake_policy.USER_ONLY:
-            raise wake_policy.WakePolicyRefused(
-                "Refused by the bridge's wake policy: the calling host session cannot be identified, "
-                f"so {action} changes need a plain terminal or a turn the user started.")
-        return wake_policy.UNKNOWN
     if project is not None and project not in config.projects:
         project = None
-    kind, _ = skills.enforce(config, host, project, action)
+    kind, _ = skills.enforce_caller(config, project, _action(args))
     return kind
 
 
