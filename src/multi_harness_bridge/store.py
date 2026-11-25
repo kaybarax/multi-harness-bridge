@@ -1,6 +1,7 @@
 """Portable SQLite queue and role bindings for multiple projects."""
 
 from contextlib import closing, nullcontext
+import json
 import secrets
 import sqlite3
 import time
@@ -15,6 +16,21 @@ WAKE_RETRY_BASE_SECONDS = 2.0
 WAKE_RETRY_MAX_SECONDS = 60.0
 SCHEMA_VERSION = 4
 HUMAN_NOTIFICATION_ROUTES = {"telegram", "pma"}
+
+
+ACK_MAX_CHARS = 280
+
+
+class LoopCapReached(PermissionError):
+    """Too many wake-started messages between one pair of harnesses in the window."""
+
+    def __init__(self, project, sender, recipient, limit, window):
+        self.project, self.sender, self.recipient = project, sender, recipient
+        self.limit, self.window = limit, window
+        super().__init__(
+            f"Loop cap reached: {limit} wake-started messages between {sender} and {recipient} within "
+            f"{int(window // 60)} minutes. The bridge refuses more from wake turns until the window "
+            "passes; a turn the user starts can still send, and the bridge chat has an alert.")
 
 
 class Store:
@@ -46,6 +62,12 @@ class Store:
                 return
             self._migrate(db)
             db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+    @property
+    def root(self):
+        """The state directory this database lives in (its options file sits beside it)."""
+        from pathlib import Path
+        return Path(self.path).parent
 
     @staticmethod
     def _ensure_wal(db):
@@ -520,8 +542,18 @@ class Store:
         return bool(enabled)
 
     def send(
-        self, project, sender, recipient, body, key, reply_to=None, *, session=None
+        self, project, sender, recipient, body, key, reply_to=None, *, session=None,
+        origin=None, ack_only=False, loop_cap=None,
     ):
+        try:
+            return self._send(project, sender, recipient, body, key, reply_to, session=session,
+                              origin=origin, ack_only=ack_only, loop_cap=loop_cap)
+        except LoopCapReached as exc:
+            self._record_loop_cap(exc, session)
+            raise
+
+    def _send(self, project, sender, recipient, body, key, reply_to, *, session,
+              origin, ack_only, loop_cap):
         for value, label in (
             (project, "project"),
             (sender, "sender"),
@@ -561,6 +593,12 @@ class Store:
                         "reply_to must reference a message in this project with reversed sender and recipient"
                     )
             now = time.time()
+            existing = db.execute(
+                "SELECT 1 FROM messages WHERE project=? AND sender=? AND key=? AND request_id IS NULL",
+                (project, sender, key)).fetchone()
+            if not existing:
+                self._guard_loop(db, project, sender, [recipient], origin, ack_only, loop_cap, body=body,
+                                 is_reply=reply_to is not None)
             db.execute(
                 """INSERT INTO messages(id,project,sender,recipient,body,key,reply_to,stage,created,updated)
                 VALUES(?,?,?,?,?,?,?,'inbox',?,?) ON CONFLICT(project,sender,key) WHERE request_id IS NULL DO NOTHING""",
@@ -579,10 +617,21 @@ class Store:
                 raise ValueError(
                     "message key was reused with a different recipient, body, or reply_to"
                 )
+            if not existing:
+                self._note_meta(db, project, sender, [(row[0], recipient)], origin, ack_only)
             return {"id": row[0]}
 
-    def send_fanout(self, project, sender, recipients, body, key, *, session):
+    def send_fanout(self, project, sender, recipients, body, key, *, session, origin=None,
+                    ack_only=False, loop_cap=None):
         """Enqueue one durable outbound delivery per registered destination."""
+        try:
+            return self._send_fanout(project, sender, recipients, body, key, session=session,
+                                     origin=origin, ack_only=ack_only, loop_cap=loop_cap)
+        except LoopCapReached as exc:
+            self._record_loop_cap(exc, session)
+            raise
+
+    def _send_fanout(self, project, sender, recipients, body, key, *, session, origin, ack_only, loop_cap):
         self._validate_free_text(project, sender, body, key, session)
         if not isinstance(recipients, (list, tuple)) or not recipients:
             raise ValueError("recipients must be a non-empty list of harnesses")
@@ -610,6 +659,7 @@ class Store:
                     raise ValueError("request key was reused with different recipients or body")
                 return {"request_id": request["id"], "deliveries": deliveries}
 
+            self._guard_loop(db, project, sender, recipients, origin, ack_only, loop_cap, body=body)
             request_id = str(uuid.uuid4())
             db.execute(
                 "INSERT INTO free_text_requests(id,project,sender,key,body) VALUES(?,?,?,?,?)",
@@ -620,17 +670,26 @@ class Store:
                                              body, key, session), recipient=recipient)
                 for recipient in recipients
             ]
+            self._note_meta(db, project, sender, [(d["id"], d["recipient"]) for d in deliveries],
+                            origin, ack_only)
             return {"request_id": request_id, "deliveries": deliveries}
 
-    def reply_free_text(self, project, sender, reply_to, body, key, *, session):
+    def reply_free_text(self, project, sender, reply_to, body, key, *, session, origin=None,
+                        ack_only=False, loop_cap=None):
         """Send one substantive reply for a delivery back through both bridges."""
         self._validate_free_text(project, sender, body, key, session)
         self._name(reply_to, "reply_to")
-        with self._route_guard(project), closing(self._connect()) as db, db:
-            db.execute("BEGIN IMMEDIATE")
-            return self._reply_free_text(db, project, sender, reply_to, body, key, session)
+        try:
+            with self._route_guard(project), closing(self._connect()) as db, db:
+                db.execute("BEGIN IMMEDIATE")
+                return self._reply_free_text(db, project, sender, reply_to, body, key, session,
+                                             origin=origin, ack_only=ack_only, loop_cap=loop_cap)
+        except LoopCapReached as exc:
+            self._record_loop_cap(exc, session)
+            raise
 
-    def _reply_free_text(self, db, project, sender, reply_to, body, key, session):
+    def _reply_free_text(self, db, project, sender, reply_to, body, key, session, *, origin=None,
+                         ack_only=False, loop_cap=None):
         self._require_free_text_sender(db, project, sender, session)
         original = db.execute(
             """SELECT sender,request_id,stage,lease_session,deadline FROM messages
@@ -661,11 +720,87 @@ class Store:
         )
         if not received:
             raise ValueError("claim the free-text delivery as coordinator before replying")
+        self._guard_loop(db, project, sender, [original["sender"]], origin, ack_only, loop_cap, body=body,
+                         is_reply=True)
         message_id = self._enqueue_routed(
             db, original["request_id"], project, sender, original["sender"],
             body, key, session, reply_to=reply_to,
         )
+        self._note_meta(db, project, sender, [(message_id, original["sender"])], origin, ack_only)
         return {"request_id": original["request_id"], "id": message_id}
+
+    @staticmethod
+    def _ensure_message_meta(db):
+        db.execute("""CREATE TABLE IF NOT EXISTS message_meta (
+            message_id TEXT PRIMARY KEY, project TEXT NOT NULL, sender TEXT NOT NULL,
+            recipient TEXT NOT NULL, origin TEXT NOT NULL CHECK(origin IN ('user','wake')),
+            ack_only INTEGER NOT NULL DEFAULT 0 CHECK(ack_only IN (0,1)), at REAL NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS message_meta_window ON message_meta(project,origin,at)")
+
+    def _guard_loop(self, db, project, sender, recipients, origin, ack_only, loop_cap, *, body=None,
+                    is_reply=False):
+        """Refuse a wake-started message once its pair reached the cap in the window.
+
+        A message whose origin the caller did not state counts as wake-started:
+        a new caller can never skip the cap by leaving it out.
+        """
+        if ack_only:
+            if not is_reply:
+                raise ValueError("ack-only is for a reply that only confirms receipt")
+            if not isinstance(body, str) or len(body) > ACK_MAX_CHARS:
+                raise ValueError(f"an ack-only reply is a short receipt of at most {ACK_MAX_CHARS} characters")
+            return
+        if origin == "user":
+            return
+        self._ensure_message_meta(db)
+        now = time.time()
+        for recipient in recipients:
+            if loop_cap is not None:
+                limit, window = loop_cap
+            else:
+                from . import wake_policy
+                limit, window = wake_policy.loop_cap(self.root, project, sender, recipient)
+            since = now - window
+            count = db.execute(
+                """SELECT COUNT(*) FROM message_meta WHERE project=? AND origin='wake' AND ack_only=0
+                AND at>? AND ((sender=? AND recipient=?) OR (sender=? AND recipient=?))""",
+                (project, since, sender, recipient, recipient, sender)).fetchone()[0]
+            if count >= limit:
+                raise LoopCapReached(project, sender, recipient, limit, window)
+
+    def _note_meta(self, db, project, sender, deliveries, origin, ack_only):
+        """Record who started each message; an ack-only message is done at once and wakes nobody."""
+        self._ensure_message_meta(db)
+        now = time.time()
+        for message_id, recipient in deliveries:
+            db.execute("INSERT OR IGNORE INTO message_meta VALUES(?,?,?,?,?,?,?)",
+                       (message_id, project, sender, recipient, "user" if origin == "user" else "wake",
+                        int(bool(ack_only)), now))
+            if ack_only:
+                db.execute("""UPDATE messages SET stage='done',lease=NULL,lease_role=NULL,lease_session=NULL,
+                    deadline=NULL,updated=? WHERE id=? AND stage<>'done'""", (now, message_id))
+
+    def _record_loop_cap(self, exc, session):
+        """Record a tripped cap for the watcher's alert (outside the refused transaction)."""
+        try:
+            with closing(self._connect()) as db, db:
+                db.execute("""CREATE TABLE IF NOT EXISTS mhb_pickup_events (
+                    project TEXT NOT NULL, harness TEXT NOT NULL, role TEXT NOT NULL, session TEXT NOT NULL,
+                    notification_id TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, at REAL NOT NULL)""")
+                pair = "-".join(sorted((exc.sender, exc.recipient)))
+                db.execute("INSERT INTO mhb_pickup_events VALUES(?,?,?,?,?,?,?,?)",
+                           (exc.project, exc.sender, "coordinator", session or "", f"loop-cap:{pair}",
+                            "loop-cap", json.dumps({"recipient": exc.recipient, "limit": exc.limit,
+                                                     "window_seconds": exc.window}), time.time()))
+        except sqlite3.Error:
+            pass
+
+    def message_meta(self, project, message_id):
+        with closing(self._connect()) as db:
+            self._ensure_message_meta(db)
+            row = db.execute("SELECT origin,ack_only FROM message_meta WHERE project=? AND message_id=?",
+                             (project, message_id)).fetchone()
+            return {"origin": row["origin"], "ack_only": bool(row["ack_only"])} if row else None
 
     @staticmethod
     def _enqueue_routed(db, request_id, project, sender, recipient, body, key, session, reply_to=None):
@@ -831,10 +966,20 @@ class Store:
             updated_at REAL NOT NULL,
             PRIMARY KEY(project,harness,role,session))""")
 
-    def finish_and_reply(self, project, sender, session, message_id, lease, body, key):
+    def finish_and_reply(self, project, sender, session, message_id, lease, body, key, *,
+                         origin=None, ack_only=False, loop_cap=None):
         """Complete an exact coordinator lease and queue its reply in one commit."""
         self._validate_free_text(project, sender, body, key, session)
         self._name(message_id, "message_id")
+        try:
+            return self._finish_and_reply(project, sender, session, message_id, lease, body, key,
+                                          origin=origin, ack_only=ack_only, loop_cap=loop_cap)
+        except LoopCapReached as exc:
+            self._record_loop_cap(exc, session)
+            raise
+
+    def _finish_and_reply(self, project, sender, session, message_id, lease, body, key, *,
+                          origin, ack_only, loop_cap):
         with self._route_guard(project), closing(self._connect()) as db, db:
             db.execute("BEGIN IMMEDIATE")
             self._ensure_wake_sessions(db)
@@ -843,7 +988,8 @@ class Store:
             db.execute("""UPDATE mhb_wake_sessions SET state='cooldown',updated_at=?
                 WHERE project=? AND harness=? AND role='coordinator' AND session=? AND notification_id=?""",
                 (time.time(), project, sender, session, message_id))
-            return self._reply_free_text(db, project, sender, message_id, body, key, session)
+            return self._reply_free_text(db, project, sender, message_id, body, key, session,
+                                         origin=origin, ack_only=ack_only, loop_cap=loop_cap)
 
     def _finish_lease(self, db, project, harness, role, session, id, lease):
         if self._roles(db, project, harness).get(role) != session:

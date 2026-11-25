@@ -38,6 +38,9 @@ class Invocation:
     proof: str = ""
     orchestrator: bool = False
     invocation_key: str | None = None
+    # Native evidence of the turn this call runs in, for the wake policy.
+    turn_text: str | None = None
+    turn_at: float | None = None
 
 
 def _parse_details(prompt: str, role: str):
@@ -256,9 +259,76 @@ def codex_invocation(role=None, *, thread_id=None, home=None, cwd=None, project_
         title, orchestrator = _parse_details(_codex_skill_text(latest), role)
         project, _ = _resolve(workspace, project_hint)
         return Invocation(project, "codex", thread_id, role or "", workspace, title,
-                          "codex-current-user-turn", orchestrator, latest_turn_key)
+                          "codex-current-user-turn", orchestrator, latest_turn_key, turn_text=latest)
     except (OSError, sqlite3.Error, KeyError, TypeError) as exc:
         raise ValueError(f"Codex native invocation could not be verified ({type(exc).__name__})") from None
+
+
+def codex_turn_text(*, thread_id=None, home=None):
+    """The latest user message of the calling Codex thread, for turn classification only."""
+    return codex_turn(thread_id=thread_id, home=home)[0]
+
+
+def codex_turn(*, thread_id=None, home=None):
+    """(latest user text, what started the latest turn) of the calling Codex thread."""
+    thread_id = thread_id or os.environ.get("CODEX_THREAD_ID")
+    codex_home = Path(home or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+    thread_id = str(uuid.UUID(str(thread_id)))
+    with sqlite3.connect(f"file:{codex_home / 'state_5.sqlite'}?mode=ro", uri=True) as conn:
+        row = conn.execute("SELECT rollout_path FROM threads WHERE id=?", (thread_id,)).fetchone()
+    if not row or not row[0]:
+        raise ValueError("Codex thread has no transcript")
+    rollout = Path(row[0]).resolve(strict=True)
+    if not rollout.is_relative_to((codex_home / "sessions").resolve(strict=True)):
+        raise ValueError("Codex transcript is outside the host's session store")
+    latest = None
+    trigger = None
+    with rollout.open(encoding="utf-8") as stream:
+        for line in stream:
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = item.get("payload", {})
+            if isinstance(payload, dict) and payload.get("type") == "task_started":
+                attribution = payload.get("turn_attribution") or {}
+                trigger = attribution.get("turn_trigger") if isinstance(attribution, dict) else None
+                latest = None
+                continue
+            if item.get("type") == "response_item" and isinstance(payload, dict) and payload.get("role") == "user":
+                metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+                if metadata.get("content_item_kinds") == ["skills.selected_skill_instructions"]:
+                    continue
+                content = payload.get("content", "")
+                if isinstance(content, str):
+                    latest = content
+                elif isinstance(content, list):
+                    latest = "\n".join(p.get("text", "") for p in content
+                                       if isinstance(p, dict) and isinstance(p.get("text"), str))
+    if latest is None:
+        raise ValueError("Codex thread has no user turn")
+    return _codex_skill_text(latest), trigger
+
+
+def devin_turn_text(session_id, *, native_db=None):
+    """The latest user message of one Devin Local session, for turn classification only."""
+    db_path = Path(native_db or os.environ.get("MHB_DEVIN_SESSIONS_DB", Path.home() / ".local/share/devin/cli/sessions.db"))
+    sid = str(session_id).removeprefix("acp/devin-cli/")
+    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2) as db:
+        rows = db.execute("SELECT chat_message FROM message_nodes WHERE session_id IN (?,?) ORDER BY row_id DESC",
+                          (sid, f"acp/devin-cli/{sid}")).fetchall()
+    for (raw,) in rows:
+        try:
+            message = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(message, dict) and message.get("role") == "user":
+            content = message.get("content", "")
+            if isinstance(content, list):
+                content = "\n".join(part.get("text", "") for part in content
+                                    if isinstance(part, dict) and isinstance(part.get("text"), str))
+            return content if isinstance(content, str) else ""
+    raise ValueError("Devin session has no user turn")
 
 
 def claude_invocation(role, hook_context, *, project_hint=None, cwd=None, expected_session=None):
@@ -291,10 +361,15 @@ def claude_invocation(role, hook_context, *, project_hint=None, cwd=None, expect
         raise ValueError("Claude transcript is not in the native project session directory")
     title, orchestrator = _parse_details(prompt, role)
     project, _ = _resolve(workspace, project_hint)
+    try:
+        captured = float(hook_context.get("captured_at"))
+    except (TypeError, ValueError):
+        captured = None
     return Invocation(project, "claude", session, role or "", workspace, title,
                       "claude-user-prompt-submit", orchestrator,
                       hashlib.sha256((session + "\0" + str(hook_context.get("captured_at", ""))
-                                      + "\0" + prompt).encode("utf-8")).hexdigest())
+                                      + "\0" + prompt).encode("utf-8")).hexdigest(),
+                      turn_text=prompt, turn_at=captured)
 
 
 def claude_hook_main(state_home=None):
@@ -487,7 +562,8 @@ def devin_native_invocation(role=None, *, native_db=None, project_hint=None, max
             f"devin\0{project}\0{session_id}\0{user_row_id}".encode("utf-8")
         ).hexdigest()
         candidates.append(Invocation(project, "devin", session_id, role or "", workspace, title,
-                                     "devin-fresh-native-user-message", orchestrator, invocation_key))
+                                     "devin-fresh-native-user-message", orchestrator, invocation_key,
+                                     turn_text=prompt))
     unique = {(x.project, x.session): x for x in candidates}
     if len(unique) != 1:
         raise ValueError("Devin native invocation did not resolve to one fresh project session")

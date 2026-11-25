@@ -17,6 +17,8 @@ def subscribe(config, store, project, harness, role, session, *, output, interva
         for message_id, attempt in available:
             if (message_id, attempt) not in seen:
                 line = {"project": project, "harness": harness, "role": role, "session": session, "id": message_id}
+                from . import wake_policy
+                wake_policy.record_hint(config.root, project, harness, session, [message_id])
                 print(json.dumps(line), file=output, flush=True)
         seen = set(available)
         wait(interval)

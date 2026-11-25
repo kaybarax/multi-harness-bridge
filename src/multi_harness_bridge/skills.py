@@ -92,6 +92,63 @@ def _active_project_workspace(cfg, host, project_hint=None, workspace_hint=None)
     return project, workspace_root
 
 
+def current_turn(cfg, host, project, *, invocation=None):
+    """Classify the calling host session's current turn from native evidence; fail closed.
+
+    Returns (kind, woken_notification_id). Without any host session this is an
+    operator call (a terminal or a service), which the wake policy never limits.
+    """
+    from . import role_adapters, wake_policy
+    if host is None:
+        return wake_policy.OPERATOR, None
+    try:
+        if host == "codex":
+            text, trigger = role_adapters.codex_turn(
+                thread_id=invocation.session if invocation is not None else None)
+            return wake_policy.classify("codex", text=text, trigger=trigger)
+        if host == "claude":
+            session = invocation.session if invocation is not None else os.environ.get("CLAUDE_CODE_SESSION_ID")
+            if invocation is not None:
+                prompt, prompt_at = invocation.turn_text, invocation.turn_at
+            else:
+                context_path = os.environ.get("MHB_CLAUDE_HOOK_CONTEXT")
+                path = Path(context_path).expanduser() if context_path else cfg_context_path("claude", session)
+                context = json.loads(path.read_text())
+                if context.get("session_id") != session:
+                    return wake_policy.UNKNOWN, None
+                prompt, prompt_at = context.get("prompt"), context.get("captured_at")
+            return wake_policy.classify("claude", root=cfg.root, project=project, harness="claude",
+                                        session=session, prompt=prompt, prompt_at=prompt_at)
+        if host == "devin":
+            session = invocation.session if invocation is not None else (
+                os.environ.get("DEVIN_SESSION_ID") or os.environ.get("DEVIN_LOCAL_SESSION_ID"))
+            text = invocation.turn_text if invocation is not None and invocation.turn_text is not None \
+                else role_adapters.devin_turn_text(session)
+            return wake_policy.classify("devin", text=text)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+        return wake_policy.UNKNOWN, None
+    return wake_policy.classify(host)
+
+
+def enforce(cfg, host, project, action, *, invocation=None, reply_to=None):
+    """Apply the wake policy to one bridge action; returns (kind, woken)."""
+    from . import wake_policy
+    kind, woken = current_turn(cfg, host, project, invocation=invocation)
+    if project is None:
+        # No project resolved yet: only a turn the user started may change anything.
+        if action in wake_policy.USER_ONLY and kind not in (wake_policy.USER, wake_policy.OPERATOR):
+            raise wake_policy.WakePolicyRefused(
+                f"Refused by the bridge's wake policy: {action} changes need a turn the user started.")
+        return kind, woken
+    wake_policy.check(cfg.root, project, host, kind, action, reply_to=reply_to, woken=woken)
+    return kind, woken
+
+
+_MAILBOX_ACTIONS = {"status": "read", "claim": "read", "finish": "finish", "relay-confirm": "finish",
+                    "relay-failed": "finish", "send": "send", "send-fanout": "send", "reply": "reply",
+                    "stop": "settings", "resume": "settings"}
+
+
 def cfg_context_path(host, session=None):
     if host == "claude":
         if not session:
@@ -147,6 +204,13 @@ def _mailbox(args, host, cfg):
     role = next((name for name in ("coordinator", "inbox") if roles[name] == invocation.session), None)
     if role is None:
         raise ValueError("This verified native chat is not bound to a project role")
+    from . import wake_policy
+    action = _MAILBOX_ACTIONS.get(args.mailbox, "read")
+    if args.mailbox == "digest":
+        action = "read" if (args.digest_action or "show") == "show" else "settings"
+    kind, _ = enforce(cfg, host, project, action, invocation=invocation,
+                      reply_to=getattr(args, "reply_to", None))
+    send_policy = {"origin": wake_policy.origin(kind), "ack_only": bool(getattr(args, "ack_only", False))}
     if args.mailbox == "status":
         from . import pickup
         result = {"project": project, "harness": host, "role": role, "session": invocation.session,
@@ -249,18 +313,18 @@ def _mailbox(args, host, cfg):
             if len(recipients) != 1:
                 raise ValueError("send takes exactly one --recipient")
             message = store.send(project, host, recipients[0], body, args.key,
-                                 reply_to=args.reply_to, session=invocation.session)
+                                 reply_to=args.reply_to, session=invocation.session, **send_policy)
             result = {"id": message["id"]}
         elif args.mailbox == "send-fanout":
             if not recipients or args.reply_to is not None:
                 raise ValueError("send-fanout requires --recipient for each destination")
             result = store.send_fanout(project, host, recipients, body, args.key,
-                                       session=invocation.session)
+                                       session=invocation.session, **send_policy)
         else:
             if recipients or not args.reply_to:
                 raise ValueError("reply requires only --reply-to to identify the original delivery")
             result = store.reply_free_text(project, host, args.reply_to, body, args.key,
-                                          session=invocation.session)
+                                          session=invocation.session, **send_policy)
         result = {"project": project, **result}
     elif args.mailbox in {"stop", "resume"}:
         enabled = args.mailbox == "resume"
@@ -293,6 +357,8 @@ def main(argv=None):
     body.add_argument("--body-file", help="Read the message as UTF-8, or use - for standard input")
     parser.add_argument("--key")
     parser.add_argument("--reply-to")
+    parser.add_argument("--ack-only", action="store_true",
+                        help="with send, send-fanout or reply: a receipt that needs no answer; it wakes nobody")
     args = parser.parse_args(argv)
     try:
         cfg = config.load()
@@ -337,6 +403,7 @@ def main(argv=None):
                 raise ValueError(f"Use this project's native {host} MCP role tools for the takeover")
             if cfg.resolve(invocation.workspace, args.project or args.hint) != invocation.project:
                 raise ValueError("Native workspace does not match project selection")
+            enforce(cfg, host, invocation.project, "role", invocation=invocation)
             store = config.open_store(cfg)
             outcome = role_adapters.bind(store, invocation)
             if role == "coordinator":
@@ -353,6 +420,7 @@ def main(argv=None):
         caller = host if not (args.bootstrap or args.install_native) else caller
         project, active_workspace = _active_project_workspace(
             cfg, caller, args.project or args.hint, args.workspace)
+        enforce(cfg, caller, project, "settings" if args.install_native else "propagate")
         if args.bootstrap:
             result = bootstrap(project, host, workspace=active_workspace)
             try:
