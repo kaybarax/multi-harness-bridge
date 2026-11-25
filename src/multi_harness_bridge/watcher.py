@@ -671,7 +671,7 @@ def _alert_loop_cap(cfg, project, event, state, log):
     window = max(60, int(detail.get("window_seconds") or 1800))
     limit = detail.get("limit")
     pair = "-".join(sorted((sender, recipient)))
-    key = f"loop-{pair}-{int(event['at'] // window)}"
+    key = f"loop-{pair}"  # one open alert per pair; it clears when its window has passed
     text = (f"Messages between {pair.replace('-', ' and ')} reached the loop cap ({limit} wake-started "
             f"messages in {window // 60} minutes). The bridge refuses more from bridge-started turns "
             "until the window passes. Fix: look at the exchange in both coordinator chats; a turn you "

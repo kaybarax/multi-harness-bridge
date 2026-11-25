@@ -341,6 +341,8 @@ def test_d_loop_cap_alert_reaches_the_bridge_chat_once_per_window(tmp_path, monk
         with pytest.raises(LoopCapReached):
             store.send_fanout("sample", "codex", ["devin"], "again", key, session="codex-coordinator",
                               origin="wake")
+    with closing(sqlite3.connect(store.path)) as db, db:  # trips on both sides of a time boundary
+        db.execute("UPDATE mhb_pickup_events SET at=at+1800 WHERE rowid=(SELECT MAX(rowid) FROM mhb_pickup_events)")
     state, logged = {}, []
     watcher._alert_pickup_events(cfg, store, "sample", state, logged.append)
     alerts = [e for e in logged if e.get("reason") == "loop-cap"]
