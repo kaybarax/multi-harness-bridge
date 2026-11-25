@@ -754,8 +754,8 @@ class Store:
             return
         self._ensure_message_meta(db)
         now = time.time()
-        # A person's notification route is not an agent loop.
-        recipients = [r for r in recipients if r not in HUMAN_NOTIFICATION_ROUTES]
+        # What a person's notification route sends was written by a person; agents'
+        # messages to that route still count, so an automated responder cannot loop.
         if sender in HUMAN_NOTIFICATION_ROUTES:
             return
         for recipient in recipients:
@@ -778,7 +778,8 @@ class Store:
         now = time.time()
         for message_id, recipient in deliveries:
             db.execute("INSERT OR IGNORE INTO message_meta VALUES(?,?,?,?,?,?,?)",
-                       (message_id, project, sender, recipient, "user" if origin == "user" else "wake",
+                       (message_id, project, sender, recipient,
+                        "user" if origin == "user" or sender in HUMAN_NOTIFICATION_ROUTES else "wake",
                         int(bool(ack_only)), now))
             if ack_only:
                 db.execute("""UPDATE messages SET stage='done',lease=NULL,lease_role=NULL,lease_session=NULL,

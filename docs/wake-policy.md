@@ -48,7 +48,7 @@ Limits worth knowing:
 ## Loop guard
 
 - **Ack-only replies.** A reply that only confirms receipt can be marked ack-only (`--ack-only`, or `ack_only=true` in MCP tools). It is stored as done at once, wakes nobody and still appears in traces, the history feed and digests. Ack-only is for replies of at most 280 characters.
-- **Person routes.** Messages to or from a person's notification route (Telegram, an assistant relay) are never capped.
+- **Person routes.** Messages that a person's notification route (Telegram, an assistant relay) sends are never capped. Agents' messages to such a route still count.
 - **Per-pair cap.** Messages sent from turns that are not the user's count toward a cap per pair of harnesses, in both directions: `loop_cap_messages` (default 10) within `loop_cap_minutes` (default 30). The stricter of the two harnesses' settings applies. At the cap, the bridge refuses further such messages and records a `loop-cap` event. The watcher then alerts the bridge chat once per pair and window, and escalates like other alerts. Turns the user starts are never capped.
 
 A message whose origin a caller does not state counts toward the cap, so a new integration cannot skip it by leaving the origin out.

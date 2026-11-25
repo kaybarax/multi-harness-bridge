@@ -454,7 +454,7 @@ def test_devin_turn_without_a_visible_prompt_cannot_change_settings(tmp_path, mo
     cfg, store, server, add, call, _ = _devin_rig(tmp_path, monkeypatch)
     set_pickup = server._tool_manager.get_tool("set_pickup").fn
     call("c1", "set_pickup", {"enabled": False})
-    with pytest.raises(PermissionError, match="unknown turn"):
+    with pytest.raises(PermissionError, match="turn the user started"):
         set_pickup(enabled=False)
     add({"role": "tool", "tool_call_id": "c1", "content": "refused"})
     add({"role": "user", "content": "please pause the bridge"})
@@ -625,6 +625,10 @@ def test_a_persons_notification_route_is_never_capped(tmp_path):
     for n in range(15):
         store.send("sample", "telegram", "pma", f"update {n}", f"t{n}")
         store.send("sample", "pma", "codex", f"forward {n}", f"f{n}")
+    for n in range(10):  # an agent's own messages to a person route still count
+        store.send("sample", "codex", "pma", f"note {n}", f"n{n}", origin="wake")
+    with pytest.raises(LoopCapReached):
+        store.send("sample", "codex", "pma", "one too many", "n10", origin="wake")
 
 
 def test_a_host_less_credential_caller_cannot_change_settings(tmp_path, monkeypatch):

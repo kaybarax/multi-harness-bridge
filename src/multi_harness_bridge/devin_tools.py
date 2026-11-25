@@ -207,6 +207,10 @@ def make_role_server(cfg, project):
                 # Whatever the host recorded after the prompt, a bridge turn is still running here.
                 kind = wake_policy.UNKNOWN
         action = wake_policy.tool_action(tool, args)
+        if kind == wake_policy.UNKNOWN and action in wake_policy.USER_ONLY:
+            raise wake_policy.WakePolicyRefused(
+                f"Refused by the bridge's wake policy: {action} changes need a turn the user started, and a "
+                "bridge turn is running or just ran in this chat; retry in a new turn in a minute.")
         if kind == wake_policy.WAKE and tool in ("pickup_notification", "acknowledge") and (
                 (args or {}).get("notification_id", (args or {}).get("id")) != woken):
             raise wake_policy.WakePolicyRefused(
