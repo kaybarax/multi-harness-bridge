@@ -497,10 +497,12 @@ def pickup_events(store, project, since=0.0, limit=500):
 def _pull_decision(store, project, harness, role, session, item, attempt):
     """Choose how the watcher nudges a pull-mode coordinator; push never comes here.
 
-    Returns ("nudge", None), ("fallback", detail) or ("hold", reason). The first
-    nudge never navigates. A repeat is allowed only once the adapter proves the
-    chat consumed the earlier hint. A cold chat may be opened once, after the
-    grace window, when the project allows it; anything unproven only holds.
+    Returns ("nudge", None), ("fallback", detail) or ("hold", reason). No nudge
+    navigates. For an adapter that can open a chat, a repeat nudge needs proof
+    that the chat consumed the earlier hint, and a proven-cold chat may be
+    opened once, after the grace window, when the project allows it; anything
+    unproven only holds. Adapters that cannot navigate (Devin's ACP prompt)
+    repeat under the dispatcher's normal backoff.
     """
     port = pickup.adapter(harness)
     root = Path(store.path).parent
@@ -519,7 +521,8 @@ def _pull_decision(store, project, harness, role, session, item, attempt):
                          **(check.conditions or {})}, sort_keys=True)
     with closing(_ledger(store.path)) as db:
         opened = db.execute("""SELECT at FROM mhb_pickup_events WHERE project=? AND harness=? AND role=?
-            AND session=? AND notification_id=? AND event='fallback-open' LIMIT 1""",
+            AND session=? AND notification_id=? AND event IN ('fallback-attempt','fallback-open')
+            ORDER BY at LIMIT 1""",
             (*route, item["id"])).fetchone()
         if (check.state == "cold" and not opened and opts["fallback_open"] == "after_wait"
                 and age >= opts["fallback_grace_seconds"]):
@@ -623,6 +626,11 @@ def wake_one(store, project, harness, role, session, *, commands=None):
             return {"id": item["id"], "status": "held", "reason": detail}
         values["navigate"] = decision == "fallback-and-nudge"
         values["pickup_fallback"] = decision == "fallback"
+        if decision == "fallback":
+            # Recorded before the open, so a failed or ambiguous open is never retried.
+            with closing(_ledger(store.path)) as events, events:
+                _pickup_event(events, (project, harness, role, session), item["id"],
+                              "fallback-attempt", detail or "")
     db = _ledger(store.path)
     state = "uncertain"
     refund_attempt = False
@@ -918,6 +926,33 @@ def renotify(store, project, notification_id, *, harness, role, session):
     return {"id": notification_id, "status": "retry-authorized"}
 
 
+WATCHER_CHECK_SECONDS = 30.0
+
+
+def ensure_watcher_for_pull(project=None):
+    """Keep an upgraded installation delivering.
+
+    When any harness of the project is set (or defaults) to pull, its inbox
+    stages are forwarded only by the shared watcher. The wake service checks
+    for a live watcher and starts one when none runs, so mail never waits for
+    a watcher nobody started. Returns a report only when it acted.
+    """
+    try:
+        from . import watcher
+        cfg = config.load()
+        selected = cfg.resolve(Path.cwd(), project)
+        if not any(pickup.is_pull(cfg.root, selected, name) for name in sorted(HARNESS_NAMES)):
+            return None
+        state = watcher.health(cfg.root, selected)
+        if state["status"] == "alive":
+            return None
+        result = watcher.ensure(cfg.root, selected)
+        return {"project": selected, "status": "watcher-" + result.get("action", "checked"),
+                "watcher": result.get("status")}
+    except Exception as exc:  # never stop the push dispatcher over the watcher
+        return {"status": "watcher-check-held", "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", help="registered project hint")
@@ -961,7 +996,13 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    last_watch_check = 0.0
     while not stopped:
+        if time.monotonic() - last_watch_check >= WATCHER_CHECK_SECONDS:
+            last_watch_check = time.monotonic()
+            report = ensure_watcher_for_pull(args.project)
+            if report:
+                print(json.dumps(report, sort_keys=True), flush=True)
         try:
             for report in cycle(args.project, args.harness, args.role, pickup_mode="push"):
                 print(json.dumps(report, sort_keys=True), flush=True)

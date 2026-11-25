@@ -95,14 +95,31 @@ def lock_held(root, project):
     return True
 
 
+def _pid_running(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def health(root, project, *, clock=time.time):
-    """Read-only: is the project's watcher alive, hung, or stopped?"""
-    held = lock_held(root, project)
+    """Read-only: is the project's watcher alive, hung, or stopped?
+
+    Never touches the lock, so a check can't make a starting watcher lose it.
+    """
     try:
         beat = json.loads(paths(root, project)["heartbeat"].read_text(encoding="utf-8"))
     except (OSError, ValueError):
         beat = {}
     age = clock() - float(beat.get("beat_at", 0)) if beat else None
+    held = bool(beat) and beat.get("stopped") is not True and _pid_running(beat.get("pid"))
     if held and age is not None and age <= HEARTBEAT_STALE_SECONDS:
         status = "alive"
     elif held:
@@ -413,25 +430,89 @@ def _alert_command():
     return None
 
 
-def raise_alert(project, key, text, state, *, run=None):
-    """Send one alert per failure episode through the configured alert command."""
+def _alert_record(value):
+    return value if isinstance(value, dict) else {"first_at": float(value or 0), "escalated": True}
+
+
+def raise_alert(project, key, text, state, *, harness=None, message_id=None, run=None,
+                root=None, clock=time.time):
+    """Open one alert episode per stuck message.
+
+    The bridge chat hears first: the alert goes into the history feed and a
+    digest is marked ready at once (even with digests off). The configured
+    alert command (for example a Telegram relay) is used only by
+    ``escalate_alerts`` if the message stays stuck past the escalation delay.
+    With no ``root`` (no bridge to tell), the alert command runs at once.
+    """
     alerts = state.setdefault("alerts", {})
-    if alerts.get(key):
+    if key in alerts:
         return False
-    alerts[key] = time.time()
+    alerts[key] = {"first_at": clock(), "text": text, "harness": harness, "id": message_id,
+                   "escalated": root is None}
+    if root is None:
+        _run_alert_command(project, text, run)
+        return True
+    feed = paths(root, project)["feed"]
+    feed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(feed, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as out:
+        out.write(json.dumps({"at": clock(), "event": "alert", "id": f"alert-{key}", "kind": "alert",
+                              "sender": "bridge", "recipient": harness, "excerpt": text}) + "\n")
+    if harness:
+        marks = state.setdefault("digest", {}).setdefault(harness, {})
+        seq = int(marks.get("seq", 0)) + 1
+        marks["seq"] = seq
+        marks["nudge_seq"] = seq
+        marks.pop("nudge_tried_at", None)
+        _save_state(digest_path(root, project, harness),
+                    {"project": project, "harness": harness, "seq": seq, "ready_at": clock(),
+                     "count": 1, "alert": True})
+    return True
+
+
+def _run_alert_command(project, text, run=None):
     argv = _alert_command()
     run = run or subprocess.run
-    if argv:
-        try:
-            run([part.format_map({"project": project, "text": text}) for part in argv],
-                capture_output=True, timeout=20, check=False, shell=False)
-        except (OSError, subprocess.SubprocessError, KeyError, ValueError):
-            pass
-    return True
+    if not argv:
+        return False
+    try:
+        run([part.format_map({"project": project, "text": text}) for part in argv],
+            capture_output=True, timeout=20, check=False, shell=False)
+        return True
+    except (OSError, subprocess.SubprocessError, KeyError, ValueError):
+        return False
+
+
+def escalate_alerts(root, project, state, log, *, run=None, clock=time.time):
+    """Send a still-open alert through the alert command once, after its delay."""
+    for key, value in state.get("alerts", {}).items():
+        record = _alert_record(value)
+        if record.get("escalated"):
+            continue
+        harness = record.get("harness") or "codex"
+        delay = pickup.settings(root, project, harness)["alert_escalate_minutes"] * 60
+        if clock() - float(record.get("first_at", 0)) < delay:
+            continue
+        minutes = int((clock() - float(record["first_at"])) // 60)
+        _run_alert_command(project, f"{record.get('text', '')} (still waiting after {minutes} min)", run)
+        record["escalated"] = True
+        state["alerts"][key] = record
+        log({"event": "alert-escalated", "key": key})
 
 
 def clear_alert(key, state):
     state.setdefault("alerts", {}).pop(key, None)
+
+
+def _clear_resolved_alerts(store, project, state):
+    for key, value in list(state.get("alerts", {}).items()):
+        record = _alert_record(value)
+        message_id, harness = record.get("id"), record.get("harness")
+        if not message_id:
+            continue
+        trace = store.trace(project, message_id)
+        if not trace or trace["stage"] == "done" or harness not in (trace["recipient"], trace["sender"]):
+            clear_alert(key, state)
 
 
 # Main loop --------------------------------------------------------------------
@@ -443,12 +524,18 @@ def pull_harnesses(cfg, project):
 def run_pass(cfg, store, project, state, *, log):
     """One watcher pass. Errors in one part never stop the others."""
     harnesses = pull_harnesses(cfg, project)
-    for harness in harnesses:
+
+    def guarded(part, call, *args):
         try:
-            for moved in store.forward_pull(project, harness):
-                log({"event": "forwarded", "harness": harness, **moved})
-        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-            log({"event": "forward-held", "harness": harness, "reason": str(exc)})
+            return call(*args)
+        except Exception as exc:  # each part fails alone; the pass goes on
+            log({"event": f"{part}-held", "reason": f"{type(exc).__name__}: {exc}"})
+            return None
+
+    for harness in harnesses:
+        moved = guarded("forward", store.forward_pull, project, harness) or []
+        for item in moved:
+            log({"event": "forwarded", "harness": harness, **item})
     if harnesses:
         try:
             seen = state.setdefault("_dispatch_seen", {})
@@ -461,8 +548,8 @@ def run_pass(cfg, store, project, state, *, log):
                 if seen.get(key) != signature:  # log changes only, not a steady state every pass
                     log({"event": "dispatch", **report})
             state["_dispatch_seen"] = current
-        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-            log({"event": "dispatch-held", "reason": str(exc)})
+        except Exception as exc:
+            log({"event": "dispatch-held", "reason": f"{type(exc).__name__}: {exc}"})
     feed = paths(cfg.root, project)["feed"]
     with _state_lock(cfg.root, project):
         current = _load_state(paths(cfg.root, project)["state"])
@@ -471,17 +558,18 @@ def run_pass(cfg, store, project, state, *, log):
         state.clear()
         state.update(current)
         try:
-            append_feed(store, project, feed, state)
-        except (OSError, sqlite3.Error) as exc:
-            log({"event": "feed-held", "reason": str(exc)})
-        for ready in schedule_digests(cfg.root, project, harnesses, feed, state):
-            log({"event": "digest-ready", **ready})
-            state["digest"][ready["harness"]]["nudge_seq"] = ready["seq"]
-        _nudge_digests(store, project, harnesses, state, log)
-        _check_listeners(cfg, store, project, harnesses, state, log)
-        _alert_pickup_events(store, project, state, log)
-        _save_state(paths(cfg.root, project)["state"],
-                    {k: v for k, v in state.items() if not k.startswith("_")})
+            guarded("feed", append_feed, store, project, feed, state)
+            for ready in guarded("digest", schedule_digests, cfg.root, project, harnesses, feed, state) or []:
+                log({"event": "digest-ready", **ready})
+                state["digest"][ready["harness"]]["nudge_seq"] = ready["seq"]
+            guarded("alert-clear", _clear_resolved_alerts, store, project, state)
+            guarded("listener-check", _check_listeners, cfg, store, project, harnesses, state, log)
+            guarded("alert", _alert_pickup_events, cfg, store, project, state, log)
+            guarded("alert-escalate", escalate_alerts, cfg.root, project, state, log)
+            guarded("digest-nudge", _nudge_digests, store, project, harnesses, state, log)
+        finally:
+            _save_state(paths(cfg.root, project)["state"],
+                        {k: v for k, v in state.items() if not k.startswith("_")})
 
 
 DIGEST_RETRY_SECONDS = 60.0
@@ -505,7 +593,7 @@ def _nudge_digests(store, project, harnesses, state, log):
             continue
         try:
             sent = port.digest_nudge(project, session, seq, marks.get("nudged_seq"))
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        except Exception as exc:
             log({"event": "digest-nudge-held", "harness": harness, "seq": seq, "reason": str(exc)})
             continue
         if sent:
@@ -519,13 +607,8 @@ def _check_listeners(cfg, store, project, harnesses, state, log):
         port = pickup.adapter(harness)
         if port is None or not port.self_listening:
             continue
-        prefix = f"listener-{harness}-"
         session = store.roles(project, harness).get("coordinator")
         pending = store.pending_details(project, harness, "coordinator", session) if session else []
-        waiting = {item["id"] for item in pending}
-        for key in [k for k in state.get("alerts", {}) if k.startswith(prefix)]:
-            if key[len(prefix):] not in waiting:
-                clear_alert(key, state)  # handled: the episode for that message is over
         listener = pickup.listener_health(cfg.root, project, harness, stale_seconds=LISTENER_STALE_SECONDS)
         if not session or (listener["attached"] and listener.get("session") == session):
             continue
@@ -534,21 +617,30 @@ def _check_listeners(cfg, store, project, harnesses, state, log):
             if time.time() - float(item.get("updated") or 0) < grace:
                 continue
             # One alert per stuck message, never one per pass.
-            if raise_alert(project, prefix + item["id"], (
-                    f"A {harness} message from {item['sender']} ({item['id'][:8]}) has waited over "
-                    f"{grace} s because the {harness} coordinator listener is not attached. Fix: retype "
-                    f"take coordinator in the {harness} coordinator chat."), state):
+            if raise_alert(project, f"stuck-{harness}-{item['id']}", (
+                    f"A {harness} message from {item['sender']} ({item['id'][:8]}) is waiting because the "
+                    f"{harness} coordinator listener is not attached. Fix: retype take coordinator in "
+                    f"the {_chat_label(harness, 'coordinator', session)}."), state,
+                    harness=harness, message_id=item["id"], root=cfg.root):
                 log({"event": "fallback-report", "harness": harness, "id": item["id"]})
 
 
 ALERT_EVENTS = {
-    "held-paused": "its last turn was interrupted, so its queue is paused. Fix: open that chat and press Resume.",
-    "fallback-undelivered": "it was opened once but did not take the hint. Fix: open that chat and check it is idle.",
-    "fallback-unavailable": "the bridge cannot read its state, so it will not open it. Fix: check that chat.",
+    "held-paused": ("its last turn was interrupted, so its queue is paused", "click Resume in the {chat}"),
+    "fallback-undelivered": ("it was opened once and still did not take the hint", "open the {chat}"),
+    "fallback-unavailable": ("the bridge cannot read the chat's state, so it will not open it",
+                             "open the {chat} and check it is idle"),
 }
 
 
-def _alert_pickup_events(store, project, state, log):
+def _chat_label(harness, role, session):
+    port = pickup.adapter(harness)
+    name = port.chat_name(session) if port is not None and session else None
+    label = f"{harness} {role} chat"
+    return f'{label} "{name}"' if name else label
+
+
+def _alert_pickup_events(cfg, store, project, state, log):
     """Turn new pull-mode problems recorded by the dispatcher into one alert each."""
     since = float(state.get("pickup_events_at", 0) or 0)
     try:
@@ -558,9 +650,15 @@ def _alert_pickup_events(store, project, state, log):
     for event in events:
         state["pickup_events_at"] = max(float(state.get("pickup_events_at", 0) or 0), event["at"])
         reason = ALERT_EVENTS.get(event["event"])
-        if reason and raise_alert(project, f"{event['event']}-{event['notification_id']}", (
-                f"A {event['harness']} message ({event['notification_id'][:8]}) is waiting for the "
-                f"{event['harness']} {event['role']} chat: {reason}"), state):
+        if not reason:
+            continue
+        chat = _chat_label(event["harness"], event["role"], event["session"])
+        why, fix = reason
+        # Keyed by message, so a paused queue and a later undelivered open stay one alert.
+        if raise_alert(project, f"stuck-{event['harness']}-{event['notification_id']}", (
+                f"A {event['harness']} message ({event['notification_id'][:8]}) is waiting for the {chat}: "
+                f"{why}. Fix: {fix.format(chat=chat)}."), state, harness=event["harness"],
+                message_id=event["notification_id"], root=cfg.root):
             log({"event": "alert", "reason": event["event"], "harness": event["harness"],
                  "id": event["notification_id"]})
 
@@ -581,7 +679,11 @@ def main(argv=None):
         print(json.dumps(ensure(cfg.root, project)), flush=True)
         return 0
     lock = Lock(paths(cfg.root, project)["lock"])
-    if not lock.acquire():
+    for _ in range(10):
+        if lock.acquire():
+            break
+        time.sleep(0.1)
+    else:
         print(json.dumps({"event": "already-running", "project": project}), flush=True)
         return 0  # a second start is a no-op, not a crash loop
     store = config.open_store(cfg)
@@ -613,13 +715,18 @@ def main(argv=None):
                                     "token": token, "started_at": started, "beat_at": time.time()})
             try:
                 run_pass(cfg, store, project, state, log=log)
-            except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
-                log({"event": "pass-held", "reason": str(exc)})
+            except Exception as exc:  # one bad pass must never end the watcher
+                log({"event": "pass-held", "reason": f"{type(exc).__name__}: {exc}"})
             if args.once:
                 break
             watch.wait(POLL_SECONDS, lambda: stopped)
     finally:
         watch.close()
+        try:
+            _save_state(heartbeat, {"project": project, "pid": os.getpid(), "token": token,
+                                    "started_at": started, "beat_at": time.time(), "stopped": True})
+        except OSError:
+            pass
         lock.release()
         log({"event": "stopped"})
     return 0

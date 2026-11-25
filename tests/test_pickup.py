@@ -342,3 +342,39 @@ def test_fallback_logs_every_condition_and_reports_an_open_that_did_not_deliver(
     wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
     assert [e["event"] for e in wake.pickup_events(store, "sample", since=-1e12)][-1] == "fallback-undelivered"
     assert _FakeCodex.opened == ["codex-coordinator"]
+
+
+def test_a_failed_fallback_open_is_recorded_and_never_retried(tmp_path, fake_codex):
+    store = _store(tmp_path)
+    message_id = _at_coordinator(store, "devin", "codex")
+    wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+    _aged_attempt(store, message_id, 400)
+
+    def refuse(self, session):
+        _FakeCodex.opened.append(session)
+        raise RuntimeError("host refused")
+    _FakeCodex.fallback = refuse
+    try:
+        with pytest.raises(RuntimeError):
+            wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+        _aged_attempt(store, message_id, 400)
+        result = wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+        assert result["status"] == "held" and _FakeCodex.opened == ["codex-coordinator"]
+    finally:
+        del _FakeCodex.fallback
+    assert "fallback-attempt" in [e["event"] for e in wake.pickup_events(store, "sample", since=-1e12)]
+
+
+def test_wake_service_starts_a_missing_watcher_for_pull_harnesses(tmp_path, monkeypatch):
+    from multi_harness_bridge import watcher
+    root = tmp_path / "ws"
+    root.mkdir()
+    monkeypatch.setenv("MHB_HOME", str(tmp_path / "state"))
+    register("sample", [root], tmp_path / "state")
+    monkeypatch.chdir(root)
+    started = []
+    monkeypatch.setattr(watcher, "ensure", lambda home, project: started.append(project) or {"action": "started", "status": "alive"})
+    assert wake.ensure_watcher_for_pull("sample")["status"] == "watcher-started"
+    for harness in ("codex", "claude", "devin"):
+        config.set_project_option(tmp_path / "state", "sample", harness, "coordinator_pickup", "push")
+    assert wake.ensure_watcher_for_pull("sample") is None and started == ["sample"]

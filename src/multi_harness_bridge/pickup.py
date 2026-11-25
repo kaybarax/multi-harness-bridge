@@ -34,6 +34,7 @@ DEFAULTS = {
     "digest": "on",
     "digest_minutes": 30,
     "batch_seconds": 30,
+    "alert_escalate_minutes": 15,
 }
 # Hosts whose coordinator can collect its own mail. Every other host keeps push.
 PULL_CAPABLE = frozenset({"codex", "claude", "devin"})
@@ -68,6 +69,8 @@ def settings(root, project, harness) -> dict:
         "digest": digest if digest in ("on", "off") else DEFAULTS["digest"],
         "digest_minutes": _number(option("digest_minutes"), DEFAULTS["digest_minutes"], 1, 1440),
         "batch_seconds": _number(option("batch_seconds"), DEFAULTS["batch_seconds"], 0, 600),
+        "alert_escalate_minutes": _number(option("alert_escalate_minutes"),
+                                          DEFAULTS["alert_escalate_minutes"], 0, 1440),
     }
 
 
@@ -110,6 +113,10 @@ class CoordinatorPickup:
     def fallback(self, session):
         """Perform the one allowed navigation. Only called when check() says cold."""
         raise NotImplementedError
+
+    def chat_name(self, session):
+        """The chat's title as the user sees it, when the host exposes it; else None."""
+        return None
 
     def digest_nudge(self, project, session, seq, previous_seq=None):
         """Tell a bridge chat that digest ``seq`` is ready, without opening it.
@@ -181,6 +188,15 @@ class CodexPickup(CoordinatorPickup):
         if idle < grace_seconds:
             return ColdCheck("busy", "thread wrote within the grace window", conditions)
         return ColdCheck("cold", "hint not delivered and thread idle for the grace window", conditions)
+
+    def chat_name(self, session):
+        try:
+            db = self.codex_home / "state_5.sqlite"
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2) as conn:
+                row = conn.execute("SELECT title FROM threads WHERE id=?", (session,)).fetchone()
+            return row[0] if row and row[0] else None
+        except (sqlite3.Error, OSError):
+            return None
 
     def digest_nudge(self, project, session, seq, previous_seq=None):
         import shutil

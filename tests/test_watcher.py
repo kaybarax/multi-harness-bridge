@@ -54,18 +54,29 @@ def test_simultaneous_starts_produce_one_watcher(tmp_path):
 def test_health_alive_hung_and_stopped(tmp_path):
     paths = watcher.paths(tmp_path, "sample")
     assert watcher.health(tmp_path, "sample")["status"] == "stopped"
-    lock = watcher.Lock(paths["lock"])
-    assert lock.acquire()
-    paths["heartbeat"].write_text(json.dumps({"pid": 1, "beat_at": time.time(), "token": "t"}))
+    paths["heartbeat"].parent.mkdir(parents=True, exist_ok=True)
+    paths["heartbeat"].write_text(json.dumps({"pid": os.getpid(), "beat_at": time.time(), "token": "t"}))
     assert watcher.health(tmp_path, "sample")["status"] == "alive"
-    paths["heartbeat"].write_text(json.dumps({"pid": 1, "beat_at": time.time() - 999}))
+    paths["heartbeat"].write_text(json.dumps({"pid": os.getpid(), "beat_at": time.time() - 999}))
     assert watcher.health(tmp_path, "sample")["status"] == "hung"
     assert watcher.ensure(tmp_path, "sample", start=lambda *_: None)["action"] == "hung-needs-service-restart"
-    lock.release()
-    # A stale heartbeat without the lock is a dead watcher: a start is allowed.
+    # A dead watcher's heartbeat and leftover lock file never block a start.
+    paths["heartbeat"].write_text(json.dumps({"pid": 2 ** 22 + 12345, "beat_at": time.time()}))
+    paths["lock"].write_text("left behind")
+    assert watcher.health(tmp_path, "sample")["status"] == "stopped"
     started = []
     watcher.ensure(tmp_path, "sample", start=lambda argv, root: started.append(argv))
     assert started and started[0][-2:] == ["--project", "sample"]
+
+
+def test_health_check_never_takes_the_lock(tmp_path):
+    lock = watcher.Lock(watcher.paths(tmp_path, "sample")["lock"])
+    assert lock.acquire()
+    try:
+        watcher.health(tmp_path, "sample")
+        assert lock.handle is not None
+    finally:
+        lock.release()
 
 
 def test_second_watcher_process_exits_zero(tmp_path, monkeypatch):
@@ -127,7 +138,7 @@ def test_digest_off_is_stored_and_offered_back(tmp_path, monkeypatch):
     assert shown["footer"].startswith("Digests are off.")
 
 
-def test_missing_listener_with_overdue_mail_alerts_once(tmp_path, monkeypatch):
+def test_missing_listener_alerts_bridge_first_once_per_message_then_escalates(tmp_path, monkeypatch):
     cfg, store = _project(tmp_path, monkeypatch)
     message = store.send("sample", "codex", "claude", "x", "k")
     store.forward_pull("sample", "claude")
@@ -141,27 +152,41 @@ def test_missing_listener_with_overdue_mail_alerts_once(tmp_path, monkeypatch):
     for _ in range(2):
         watcher._check_listeners(cfg, store, "sample", ["claude"], state, logs.append)
     assert [entry["event"] for entry in logs] == ["fallback-report"]  # once per message, not per pass
-    assert len(calls) == 1 and "Fix: retype take coordinator" in calls[0][2]
-    calls.clear()
+    assert calls == []  # the bridge chat hears first
+    feed = watcher.read_feed(watcher.paths(cfg.root, "sample")["feed"], 0)
+    assert feed[-1]["kind"] == "alert" and "Fix: retype take coordinator" in feed[-1]["excerpt"]
+    marker = json.loads(watcher.digest_path(cfg.root, "sample", "claude").read_text())
+    assert marker["alert"] is True
+    watcher.escalate_alerts(cfg.root, "sample", state, logs.append, clock=lambda: time.time() + 60)
+    assert calls == []
+    watcher.escalate_alerts(cfg.root, "sample", state, logs.append, clock=lambda: time.time() + 16 * 60)
+    watcher.escalate_alerts(cfg.root, "sample", state, logs.append, clock=lambda: time.time() + 30 * 60)
+    assert len(calls) == 1 and "still waiting" in calls[0][2]
     claimed = store.claim("sample", "claude", "coordinator", "claude-coordinator")
     store.finish("sample", "claude", "coordinator", "claude-coordinator", claimed["id"], claimed["lease"])
-    watcher._check_listeners(cfg, store, "sample", ["claude"], state, logs.append)
-    assert not any(k.startswith("listener-claude-") for k in state["alerts"])
-    assert watcher.raise_alert("sample", "k", "text", state, run=lambda argv, **_: calls.append(argv))
-    assert calls[0][:2] == ["alert", "sample"]
+    watcher._clear_resolved_alerts(store, "sample", state)
+    assert state["alerts"] == {}
 
 
-def test_dispatcher_problems_become_one_alert_each(tmp_path, monkeypatch):
+def test_dispatcher_problems_become_one_alert_per_message_naming_chat_and_fix(tmp_path, monkeypatch):
     cfg, store = _project(tmp_path, monkeypatch)
     from multi_harness_bridge import wake
+    message_id = "11111111-2222-4333-8444-555555555555"
     route = ("sample", "codex", "coordinator", "codex-coordinator")
     with __import__("contextlib").closing(wake._ledger(store.path)) as db, db:
-        wake._pickup_event(db, route, "11111111-2222-4333-8444-555555555555", "held-paused", "{}")
-        wake._pickup_event(db, route, "11111111-2222-4333-8444-555555555555", "held-busy", "{}")
-    sent = []
-    monkeypatch.setattr(watcher, "_alert_command", lambda: ["alert", "{text}"])
-    monkeypatch.setattr(watcher.subprocess, "run", lambda argv, **_: sent.append(argv))
+        wake._pickup_event(db, route, message_id, "held-paused", "{}")
+        wake._pickup_event(db, route, message_id, "fallback-undelivered", "{}")
+
+    class Named(pickup.CodexPickup):
+        def __init__(self):
+            pass
+
+        def chat_name(self, session):
+            return "Team Coordinator"
+    monkeypatch.setitem(pickup._ADAPTERS, "codex", Named)
     state, logs = {}, []
-    watcher._alert_pickup_events(store, "sample", state, logs.append)
-    watcher._alert_pickup_events(store, "sample", state, logs.append)
-    assert len(sent) == 1 and "press Resume" in sent[0][1]
+    watcher._alert_pickup_events(cfg, store, "sample", state, logs.append)
+    watcher._alert_pickup_events(cfg, store, "sample", state, logs.append)
+    assert len(state["alerts"]) == 1
+    text = next(iter(state["alerts"].values()))["text"]
+    assert 'click Resume in the codex coordinator chat "Team Coordinator"' in text

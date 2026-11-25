@@ -16,6 +16,15 @@ mhb option unset my-project codex coordinator_pickup      # return to the defaul
 `push` keeps the earlier behaviour exactly, so a harness can be moved back
 with one setting and no new release.
 
+**Upgrading from 1.4 or earlier.** Codex, Claude Code and Devin Local switch to
+`pull` unless you set `push`. Their inbox stages are then forwarded only by the
+shared watcher. Install it (`multi-harness-service --watch`); until you do, the
+existing wake service starts a watcher when it finds none running. Claude Code
+coordinators also need their listener: retype take coordinator in that chat,
+or run `mhb pickup PROJECT claude coordinator` and start the command it
+prints. To upgrade without changing behaviour first, set
+`coordinator_pickup push` for each harness, then move them one at a time.
+
 ## Parts
 
 - **Shared watcher** (`multi-harness-watch --project P`): one detached
@@ -53,14 +62,17 @@ chat is cold:
 | `fallback_open` | `never`, `after_wait`, `always` | `after_wait` |
 | `fallback_grace_seconds` | 10 to 86400 | 180 |
 
-With `after_wait`, the Codex adapter opens the thread once per message, after
+With `always`, every nudge also opens the chat (the earlier behaviour); use it
+only as an explicit choice. With `after_wait`, the Codex adapter opens the thread once per message, after
 the grace window, when the hint is unclaimed, the queued hint is not in the
 thread's transcript, and the transcript shows no activity in the window. A busy
 thread is left alone, because Codex drains its queue at the end of a turn. If
 the transcript cannot be read, nothing is opened. Claude Code and Devin Local
-have no way to open a chat from outside; their fallback is a report: the
-watcher logs it and raises one alert. Every fallback decision is recorded and
-can be listed with `wake.pickup_events`.
+have no way to open a chat from outside; their fallback is a report. A Codex
+thread whose last turn was interrupted keeps its queue paused until Resume is
+clicked; that is detected and reported, never opened. An open that still does
+not deliver is reported, never repeated. Every decision, with the value of each
+condition behind it, is recorded and can be listed with `wake.pickup_events`.
 
 ## Bridge chat: history board and digests
 
@@ -99,9 +111,14 @@ that is currently bound (`--no-start` only reports).
 
 ## Alerts
 
-Add an `alert` argv to the `MHB_WAKE_CONFIG` file to receive one alert per
-failure episode (for example a listener that is not attached while mail waits).
-Placeholders: `{project}`, `{text}`.
+A stuck message raises one alert, never one per retry. Each alert names the
+chat and its fix (for example "click Resume in the codex coordinator chat
+\"Name\"", "open the ... chat", or "retype take coordinator in the ... chat").
+The bridge chat hears first: the alert enters the history feed and a digest is
+marked ready at once, even with digests off. If the message is still stuck
+after `alert_escalate_minutes` (default 15, `0` sends at once), the alert is
+sent once through the `alert` argv in the `MHB_WAKE_CONFIG` file, for example
+a chat relay. Placeholders: `{project}`, `{text}`.
 
 ```json
 {"alert": ["/path/to/notify", "{project}", "{text}"]}
