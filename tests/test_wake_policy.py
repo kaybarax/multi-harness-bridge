@@ -596,3 +596,19 @@ def test_remote_transport_callers_may_message_but_never_change_settings(tmp_path
     result = transport.dispatch(cfg, "t" * 43, {"op": "send_fanout", "recipients": ["devin"], "body": "hi",
                                                 "key": "k"}, remote=True)
     assert store.message_meta("sample", result["deliveries"][0]["id"])["origin"] == "wake"
+
+
+def test_devin_finish_records_receipt_even_when_the_reply_hits_the_loop_cap(tmp_path):
+    from multi_harness_bridge import devin_acp
+    cfg, store = _store(tmp_path)
+    store.bind("sample", "devin", "coordinator", "dv")
+    config.set_project_option(cfg.root, "sample", "devin", "loop_cap_messages", "1")
+    store.send_fanout("sample", "devin", ["codex"], "earlier", "e", session="dv", origin="wake")
+    request = store.send_fanout("sample", "codex", ["devin"], "Q", "q", session="codex-coordinator", origin="user")
+    delivery = request["deliveries"][0]["id"]
+    _deliver(store, delivery, "devin", "codex")
+    receipt = devin_acp._pickup_notification(store, "sample", "coordinator", "dv", delivery)
+    result = devin_acp._finish_notification(store, "sample", "dv", delivery, receipt, delivery, receipt["lease"],
+                                            "Answer", origin="wake")
+    assert result["acknowledged"] and "Loop cap reached" in result["reply_refused"]
+    assert store.trace("sample", delivery)["stage"] == "done"

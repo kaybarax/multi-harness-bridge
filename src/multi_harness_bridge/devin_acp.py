@@ -601,7 +601,11 @@ def _permission_handler(*, server_name, expected_session, workspace, notificatio
                                          previous_call=prior, native_db=native_db)
         if args is None and mode == wake_policy.ACT:
             return act(params, call_id)
-        if tool in state.get("tools", ()):
+        if tool == PICKUP_TOOL and tool in state.get("tools", ()):
+            return {"outcome": {"outcome": "cancelled"}}
+        if tool == FINISH_TOOL and (state.get("finish_count", 0) >= 2
+                                    or call_id in state.get("approved_ids", ())):
+            # One retry, for a finish whose first attempt the bridge refused (the store keeps it exact).
             return {"outcome": {"outcome": "cancelled"}}
         if args is None or args.get("notification_id") != notification_id:
             return {"outcome": {"outcome": "cancelled"}}
@@ -635,6 +639,9 @@ def _permission_handler(*, server_name, expected_session, workspace, notificatio
             return {"outcome": {"outcome": "cancelled"}}
         if tool == PICKUP_TOOL:
             state["pickup_call"] = call_id
+        if tool == FINISH_TOOL:
+            state["finish_count"] = state.get("finish_count", 0) + 1
+            state.setdefault("approved_ids", set()).add(call_id)
         state.setdefault("tools", set()).add(tool)
         state["allowed"] += 1
         return {"outcome": {"outcome": "selected", "optionId": allowed[0]}}
@@ -681,9 +688,15 @@ def _finish_notification(store, project, session, expected_id, receipt, notifica
     if reply is None:
         finished = store.finish(project, "devin", "coordinator", session, notification_id, lease)
     else:
-        finished = store.finish_and_reply(project, "devin", session, notification_id, lease, reply,
-                                          f"wake-reply:{notification_id}", origin=origin, ack_only=ack_only)
-        result["reply"] = finished
+        from .store import LoopCapReached
+        try:
+            finished = store.finish_and_reply(project, "devin", session, notification_id, lease, reply,
+                                              f"wake-reply:{notification_id}", origin=origin, ack_only=ack_only)
+            result["reply"] = finished
+        except LoopCapReached as exc:
+            # Receipt never depends on the cap: record it and say why the reply did not go.
+            finished = store.finish(project, "devin", "coordinator", session, notification_id, lease)
+            result["reply_refused"] = str(exc)
     if not finished:
         raise ValueError("The notification lease is stale or belongs to another coordinator")
     return result
