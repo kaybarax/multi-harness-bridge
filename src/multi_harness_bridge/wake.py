@@ -509,11 +509,11 @@ def _pull_decision(store, project, harness, role, session, item, attempt):
     opts = pickup.settings(root, project, harness)
     if attempt is None or port is None or not port.can_open:
         return "nudge", None
-    if opts["fallback_open"] == "always":
-        return "fallback-and-nudge", "fallback_open=always"
     check = port.check(session, item["id"], opts["fallback_grace_seconds"])
     if check.state == "consumed":
         return "nudge", None
+    if opts["fallback_open"] == "always" and check.state != "paused":
+        return "fallback-and-nudge", "fallback_open=always"
     route = (project, harness, role, session)
     age = time.time() - float(item.get("updated") or 0)
     record = json.dumps({"detail": check.detail, "unclaimed": True,

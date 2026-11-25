@@ -190,3 +190,5 @@ def test_dispatcher_problems_become_one_alert_per_message_naming_chat_and_fix(tm
     assert len(state["alerts"]) == 1
     text = next(iter(state["alerts"].values()))["text"]
     assert 'click Resume in the codex coordinator chat "Team Coordinator"' in text
+    outside = next(iter(state["alerts"].values()))["external_text"]
+    assert "Team Coordinator" not in outside and "click Resume in the codex coordinator chat" in outside

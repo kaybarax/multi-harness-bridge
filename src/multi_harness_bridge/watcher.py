@@ -435,7 +435,7 @@ def _alert_record(value):
 
 
 def raise_alert(project, key, text, state, *, harness=None, message_id=None, run=None,
-                root=None, clock=time.time):
+                root=None, clock=time.time, external_text=None):
     """Open one alert episode per stuck message.
 
     The bridge chat hears first: the alert goes into the history feed and a
@@ -447,10 +447,11 @@ def raise_alert(project, key, text, state, *, harness=None, message_id=None, run
     alerts = state.setdefault("alerts", {})
     if key in alerts:
         return False
-    alerts[key] = {"first_at": clock(), "text": text, "harness": harness, "id": message_id,
-                   "escalated": root is None}
+    record = {"first_at": clock(), "text": text, "external_text": external_text or text,
+              "harness": harness, "id": message_id, "escalated": root is None}
     if root is None:
-        _run_alert_command(project, text, run)
+        alerts[key] = record
+        _run_alert_command(project, record["external_text"], run)
         return True
     feed = paths(root, project)["feed"]
     feed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -467,6 +468,7 @@ def raise_alert(project, key, text, state, *, harness=None, message_id=None, run
         _save_state(digest_path(root, project, harness),
                     {"project": project, "harness": harness, "seq": seq, "ready_at": clock(),
                      "count": 1, "alert": True})
+    alerts[key] = record  # only once the bridge chat has been told; a failed write retries next pass
     return True
 
 
@@ -494,7 +496,8 @@ def escalate_alerts(root, project, state, log, *, run=None, clock=time.time):
         if clock() - float(record.get("first_at", 0)) < delay:
             continue
         minutes = int((clock() - float(record["first_at"])) // 60)
-        _run_alert_command(project, f"{record.get('text', '')} (still waiting after {minutes} min)", run)
+        text = record.get("external_text") or record.get("text", "")
+        _run_alert_command(project, f"{text} (still waiting after {minutes} min)", run)
         record["escalated"] = True
         state["alerts"][key] = record
         log({"event": "alert-escalated", "key": key})
@@ -633,10 +636,13 @@ ALERT_EVENTS = {
 }
 
 
-def _chat_label(harness, role, session):
+def _chat_label(harness, role, session, *, with_title=True):
+    """The chat as the user knows it. Titles stay local: an outside alert gets the plain label."""
+    label = f"{harness} {role} chat"
+    if not with_title:
+        return label
     port = pickup.adapter(harness)
     name = port.chat_name(session) if port is not None and session else None
-    label = f"{harness} {role} chat"
     return f'{label} "{name}"' if name else label
 
 
@@ -652,13 +658,17 @@ def _alert_pickup_events(cfg, store, project, state, log):
         reason = ALERT_EVENTS.get(event["event"])
         if not reason:
             continue
-        chat = _chat_label(event["harness"], event["role"], event["session"])
         why, fix = reason
+
+        def text(chat):
+            return (f"A {event['harness']} message ({event['notification_id'][:8]}) is waiting for the "
+                    f"{chat}: {why}. Fix: {fix.format(chat=chat)}.")
         # Keyed by message, so a paused queue and a later undelivered open stay one alert.
-        if raise_alert(project, f"stuck-{event['harness']}-{event['notification_id']}", (
-                f"A {event['harness']} message ({event['notification_id'][:8]}) is waiting for the {chat}: "
-                f"{why}. Fix: {fix.format(chat=chat)}."), state, harness=event["harness"],
-                message_id=event["notification_id"], root=cfg.root):
+        if raise_alert(project, f"stuck-{event['harness']}-{event['notification_id']}",
+                       text(_chat_label(event["harness"], event["role"], event["session"])), state,
+                       harness=event["harness"], message_id=event["notification_id"], root=cfg.root,
+                       external_text=text(_chat_label(event["harness"], event["role"], event["session"],
+                                                      with_title=False))):
             log({"event": "alert", "reason": event["event"], "harness": event["harness"],
                  "id": event["notification_id"]})
 

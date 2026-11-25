@@ -378,3 +378,15 @@ def test_wake_service_starts_a_missing_watcher_for_pull_harnesses(tmp_path, monk
     for harness in ("codex", "claude", "devin"):
         config.set_project_option(tmp_path / "state", "sample", harness, "coordinator_pickup", "push")
     assert wake.ensure_watcher_for_pull("sample") is None and started == ["sample"]
+
+
+def test_paused_thread_is_never_opened_even_with_always(tmp_path, fake_codex):
+    store = _store(tmp_path)
+    config.set_project_option(tmp_path, "sample", "codex", "fallback_open", "always")
+    message_id = _at_coordinator(store, "devin", "codex")
+    wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+    _aged_attempt(store, message_id, 400)
+    _FakeCodex.state = "paused"
+    result = wake.wake_one(store, "sample", "codex", "coordinator", "codex-coordinator", commands={})
+    assert result["status"] == "held" and _FakeCodex.opened == []
+    assert all(argv[1] != "open" for argv in fake_codex)
