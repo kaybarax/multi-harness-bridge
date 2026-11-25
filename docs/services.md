@@ -117,3 +117,7 @@ start a detached Claude turn. To check state, inspect the OS service manager
 and use `multi-harness-wake --project <project> --once` from a registered
 workspace. Queue enable/stop controls remain separate from the OS service
 process.
+
+## Shared watcher (coordinator pull mode)
+
+`multi-harness-service --watch` writes `org.multi-harness-bridge.watch.<project>.plist` on macOS. It runs `multi-harness-watch --project <project>` at login, restarts it after a crash, and logs to `<MHB_HOME>/watch/<project>.log`. A second start exits 0 under the watcher's lock. Keep the wake service only while some harness in the project stays on `push`. See [Coordinator pickup](pickup.md).

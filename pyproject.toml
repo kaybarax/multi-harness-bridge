@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "multi-harness-bridge"
-version = "1.4.1"
+version = "1.5.0"
 description = "A local, project-scoped mailbox and handoff system for AI development harnesses"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,6 +22,7 @@ test = ["pytest>=8,<10"]
 mhb = "multi_harness_bridge.cli:main"
 multi-harness-bridge = "multi_harness_bridge.cli:main"
 multi-harness-wake = "multi_harness_bridge.wake:main"
+multi-harness-watch = "multi_harness_bridge.watcher:main"
 multi-harness-telegram = "multi_harness_bridge.telegram:main"
 multi-harness-service = "multi_harness_bridge.services:main"
 multi-harness-skills = "multi_harness_bridge.skills:main"

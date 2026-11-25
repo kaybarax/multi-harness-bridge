@@ -27,6 +27,12 @@ def wake_argv(executable: str | Path, project: str) -> list[str]:
     return [_clean(executable, "Executable"), "-m", "multi_harness_bridge.wake", "--project", project]
 
 
+def watch_argv(executable: str | Path, project: str) -> list[str]:
+    """The shared watcher for coordinator pull mode, one per project."""
+    config.identifier(project)
+    return [_clean(executable, "Executable"), "-m", "multi_harness_bridge.watcher", "--project", project]
+
+
 def _exec(argv: list[str], *, expand_dollars=True) -> str:
     """Quote one systemd ExecStart argv without invoking a shell."""
     def quote(arg: str) -> str:
@@ -54,19 +60,25 @@ def render_systemd(project: str, root: str | Path, executable: str | Path, state
 
 
 def render_launchd(project: str, root: str | Path, executable: str | Path,
-                   state_home: str | Path) -> bytes:
+                   state_home: str | Path, *, kind: str = "wake") -> bytes:
     config.identifier(project)
     root = _clean(Path(root).resolve(), "Project root")
     state_home = _clean(Path(state_home).resolve(), "State directory")
-    label = f"org.multi-harness-bridge.wake.{project}"
+    label = f"org.multi-harness-bridge.{kind}.{project}"
     payload = {
         "Label": label,
-        "ProgramArguments": wake_argv(executable, project),
+        "ProgramArguments": (watch_argv if kind == "watch" else wake_argv)(executable, project),
         "WorkingDirectory": root,
         "EnvironmentVariables": {"MHB_HOME": state_home},
         "RunAtLoad": True,
         "KeepAlive": True,
     }
+    if kind == "watch":
+        # A second start exits 0 under the watcher's lock; restart only after a crash.
+        payload["KeepAlive"] = {"SuccessfulExit": False}
+        payload["ThrottleInterval"] = 10
+        payload["StandardOutPath"] = str(Path(state_home) / "watch" / f"{project}.log")
+        payload["StandardErrorPath"] = str(Path(state_home) / "watch" / f"{project}.log")
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
@@ -144,7 +156,7 @@ def default_output_dir(name: str) -> Path:
 
 
 def generate(*, platform_name: str | None = None, output_dir: str | Path | None = None,
-             executable: str | Path | None = None, state=None) -> list[Path]:
+             executable: str | Path | None = None, state=None, kind: str = "wake") -> list[Path]:
     """Write deterministic per-project unit files without enabling them."""
     selected = _platform_name(platform_name)
     state = state or config.load()
@@ -159,7 +171,13 @@ def generate(*, platform_name: str | None = None, output_dir: str | Path | None 
         if not roots:
             continue
         root = roots[0]
-        if selected == "macos":
+        if kind == "watch":
+            if selected != "macos":
+                raise ValueError("Watcher service generation is provided for macOS launchd; "
+                                 "on other systems run multi-harness-watch under your service manager")
+            path = output / f"org.multi-harness-bridge.watch.{project}.plist"
+            data = render_launchd(project, root, python, state.root, kind="watch")
+        elif selected == "macos":
             path = output / f"org.multi-harness-bridge.wake.{project}.plist"
             data = render_launchd(project, root, python, state.root)
         elif selected == "linux":
@@ -178,9 +196,12 @@ def main(argv=None):
     parser.add_argument("generate", nargs="?", choices=("generate",), default="generate")
     parser.add_argument("--platform", dest="platform_name", help="override detected OS for packaging and inspection")
     parser.add_argument("--output-dir", type=Path, help="write generated files here instead of the OS user service directory")
+    parser.add_argument("--watch", action="store_true",
+                        help="generate the shared watcher service (coordinator pull mode) instead of the wake service")
     args = parser.parse_args(argv)
     try:
-        result = generate(platform_name=args.platform_name, output_dir=args.output_dir)
+        result = generate(platform_name=args.platform_name, output_dir=args.output_dir,
+                          kind="watch" if args.watch else "wake")
         print(json.dumps({"generated": [str(path) for path in result]}, indent=2))
         return 0
     except (OSError, ValueError) as exc:

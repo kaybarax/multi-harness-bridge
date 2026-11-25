@@ -194,7 +194,7 @@ def test_devin_role_server_registers_only_expected_native_tools(tmp_path, monkey
     assert set(server.tools) == {"prepare_role_handoff", "take_coordinator", "take_bridge",
                                  "bridge_status", "pickup_notification", "acknowledge",
                                  "pickup_wake", "finish_wake", "send_message", "send_fanout",
-                                 "reply_free_text", "set_pickup", "propagate_skills"}
+                                 "reply_free_text", "set_pickup", "propagate_skills", "bridge_digest"}
 
 
 def test_devin_skill_propagation_uses_verified_native_turn_without_environment_identity(tmp_path, monkeypatch):

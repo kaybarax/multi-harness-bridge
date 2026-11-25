@@ -1,7 +1,9 @@
 # Native automatic wake drivers
 
 `multi-harness-wake` polls the registered project's mailbox and nudges the
-exact already-bound native session. It never claims or acknowledges a message;
+exact already-bound native session for every harness set to
+`coordinator_pickup = push`. Harnesses set to `pull` are served by the shared
+watcher instead; see [Coordinator pickup](pickup.md). It never claims or acknowledges a message;
 the receiving assistant remains responsible for reading and processing the
 mailbox through the normal protocol. The dispatcher checks the Store's enabled
 state and role binding on every cycle, and polls every four seconds by default.
@@ -63,10 +65,13 @@ establish the native mailbox role by itself.
 ## Host differences
 
 Codex uses its `codex queue --thread SESSION --message PROMPT` host interface,
-which queues a prompt for the exact session. On macOS the dispatcher first
-opens `codex://threads/SESSION` so an unloaded Desktop thread attaches to the
-app-server and can drain the queue; the deep link briefly navigates the
-Desktop UI. Queued items only dispatch at turn boundaries, so a busy
+which queues a prompt for the exact session. A thread the Desktop app has
+loaded drains it without any navigation. Under `coordinator_pickup = pull`
+(the default since 1.5.0, see [Coordinator pickup](pickup.md)) the dispatcher
+never opens a thread except in the logged fallback for a proven-cold thread.
+Under `push`, on macOS the dispatcher first opens `codex://threads/SESSION` so
+an unloaded Desktop thread attaches to the app-server and can drain the queue;
+the deep link briefly navigates the Desktop UI. Queued items only dispatch at turn boundaries, so a busy
 coordinator chat can hold a wake behind a manual steer. A project can instead
 opt into the agent relay with `mhb option set PROJECT codex coordinator_wake
 agent-relay`, which records the choice in `<MHB_HOME>/options.json` and

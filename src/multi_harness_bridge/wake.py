@@ -20,7 +20,7 @@ import sys
 import time
 import uuid
 
-from . import config, legacy
+from . import config, legacy, pickup
 from .store import (DB_TIMEOUT_SECONDS, WAKE_RETRY_BASE_SECONDS as RETRY_BASE_SECONDS,
                     WAKE_RETRY_MAX_SECONDS as RETRY_MAX_SECONDS, WAKE_STALE_SECONDS as STALE_WAKE_SECONDS)
 
@@ -175,7 +175,18 @@ def _default_wake(harness, values, *, before_prompt=None):
         executable = shutil.which("codex")
         if not executable:
             raise WakeError("Codex CLI is unavailable; configure a native adapter")
-        _load_codex_thread(values["session"])
+        if values.get("pickup_fallback"):
+            # Pull mode's one allowed navigation: open a proven-cold thread so
+            # its already queued hint can drain. Nothing new is queued.
+            if before_prompt is not None and not before_prompt():
+                raise WakeDeferred("Wake reservation changed before the fallback open")
+            try:
+                pickup.adapter("codex").fallback(values["session"])
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                raise WakeError(f"Fallback open failed ({type(exc).__name__}); outcome is uncertain") from None
+            return
+        if values.get("navigate", True):
+            _load_codex_thread(values["session"])
         argv = [executable, "queue", "--thread", values["session"], "--message", prompt]
     elif harness == "claude":
         if os.environ.get("MHB_CLAUDE_DETACHED_WAKE") != "1":
@@ -233,6 +244,9 @@ def _ledger(db_path):
         prior_updated_at REAL NOT NULL, action TEXT NOT NULL, action_at REAL NOT NULL)""")
     db.execute("""CREATE INDEX IF NOT EXISTS mhb_wake_history_route ON mhb_wake_history
         (project,notification_id,harness,role,session)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS mhb_pickup_events (
+        project TEXT NOT NULL, harness TEXT NOT NULL, role TEXT NOT NULL, session TEXT NOT NULL,
+        notification_id TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL, at REAL NOT NULL)""")
     db.commit()
     return db
 
@@ -466,6 +480,68 @@ def _within_relay_grace(item):
             and time.time() - updated < RELAY_GRACE_SECONDS)
 
 
+def _pickup_event(db, route, notification_id, event, detail):
+    db.execute("INSERT INTO mhb_pickup_events VALUES(?,?,?,?,?,?,?,?)",
+               (*route, notification_id, event, detail, time.time()))
+
+
+def pickup_events(store, project, since=0.0, limit=500):
+    """Read logged pull-mode decisions (nudges held, fallbacks, unavailable fallbacks)."""
+    with closing(_ledger(store.path)) as db:
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute(
+            """SELECT * FROM mhb_pickup_events WHERE project=? AND at>? ORDER BY at LIMIT ?""",
+            (project, since, limit))]
+
+
+def _pull_decision(store, project, harness, role, session, item, attempt):
+    """Choose how the watcher nudges a pull-mode coordinator; push never comes here.
+
+    Returns ("nudge", None), ("fallback", detail) or ("hold", reason). No nudge
+    navigates. For an adapter that can open a chat, a repeat nudge needs proof
+    that the chat consumed the earlier hint, and a proven-cold chat may be
+    opened once, after the grace window, when the project allows it; anything
+    unproven only holds. Adapters that cannot navigate (Devin's ACP prompt)
+    repeat under the dispatcher's normal backoff.
+    """
+    port = pickup.adapter(harness)
+    root = Path(store.path).parent
+    opts = pickup.settings(root, project, harness)
+    if attempt is None or port is None or not port.can_open:
+        return "nudge", None
+    check = port.check(session, item["id"], opts["fallback_grace_seconds"])
+    if check.state == "consumed":
+        return "nudge", None
+    if opts["fallback_open"] == "always" and check.state != "paused":
+        return "fallback-and-nudge", "fallback_open=always"
+    route = (project, harness, role, session)
+    age = time.time() - float(item.get("updated") or 0)
+    record = json.dumps({"detail": check.detail, "unclaimed": True,
+                         "seconds_at_coordinator_stage": round(age, 1),
+                         **(check.conditions or {})}, sort_keys=True)
+    with closing(_ledger(store.path)) as db:
+        opened = db.execute("""SELECT at FROM mhb_pickup_events WHERE project=? AND harness=? AND role=?
+            AND session=? AND notification_id=? AND event IN ('fallback-attempt','fallback-open')
+            ORDER BY at LIMIT 1""",
+            (*route, item["id"])).fetchone()
+        if (check.state == "cold" and not opened and opts["fallback_open"] == "after_wait"
+                and age >= opts["fallback_grace_seconds"]):
+            return "fallback", record
+        if opened and time.time() - opened[0] >= opts["fallback_grace_seconds"]:
+            event = "fallback-undelivered"  # opened once; the chat still did not take the hint
+        elif check.state == "unknown":
+            event = "fallback-unavailable"
+        else:
+            event = "held-" + check.state
+        last = db.execute("""SELECT event FROM mhb_pickup_events WHERE project=? AND harness=?
+            AND role=? AND session=? AND notification_id=? ORDER BY at DESC LIMIT 1""",
+            (*route, item["id"])).fetchone()
+        if not last or last[0] != event:
+            with db:
+                _pickup_event(db, route, item["id"], event, record)
+    return "hold", f"pull-{check.state}"
+
+
 def wake_one(store, project, harness, role, session, *, commands=None):
     """Nudge one pending notification for the exact active native role.
 
@@ -484,6 +560,10 @@ def wake_one(store, project, harness, role, session, *, commands=None):
     item = store.pending(project, harness, role, session)
     if not item:
         return None
+    pull = pickup.is_pull(Path(store.path).parent, project, harness)
+    if pull and role == "inbox":
+        # The watcher forwards this harness's inbox stages; never wake the bridge chat.
+        return None
     if harness == "antigravity":
         from . import ag_sidecar
         if not ag_sidecar.agentapi(project):
@@ -496,7 +576,7 @@ def wake_one(store, project, harness, role, session, *, commands=None):
         # The in-session `mhb monitor` delivers read-only notification hints.
         # Do not start a detached Claude turn or record a duplicate external wake.
         return {"status": "subscription-managed", "id": item.get("id")}
-    if (harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
+    if (not pull and harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
             and _within_relay_grace(item)):
         with closing(_ledger(store.path)) as db:
             lane = db.execute("""SELECT notification_id,state FROM mhb_wake_sessions
@@ -514,7 +594,7 @@ def wake_one(store, project, harness, role, session, *, commands=None):
         if not candidate:
             return _attempt_status(db, item["id"], project, harness, role, session)
     item = candidate
-    if (harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
+    if (not pull and harness == "codex" and role == "coordinator" and _agent_relay_enabled(store, project)
             and _within_relay_grace(item)):
         # A finish operation reserves the lane before returning a relay tool
         # action. Keep the fallback held while that send is unresolved. For an
@@ -537,6 +617,20 @@ def wake_one(store, project, harness, role, session, *, commands=None):
               "session": session, "notification_id": str(item.get("id", "")),
               # Never forward the mailbox body into a prompt, argv, or GUI.
               "body": WAKE_PROMPT.format(notification_id=str(item.get("id", "")))}
+    decision, detail = "push", None
+    if pull and role == "coordinator" and not isinstance(entry, dict):
+        with closing(_ledger(store.path)) as db:
+            prior = _attempt_status(db, item["id"], project, harness, role, session)
+        decision, detail = _pull_decision(store, project, harness, role, session, item, prior)
+        if decision == "hold":
+            return {"id": item["id"], "status": "held", "reason": detail}
+        values["navigate"] = decision == "fallback-and-nudge"
+        values["pickup_fallback"] = decision == "fallback"
+        if decision == "fallback":
+            # Recorded before the open, so a failed or ambiguous open is never retried.
+            with closing(_ledger(store.path)) as events, events:
+                _pickup_event(events, (project, harness, role, session), item["id"],
+                              "fallback-attempt", detail or "")
     db = _ledger(store.path)
     state = "uncertain"
     refund_attempt = False
@@ -615,6 +709,13 @@ def wake_one(store, project, harness, role, session, *, commands=None):
             state = "uncertain"
             raise WakeError(f"Native wake failed ({type(exc).__name__}); delivery state is uncertain") from None
         state = "sent"
+        if decision in {"fallback", "fallback-and-nudge"}:
+            with closing(_ledger(store.path)) as events, events:
+                _pickup_event(events, (project, harness, role, session), notification_id,
+                              "fallback-open", detail or "")
+            return {"id": notification_id, "status": "sent", "fallback": "open", "reason": detail}
+        if pull and role == "coordinator":
+            return {"id": notification_id, "status": "sent", "pickup": "pull"}
         if harness == "antigravity":
             return {"id": notification_id, "status": state, "mechanism": "agentapi", "session": session}
         return {"id": notification_id, "status": "sent"}
@@ -628,15 +729,26 @@ def wake_one(store, project, harness, role, session, *, commands=None):
                                   attempt_started, state, refund_attempt)
 
 
-def cycle(project=None, harness=None, role=None):
-    cfg = config.load()
-    store = config.open_store(cfg)
+def cycle(project=None, harness=None, role=None, *, pickup_mode=None, cfg=None, store=None):
+    """Run one dispatch pass.
+
+    ``pickup_mode`` limits the pass to harnesses with that ``coordinator_pickup``
+    setting: the standalone wake service passes ``push`` and the shared watcher
+    passes ``pull``, so no harness is dispatched by both.
+    """
+    cfg = cfg or config.load()
+    store = store or config.open_store(cfg)
     selected_project = cfg.resolve(Path.cwd(), project)
     reports = []
     targets = [harness] if harness else sorted(HARNESS_NAMES)
     for actor in targets:
         if actor not in HARNESS_NAMES:
             raise ValueError(f"Unknown harness: {actor}")
+        if pickup_mode is not None and pickup.mode(cfg.root, selected_project, actor) != pickup_mode:
+            if harness:
+                reports.append({"project": selected_project, "harness": actor,
+                                "status": "skipped", "reason": f"coordinator_pickup is not {pickup_mode}"})
+            continue
         if actor == "antigravity":
             from . import ag_sidecar
             if not ag_sidecar.agentapi(selected_project):
@@ -814,6 +926,33 @@ def renotify(store, project, notification_id, *, harness, role, session):
     return {"id": notification_id, "status": "retry-authorized"}
 
 
+WATCHER_CHECK_SECONDS = 30.0
+
+
+def ensure_watcher_for_pull(project=None):
+    """Keep an upgraded installation delivering.
+
+    When any harness of the project is set (or defaults) to pull, its inbox
+    stages are forwarded only by the shared watcher. The wake service checks
+    for a live watcher and starts one when none runs, so mail never waits for
+    a watcher nobody started. Returns a report only when it acted.
+    """
+    try:
+        from . import watcher
+        cfg = config.load()
+        selected = cfg.resolve(Path.cwd(), project)
+        if not any(pickup.is_pull(cfg.root, selected, name) for name in sorted(HARNESS_NAMES)):
+            return None
+        state = watcher.health(cfg.root, selected)
+        if state["status"] == "alive":
+            return None
+        result = watcher.ensure(cfg.root, selected)
+        return {"project": selected, "status": "watcher-" + result.get("action", "checked"),
+                "watcher": result.get("status")}
+    except Exception as exc:  # never stop the push dispatcher over the watcher
+        return {"status": "watcher-check-held", "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project", help="registered project hint")
@@ -857,9 +996,15 @@ def main(argv=None):
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
+    last_watch_check = 0.0
     while not stopped:
+        if time.monotonic() - last_watch_check >= WATCHER_CHECK_SECONDS:
+            last_watch_check = time.monotonic()
+            report = ensure_watcher_for_pull(args.project)
+            if report:
+                print(json.dumps(report, sort_keys=True), flush=True)
         try:
-            for report in cycle(args.project, args.harness, args.role):
+            for report in cycle(args.project, args.harness, args.role, pickup_mode="push"):
                 print(json.dumps(report, sort_keys=True), flush=True)
         except WakeRejected as exc:
             print(json.dumps({"status": "retryable", "reason": str(exc)}), flush=True)
