@@ -754,6 +754,10 @@ class Store:
             return
         self._ensure_message_meta(db)
         now = time.time()
+        # A person's notification route is not an agent loop.
+        recipients = [r for r in recipients if r not in HUMAN_NOTIFICATION_ROUTES]
+        if sender in HUMAN_NOTIFICATION_ROUTES:
+            return
         for recipient in recipients:
             if loop_cap is not None:
                 limit, window = loop_cap

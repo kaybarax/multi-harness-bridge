@@ -201,7 +201,16 @@ def make_role_server(cfg, project):
         if (call["user_prompt"] or "").startswith(DIGEST_PREFIX) and tool != DIGEST_TOOL:
             raise PermissionError("This digest prompt is scoped to the digest tool")
         kind, woken = wake_policy.classify("devin", text=call["user_prompt"])
+        if kind == wake_policy.USER:
+            from .devin_acp import bridge_turn_active
+            if bridge_turn_active(store, project, call["session"]):
+                # Whatever the host recorded after the prompt, a bridge turn is still running here.
+                kind = wake_policy.UNKNOWN
         action = wake_policy.tool_action(tool, args)
+        if kind == wake_policy.WAKE and tool in ("pickup_notification", "acknowledge") and (
+                (args or {}).get("notification_id", (args or {}).get("id")) != woken):
+            raise wake_policy.WakePolicyRefused(
+                "Refused by the bridge's wake policy: a bridge turn handles only its own notification.")
         wake_policy.check(cfg.root, project, "devin", kind, action,
                           reply_to=(args or {}).get("reply_to") or (args or {}).get("notification_id"),
                           woken=woken)

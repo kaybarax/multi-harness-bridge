@@ -278,7 +278,7 @@ class TelegramBridge:
                             old["fingerprint"] is not None and old["fingerprint"] != fingerprint):
                     raise RejectedUpdate("Telegram update ID conflicts with stored provenance")
                 return False
-        receipt = self.store.send(route.project, "telegram", "pma", envelope, key)
+        receipt = self.store.send(route.project, "telegram", "pma", envelope, key, origin="user")
         with self.connect() as db:
             db.execute("""INSERT OR IGNORE INTO telegram_updates
                 (bot,update_id,chat,message_id,project,harness,inbound_key,fingerprint,queue_id,source_queue_id,allowed_users)
@@ -440,7 +440,7 @@ class TelegramBridge:
                 raise ValueError("Telegram queue envelope has no text or harness destination")
             source = envelope.get("source_queue_id")
             forwarded = self.store.send(project, "pma", target, body, f"telegram-forward:{item['id']}", source,
-                                        session=coordinator_session)
+                                        session=coordinator_session, origin="user")
             with self.connect() as db:
                 source_row = db.execute("SELECT bot,chat,message_id,allowed_users FROM telegram_updates WHERE queue_id=?",
                                         (item["id"],)).fetchone()

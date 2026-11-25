@@ -614,3 +614,76 @@ def test_devin_finish_records_receipt_even_when_the_reply_hits_the_loop_cap(tmp_
                                             "Answer", origin="wake")
     assert result["acknowledged"] and "Loop cap reached" in result["reply_refused"]
     assert store.trace("sample", delivery)["stage"] == "done"
+
+
+# --- regressions from the final review ------------------------------------------------
+
+def test_a_persons_notification_route_is_never_capped(tmp_path):
+    cfg, store = _store(tmp_path, harnesses=("codex",))
+    store.bind("sample", "pma", "coordinator", "pma-coordinator")
+    store.bind("sample", "pma", "inbox", "pma-inbox")
+    for n in range(15):
+        store.send("sample", "telegram", "pma", f"update {n}", f"t{n}")
+        store.send("sample", "pma", "codex", f"forward {n}", f"f{n}")
+
+
+def test_a_host_less_credential_caller_cannot_change_settings(tmp_path, monkeypatch):
+    from multi_harness_bridge import transport
+    cfg, store = _store(tmp_path)
+    monkeypatch.setattr(transport, "open_store", lambda _: store)
+    owner = transport.Principal("sample", "codex", "coordinator", "codex-coordinator")
+    monkeypatch.setattr(transport, "authenticate", lambda *_: owner)
+    monkeypatch.setattr(transport, "verify_role", lambda *_: None)
+    with pytest.raises(wake_policy.WakePolicyRefused):
+        transport.dispatch(cfg, "t" * 43, {"op": "stop"})
+    sent = transport.dispatch(cfg, "t" * 43, {"op": "send_fanout", "recipients": ["devin"], "body": "x", "key": "k"})
+    assert store.message_meta("sample", sent["deliveries"][0]["id"])["origin"] == "wake"
+
+
+def test_acknowledge_mode_keeps_a_plain_reply_to_the_woken_message(tmp_path, monkeypatch, capsys):
+    cfg, store = _store(tmp_path)
+    config.set_project_option(cfg.root, "sample", "codex", "wake_actions", "acknowledge")
+    original = store.send("sample", "devin", "codex", "ping", "p", origin="user")
+    _bind_cli(monkeypatch, cfg, "codex", "codex-coordinator")
+    _codex_turn(monkeypatch, wake_policy.wake_text("acknowledge", original["id"]), "queue")
+    result = _run_cli(capsys, ["--mailbox", "send", "--recipient", "devin", "--reply-to", original["id"],
+                               "--body", "pong", "--key", "r"])
+    assert result["id"]
+
+
+def test_malformed_transcript_lines_fail_closed(tmp_path):
+    home = tmp_path / "codex"
+    rollout = home / "sessions" / "r.jsonl"
+    rollout.parent.mkdir(parents=True)
+    thread = "019a0000-0000-7000-8000-000000000001"
+    with sqlite3.connect(home / "state_5.sqlite") as db:
+        db.execute("CREATE TABLE threads(id TEXT, rollout_path TEXT)")
+        db.execute("INSERT INTO threads VALUES(?,?)", (thread, str(rollout)))
+    rollout.write_text("[1, 2]\n" + json.dumps({"type": "response_item", "payload": {
+        "role": "user", "internal_chat_message_metadata_passthrough": "oops", "content": "hi"}}) + "\n")
+    text, trigger = role_adapters.codex_turn(thread_id=thread, home=home)
+    assert wake_policy.classify("codex", text=text, trigger=trigger)[0] == "unknown"
+
+
+def test_devin_typed_looking_turn_during_a_bridge_turn_is_not_the_users(tmp_path, monkeypatch):
+    from multi_harness_bridge import devin_acp
+    cfg, store, server, add, call, _ = _devin_rig(tmp_path, monkeypatch)
+    lease = devin_acp.TurnLease(store, "sample", "acp/devin-cli/dv", UUID)
+    lease.acquire()
+    try:
+        add({"role": "user", "content": "a host-inserted note after the wake prompt"})
+        call("c1", "set_pickup", {"enabled": False})
+        with pytest.raises(PermissionError, match="wake policy"):
+            server._tool_manager.get_tool("set_pickup").fn(enabled=False)
+    finally:
+        lease.release()
+
+
+def test_devin_wake_handles_only_its_own_notification(tmp_path, monkeypatch):
+    from multi_harness_bridge import devin_acp
+    cfg, store, server, add, call, _ = _devin_rig(tmp_path, monkeypatch)
+    add({"role": "user", "content": devin_acp._wake_prompt("mhb_roles_sample", UUID, True, "act")})
+    call("c1", "pickup_notification", {"notification_id": "11111111-1111-4111-8111-111111111111"})
+    with pytest.raises(PermissionError, match="only its own notification"):
+        server._tool_manager.get_tool("pickup_notification").fn(
+            notification_id="11111111-1111-4111-8111-111111111111")

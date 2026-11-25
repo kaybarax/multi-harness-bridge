@@ -245,9 +245,13 @@ def codex_invocation(role=None, *, thread_id=None, home=None, cwd=None, project_
                     item = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                if not isinstance(item, dict):
+                    continue
                 payload = item.get("payload", {})
                 if item.get("type") == "response_item" and isinstance(payload, dict) and payload.get("role") == "user":
                     metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
                     if metadata.get("content_item_kinds") == ["skills.selected_skill_instructions"]:
                         continue
                     content = payload.get("content", "")
@@ -289,6 +293,8 @@ def codex_turn(*, thread_id=None, home=None):
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(item, dict):
+                continue
             payload = item.get("payload", {})
             if isinstance(payload, dict) and payload.get("type") == "task_started":
                 attribution = payload.get("turn_attribution") or {}
@@ -297,6 +303,8 @@ def codex_turn(*, thread_id=None, home=None):
                 continue
             if item.get("type") == "response_item" and isinstance(payload, dict) and payload.get("role") == "user":
                 metadata = payload.get("internal_chat_message_metadata_passthrough") or {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
                 if metadata.get("content_item_kinds") == ["skills.selected_skill_instructions"]:
                     continue
                 content = payload.get("content", "")

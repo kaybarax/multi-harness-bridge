@@ -562,6 +562,9 @@ def _permission_handler(*, server_name, expected_session, workspace, notificatio
             if args is None:
                 continue
             ok, _ = wake_policy.allowed(wake_policy.ACT, wake_policy.WAKE, wake_policy.tool_action(tool, args))
+            if tool in ("pickup_notification", "acknowledge") and (
+                    args.get("notification_id", args.get("id")) != notification_id):
+                ok = False  # one message per wake: only this wake's own notification
             if not ok or not state.get("pickup_call"):
                 return {"outcome": {"outcome": "cancelled"}}
             state.setdefault("acted", []).append(tool)
@@ -738,6 +741,23 @@ def _stop_process(process):
 
 
 TURN_LEASE_STALE_SECONDS = 90.0
+RECENT_WAKE_SECONDS = 60.0
+
+
+def bridge_turn_active(store, project, session, *, clock=time.time):
+    """True while a bridge-started turn is running in this Devin session (lease or a fresh wake)."""
+    if TurnLease(store, project, session, "").busy():
+        return True
+    try:
+        with closing(sqlite3.connect(store.path, timeout=10)) as db:
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='mhb_wake_attempts'").fetchone():
+                return False
+            row = db.execute("""SELECT 1 FROM mhb_wake_attempts WHERE project=? AND harness='devin'
+                AND session=? AND state IN ('sending','sent','uncertain') AND started_at>?""",
+                (project, session, clock() - RECENT_WAKE_SECONDS)).fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return True
 TURN_BEAT_SECONDS = 20.0
 
 
@@ -816,9 +836,11 @@ def _run_act_turn(client, proc, lease, native_session, prompt, handler, pending,
     handoff = threading.Lock()
 
     def cleanup():
-        _stop_process(proc)
-        client.close()
-        lease.release()
+        try:
+            _stop_process(proc)
+            client.close()
+        finally:
+            lease.release()
 
     def run():
         try:

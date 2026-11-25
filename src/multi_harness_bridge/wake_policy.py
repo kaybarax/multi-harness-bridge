@@ -106,10 +106,6 @@ class WakePolicyRefused(PermissionError):
     """The current turn may not perform this bridge action."""
 
 
-class LoopCapReached(PermissionError):
-    """Too many wake-started messages between one pair of harnesses in the window."""
-
-
 # --- turn sources (host adapters) -------------------------------------------
 
 _TURN_SOURCES: dict[str, Callable] = {}
@@ -162,7 +158,7 @@ def classify(host, /, **evidence):
         return UNKNOWN, None
     try:
         kind, notification = source(**evidence)
-    except (OSError, ValueError, KeyError, TypeError):
+    except Exception:  # any unreadable evidence fails closed
         return UNKNOWN, None
     return (kind if kind in TURN_KINDS else UNKNOWN), notification
 
@@ -236,7 +232,8 @@ def allowed(mode_name, kind, action, *, reply_to=None, woken=None) -> tuple[bool
             return True, ""
         return False, "a digest turn only shows the digest"
     if kind == UNKNOWN:
-        # Messaging still works; it counts toward the loop cap as wake-started.
+        # In both modes an unclassifiable caller (a credential client, a host without turn
+        # evidence) may still message; every such message counts toward the loop cap.
         return True, ""
     # kind == WAKE
     if mode_name == ACT:

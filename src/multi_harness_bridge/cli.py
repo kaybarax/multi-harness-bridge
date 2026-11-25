@@ -145,7 +145,7 @@ def _action(args):
     if command == "bind":
         return "role"
     if command == "send":
-        return "send"
+        return "reply" if getattr(args, "reply_to", None) else "send"
     if command == "finish":
         return "finish"
     return "read"
@@ -157,7 +157,7 @@ def _enforce(config, args):
     project = getattr(args, "project", None)
     if project is not None and project not in config.projects:
         project = None
-    kind, _ = skills.enforce_caller(config, project, _action(args))
+    kind, _ = skills.enforce_caller(config, project, _action(args), reply_to=getattr(args, "reply_to", None))
     return kind
 
 

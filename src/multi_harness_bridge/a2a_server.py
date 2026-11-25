@@ -34,7 +34,7 @@ def application(config, port):
             raise NotImplementedError("Mailbox operations complete synchronously")
 
     card = AgentCard(
-        name="Multi Harness Bridge", version="1.5.0",
+        name="Multi Harness Bridge", version="1.6.0",
         description="Project-scoped local coordination mailbox. Send JSON operations in a text part.",
         capabilities=AgentCapabilities(streaming=False, push_notifications=False),
         default_input_modes=["text/plain"], default_output_modes=["text/plain"],

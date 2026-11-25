@@ -125,7 +125,7 @@ def current_turn(cfg, host, project, *, invocation=None):
             text = invocation.turn_text if invocation is not None and invocation.turn_text is not None \
                 else role_adapters.devin_turn_text(session)
             return wake_policy.classify("devin", text=text)
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):
+    except Exception:  # unreadable evidence fails closed
         return wake_policy.UNKNOWN, None
     return wake_policy.classify(host)
 
@@ -230,6 +230,8 @@ def _mailbox(args, host, cfg):
         raise ValueError("This verified native chat is not bound to a project role")
     from . import wake_policy
     action = _MAILBOX_ACTIONS.get(args.mailbox, "read")
+    if args.mailbox == "send" and getattr(args, "reply_to", None):
+        action = "reply"
     if args.mailbox == "digest":
         action = "read" if (args.digest_action or "show") == "show" else "settings"
     kind, _ = enforce(cfg, host, project, action, invocation=invocation,

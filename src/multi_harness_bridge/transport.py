@@ -103,7 +103,13 @@ def dispatch(config, token, command, *, remote=False):
         kind = wake_policy.UNKNOWN
         wake_policy.check(config.root, project, harness, kind, action)
     else:
-        kind, _ = skills.enforce_caller(config, project, action, reply_to=command.get("reply_to"))
+        # A credential caller is always an agent, never a terminal: with no host session
+        # to classify, it counts as unknown (it may message, counted, but never change settings).
+        if skills.caller_host() is None:
+            kind = wake_policy.UNKNOWN
+            wake_policy.check(config.root, project, harness, kind, action)
+        else:
+            kind, _ = skills.enforce_caller(config, project, action, reply_to=command.get("reply_to"))
     sent_from = {"origin": wake_policy.origin(kind)}
     if op == "status":
         return store.status(project, harness)
