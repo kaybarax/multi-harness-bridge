@@ -447,18 +447,15 @@ def raise_alert(project, key, text, state, *, harness=None, message_id=None, run
     alerts = state.setdefault("alerts", {})
     if key in alerts:
         return False
-    record = {"first_at": clock(), "text": text, "external_text": external_text or text,
+    # Text for an outside channel never carries a chat title; callers that put
+    # a title in ``text`` pass a title-free ``external_text``.
+    record = {"first_at": clock(), "text": text,
+              "external_text": external_text or _generic_alert(harness, message_id),
               "harness": harness, "id": message_id, "escalated": root is None}
     if root is None:
         alerts[key] = record
         _run_alert_command(project, record["external_text"], run)
         return True
-    feed = paths(root, project)["feed"]
-    feed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(feed, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as out:
-        out.write(json.dumps({"at": clock(), "event": "alert", "id": f"alert-{key}", "kind": "alert",
-                              "sender": "bridge", "recipient": harness, "excerpt": text}) + "\n")
     if harness:
         marks = state.setdefault("digest", {}).setdefault(harness, {})
         seq = int(marks.get("seq", 0)) + 1
@@ -468,8 +465,20 @@ def raise_alert(project, key, text, state, *, harness=None, message_id=None, run
         _save_state(digest_path(root, project, harness),
                     {"project": project, "harness": harness, "seq": seq, "ready_at": clock(),
                      "count": 1, "alert": True})
+    feed = paths(root, project)["feed"]
+    feed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(feed, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as out:
+        out.write(json.dumps({"at": clock(), "event": "alert", "id": f"alert-{key}", "kind": "alert",
+                              "sender": "bridge", "recipient": harness, "excerpt": text}) + "\n")
     alerts[key] = record  # only once the bridge chat has been told; a failed write retries next pass
     return True
+
+
+def _generic_alert(harness, message_id):
+    who = f"A {harness} message" if harness else "A message"
+    ref = f" ({message_id[:8]})" if message_id else ""
+    return f"{who}{ref} is stuck; see the bridge chat for the fix."
 
 
 def _run_alert_command(project, text, run=None):
@@ -496,7 +505,7 @@ def escalate_alerts(root, project, state, log, *, run=None, clock=time.time):
         if clock() - float(record.get("first_at", 0)) < delay:
             continue
         minutes = int((clock() - float(record["first_at"])) // 60)
-        text = record.get("external_text") or record.get("text", "")
+        text = record.get("external_text") or _generic_alert(record.get("harness"), record.get("id"))
         _run_alert_command(project, f"{text} (still waiting after {minutes} min)", run)
         record["escalated"] = True
         state["alerts"][key] = record
@@ -624,7 +633,10 @@ def _check_listeners(cfg, store, project, harnesses, state, log):
                     f"A {harness} message from {item['sender']} ({item['id'][:8]}) is waiting because the "
                     f"{harness} coordinator listener is not attached. Fix: retype take coordinator in "
                     f"the {_chat_label(harness, 'coordinator', session)}."), state,
-                    harness=harness, message_id=item["id"], root=cfg.root):
+                    harness=harness, message_id=item["id"], root=cfg.root,
+                    external_text=(f"A {harness} message ({item['id'][:8]}) is waiting because the "
+                                   f"{harness} coordinator listener is not attached. Fix: retype take "
+                                   f"coordinator in the {_chat_label(harness, 'coordinator', session, with_title=False)}.")):
                 log({"event": "fallback-report", "harness": harness, "id": item["id"]})
 
 
