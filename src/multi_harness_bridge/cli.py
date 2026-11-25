@@ -53,7 +53,21 @@ def build_parser():
     removing.add_argument("project")
     removing.add_argument("harness", choices=HOSTS)
     removing.add_argument("key")
-    for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace", "pending", "monitor"):
+    watch = commands.add_parser("watch", help="Inspect or start the project's shared watcher")
+    watch.add_argument("project")
+    watch.add_argument("action", choices=("status", "ensure"))
+    pickup_cmd = commands.add_parser(
+        "pickup", help="Ensure the watcher and print the listener for a bound chat (for take skills of other tools)")
+    pickup_cmd.add_argument("project")
+    pickup_cmd.add_argument("harness", choices=HOSTS)
+    pickup_cmd.add_argument("role", choices=("coordinator", "inbox"))
+    pickup_cmd.add_argument("--no-start", action="store_true", help="report watcher health without starting it")
+    digest = commands.add_parser("digest", help="Show a bridge digest or switch digests on or off")
+    digest.add_argument("project")
+    digest.add_argument("harness", choices=HOSTS)
+    digest.add_argument("action", choices=("show", "on", "off"), nargs="?", default="show")
+    for name in ("bind", "status", "send", "claim", "finish", "stop", "resume", "trace", "pending",
+                 "monitor", "listen"):
         cmd = commands.add_parser(name)
         cmd.add_argument("project")
         if name == "pending":
@@ -64,7 +78,7 @@ def build_parser():
             cmd.add_argument("id")
             continue
         cmd.add_argument("harness", help="Local actor name")
-        if name in ("bind", "claim", "finish", "monitor"):
+        if name in ("bind", "claim", "finish", "monitor", "listen"):
             cmd.add_argument("role", choices=("inbox", "coordinator"))
             cmd.add_argument("session")
         if name == "finish":
@@ -176,7 +190,26 @@ def run(args):
         issue(config, principal, args.out)
         return {"credential_file": str(args.out.resolve()), "project": args.project, "role": args.role}
     project = config.require(args.project)
+    if args.command == "watch":
+        from . import watcher
+        if args.action == "status":
+            return watcher.health(config.root, project)
+        return watcher.ensure(config.root, project)
+    if args.command == "digest":
+        from . import watcher
+        return watcher.digest_command(config.root, project, args.harness, args.action)
     store = settings.open_store(config)
+    if args.command == "pickup":
+        # The attachment point for a project whose role handoff lives in another
+        # tool: after that tool binds a chat, it calls this to start or verify
+        # the watcher and to get the listener for the currently bound session.
+        from . import pickup
+        session = store.roles(project, args.harness).get(args.role)
+        if not session:
+            raise ValueError(f"No {args.role} is bound for {args.harness} in this project")
+        return {"project": project, "harness": args.harness, "role": args.role, "session": session,
+                **pickup.role_report(config, store, project, args.harness, args.role, session,
+                                     config.projects[project][0], ensure_watcher=not args.no_start)}
     if args.command == "orchestrator":
         if args.action == "status":
             return store.project_status(project)
@@ -189,6 +222,14 @@ def run(args):
     if args.command == "monitor":
         from .monitor import subscribe
         subscribe(config, store, project, harness, args.role, args.session, output=sys.stdout)
+        return
+    if args.command == "listen":
+        from .pickup import listen
+        code = listen(config, store, project, harness, args.session, role=args.role, output=sys.stdout)
+        if code:
+            print(json.dumps({"mhb": "listener-exit", "reason": "session is not the bound role",
+                              "rearm": False}), flush=True)
+            raise SystemExit(code)
         return
     if args.command == "bind":
         return store.bind(project, harness, args.role, args.session)

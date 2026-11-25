@@ -190,11 +190,13 @@ def make_role_server(cfg, project):
     role_values = {"coordinator": "coordinator", "bridge": "inbox"}
 
     def current(tool, args=None, **options):
-        from .devin_acp import WAKE_PREFIX, FINISH_TOOL, PICKUP_TOOL
+        from .devin_acp import DIGEST_PREFIX, DIGEST_TOOL, WAKE_PREFIX, FINISH_TOOL, PICKUP_TOOL
 
         call = _native_call(project, tool, args, **options)
         if (call["user_prompt"] or "").startswith(WAKE_PREFIX) and tool not in {PICKUP_TOOL, FINISH_TOOL}:
             raise PermissionError("This native wake is scoped to its notification tools")
+        if (call["user_prompt"] or "").startswith(DIGEST_PREFIX) and tool != DIGEST_TOOL:
+            raise PermissionError("This digest prompt is scoped to the digest tool")
         return call
 
     @server.tool()
@@ -267,6 +269,12 @@ def make_role_server(cfg, project):
                   "status":store.status(project,"devin"),"pending":store.pending_overview(project,"devin",20)}
         if role == "coordinator":
             result["orchestrator"] = orchestrator_status
+        from . import pickup
+        try:
+            result["pickup"] = pickup.role_report(cfg, store, project, "devin", role_values[role],
+                                                  call["session"], call["workspace"])
+        except (OSError, ValueError, RuntimeError) as exc:
+            result["pickup"] = {"error": f"pickup check failed ({type(exc).__name__}): {exc}"}
         if title:
             from .devin_acp import rename
             try:
@@ -291,8 +299,11 @@ def make_role_server(cfg, project):
         roles=store.roles(project,"devin")
         role=next((r for r,v in roles.items() if v==call["session"]),None)
         if role is None: raise PermissionError("Current native chat is not bound to this project")
+        from . import pickup
         return {"roles":roles,"status":store.status(project,"devin"),"role":role,
-                "orchestrator":store.orchestrator_status(project)}
+                "orchestrator":store.orchestrator_status(project),
+                "pickup":pickup.role_report(cfg, store, project, "devin", role, call["session"],
+                                            call["workspace"], ensure_watcher=False)}
 
     @server.tool()
     def pickup_notification(notification_id: str | None = None) -> dict:
@@ -358,6 +369,18 @@ def make_role_server(cfg, project):
         args = {"reply_to": reply_to, "body": body, "key": key}
         call = current("reply_free_text", args)
         return store.reply_free_text(project, "devin", reply_to, body, key, session=call["session"])
+
+    @server.tool()
+    def bridge_digest(action: str = "show") -> dict:
+        """Bridge chat only: show the digest since the last one ("show"), or turn digests "on"/"off"."""
+        from . import watcher
+        if action not in {"show", "on", "off"}:
+            raise ValueError("action must be show, on or off")
+        call = current("bridge_digest", {"action": action}, argument_defaults={"action": "show"},
+                       latest_turn=True)
+        if store.roles(project, "devin").get("inbox") != call["session"]:
+            raise PermissionError("Only the bound bridge chat manages digests")
+        return watcher.digest_command(cfg.root, project, "devin", action)
 
     @server.tool()
     def set_pickup(enabled: bool) -> dict:

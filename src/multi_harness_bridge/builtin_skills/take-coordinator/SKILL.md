@@ -17,4 +17,15 @@ In Devin, use the installed project's `mhb_roles_<project>` tools. After the dir
 
 In Antigravity, use the project native MCP tools `mhb_<project>.take_coordinator`, `bridge_status`, `pickup_notification`, `acknowledge`, `send_message`, and `set_pickup`. These tools derive the current conversation from the native hook and do not accept caller session IDs. `pickup_notification` accepts the message notification ID and returns a lease that is acknowledged after this Coordinator has handled it.
 
+## Collect your own mail (pull mode)
+
+The takeover result has a `pickup` section. With `coordinator_pickup: pull` this chat collects its own mail and nothing opens or selects it from outside:
+
+- Report two lines to the user: the listener (attached, or the watcher nudges this chat) and the shared watcher (`alive`, with its start time). Retyping take coordinator repairs and re-confirms both.
+- If `pickup.listener.command` is present (Claude Code), start it now as a background Monitor with the maximum timeout. Each event line names pending message IDs, senders and kinds, never bodies. Handle each ID with the bridge-mailbox skill (claim, act, finish). When the Monitor expires, re-arm it with the same command. If it exits with code 3, another chat holds the role: do not re-arm, and tell the user.
+- Otherwise the watcher sends this chat a short hint with the notification ID; process it the same way.
+- Afterwards, `--mailbox status` (Codex, Claude) or `bridge_status()` (Devin) shows the listener and watcher health.
+
+With `push` nothing changes: the bridge chat forwards and wakes this chat as before.
+
 An optional title may be applied only through the current host's native title API and verified by reading it back. The role result reports title verification independently from ownership. Report a host-specific title failure without undoing a successful role transfer.

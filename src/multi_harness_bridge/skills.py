@@ -132,6 +132,11 @@ def install_native(project, host, cfg):
     raise ValueError("Unsupported host")
 
 
+def _pull(cfg, project, host):
+    from . import pickup
+    return pickup.is_pull(cfg.root, project, host)
+
+
 def _mailbox(args, host, cfg):
     invocation = _native_invocation(host, args.project)
     project = cfg.resolve(invocation.workspace, args.project)
@@ -143,9 +148,17 @@ def _mailbox(args, host, cfg):
     if role is None:
         raise ValueError("This verified native chat is not bound to a project role")
     if args.mailbox == "status":
+        from . import pickup
         result = {"project": project, "harness": host, "role": role, "session": invocation.session,
                   "roles": roles, "queue": store.status(project, host),
-                  "orchestrator": store.orchestrator_status(project)}
+                  "orchestrator": store.orchestrator_status(project),
+                  "pickup": pickup.role_report(cfg, store, project, host, role, invocation.session,
+                                               invocation.workspace, ensure_watcher=False)}
+    elif args.mailbox == "digest":
+        from . import watcher
+        if role != "inbox":
+            raise PermissionError("Only the bound bridge chat manages digests")
+        result = watcher.digest_command(cfg.root, project, host, args.digest_action or "show")
     elif args.mailbox == "claim":
         message = store.claim(project, host, role, invocation.session, message_id=args.message_id)
         result = {"project": project, "harness": host, "role": role, "message": message}
@@ -167,7 +180,8 @@ def _mailbox(args, host, cfg):
             previous_claim.unlink(missing_ok=True)
         result = {"project": project, "role": role, "message_id": args.message_id, "finished": finished}
         if (finished and host == "codex" and role == "inbox"
-                and config.project_option(cfg.root, project, "codex", "coordinator_wake") == "agent-relay"):
+                and config.project_option(cfg.root, project, "codex", "coordinator_wake") == "agent-relay"
+                and not _pull(cfg, project, host)):
             trace = store.trace(project, args.message_id)
             if trace and trace.get("stage") == "coordinator":
                 coordinator = store.roles(project, "codex").get("coordinator")
@@ -268,7 +282,9 @@ def main(argv=None):
     parser.add_argument("--install-native", action="store_true", help="Install supported host-local hook/helper")
     parser.add_argument("--take", choices=("coordinator", "bridge"), help="Transfer the current verified native chat to this role")
     parser.add_argument("--hint", help="Disambiguate a project matching the current native workspace")
-    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "relay-confirm", "relay-failed", "stop", "resume"), help="Use the mailbox as the role bound to this verified native chat")
+    parser.add_argument("--digest-action", choices=("show", "on", "off"),
+                        help="with --mailbox digest: show the digest (default) or switch digests on or off")
+    parser.add_argument("--mailbox", choices=("status", "claim", "finish", "send", "send-fanout", "reply", "relay-confirm", "relay-failed", "stop", "resume", "digest"), help="Use the mailbox as the role bound to this verified native chat")
     parser.add_argument("--message-id")
     parser.add_argument("--lease", help="Exact lease returned by the claim being finished")
     parser.add_argument("--recipient", action="append", help="Destination harness, repeat for send-fanout")
@@ -326,6 +342,12 @@ def main(argv=None):
             if role == "coordinator":
                 outcome["pending"] = store.pending(invocation.project, host, role, invocation.session)
             outcome["title"] = role_adapters.apply_native_title(invocation)
+            from . import pickup
+            try:
+                outcome["pickup"] = pickup.role_report(cfg, store, invocation.project, host, role,
+                                                       invocation.session, invocation.workspace)
+            except (OSError, ValueError, RuntimeError) as exc:
+                outcome["pickup"] = {"error": f"pickup check failed ({type(exc).__name__}): {exc}"}
             print(json.dumps(outcome, indent=2))
             return
         caller = host if not (args.bootstrap or args.install_native) else caller

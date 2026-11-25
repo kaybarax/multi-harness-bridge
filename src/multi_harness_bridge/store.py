@@ -792,6 +792,24 @@ class Store:
             rows = self._pending_rows(db, project, harness, role, time.time(), notifications_only=True)
             return [(row["id"], row["attempts"] + 1) for row in rows]
 
+    def pending_details(self, project, harness, role, session):
+        """Read body-free hint metadata for every available message for this role."""
+        self._validate_claim(project, harness, role, session)
+        with self._route_guard(project), closing(self._connect()) as db, db:
+            db.execute("BEGIN")
+            if not self._can_pickup(db, project, harness, role, session):
+                return []
+            first_stage = "outbound" if role == "inbox" else "coordinator"
+            rows = db.execute(
+                """SELECT id,attempts,sender,reply_to,key,updated FROM messages WHERE project=?
+                AND pickup_harness=? AND stage IN (?,?) AND (lease IS NULL OR deadline<=?)
+                ORDER BY created,id""", (project, harness, first_stage, role, time.time()))
+            return [{"id": row["id"], "attempt": row["attempts"] + 1, "sender": row["sender"],
+                     "kind": ("reply" if row["reply_to"] else
+                              "notice" if row["key"].startswith("mhb-orchestrator-") else "request"),
+                     "updated": row["updated"]}
+                    for row in rows]
+
     def finish(self, project, harness, role, session, id, lease):
         self._validate_claim(project, harness, role, session)
         with self._route_guard(project), closing(self._connect()) as db, db:
@@ -846,6 +864,38 @@ class Store:
             (next_stage, now, id),
         )
         return True
+
+    def forward_pull(self, project, harness, *, limit=100):
+        """Advance this harness's inbox stages without a model turn.
+
+        Used only when the harness collects coordinator mail itself
+        (``coordinator_pickup = pull``). Unleased ``outbound`` items sent by
+        this harness move to ``inbox`` and unleased ``inbox`` items addressed to
+        it move to ``coordinator``, in one transaction and without a lease, so a
+        role handover is never blocked. Both roles must be bound and pickup
+        enabled, as for an inbox claim. Returns the forwarded message IDs.
+        """
+        project, harness = self._name(project, "project"), self._name(harness, "harness")
+        with self._route_guard(project), closing(self._connect()) as db, db:
+            db.execute("BEGIN IMMEDIATE")
+            roles = self._roles(db, project, harness)
+            if not all(roles.get(role) for role in ROLES) or not self._enabled(db, project, harness):
+                return []
+            now = time.time()
+            rows = db.execute(
+                """SELECT id,stage FROM messages WHERE project=? AND pickup_harness=?
+                AND stage IN ('outbound','inbox') AND (lease IS NULL OR deadline<=?)
+                ORDER BY created,id LIMIT ?""", (project, harness, now, limit)).fetchall()
+            moved = []
+            for row in rows:
+                next_stage = "inbox" if row["stage"] == "outbound" else "coordinator"
+                changed = db.execute(
+                    """UPDATE messages SET stage=?,lease=NULL,lease_role=NULL,lease_session=NULL,
+                    deadline=NULL,updated=? WHERE id=? AND stage=? AND (lease IS NULL OR deadline<=?)""",
+                    (next_stage, now, row["id"], row["stage"], now)).rowcount
+                if changed:
+                    moved.append({"id": row["id"], "stage": next_stage})
+            return moved
 
     def status(self, project, harness):
         with self._route_guard(project), closing(self._connect()) as db, db:
