@@ -180,6 +180,7 @@ def _native_call(project, tool, expected_args=None, *, role_command=None, freshn
 
 
 def make_role_server(cfg, project):
+    from . import wake_policy
     from mcp.server.fastmcp import FastMCP
     server = FastMCP(server_name(project), instructions=(
         "Project role and mailbox operations are bound to the current Devin Local ACP chat. "
@@ -189,14 +190,46 @@ def make_role_server(cfg, project):
     store = config.open_store(cfg)
     role_values = {"coordinator": "coordinator", "bridge": "inbox"}
 
-    def current(tool, args=None, **options):
-        from .devin_acp import DIGEST_PREFIX, DIGEST_TOOL, WAKE_PREFIX, FINISH_TOOL, PICKUP_TOOL
+    def turn_window():
+        # A bridge turn may run for wake_turn_minutes; its prompt must stay in view that long.
+        minutes = wake_policy.settings(cfg.root, project, "devin")["wake_turn_minutes"]
+        return max(180, minutes * 60 + 120)
 
-        call = _native_call(project, tool, args, **options)
-        if (call["user_prompt"] or "").startswith(WAKE_PREFIX) and tool not in {PICKUP_TOOL, FINISH_TOOL}:
-            raise PermissionError("This native wake is scoped to its notification tools")
+    def policy(call, tool, args=None):
+        """Apply the shared wake policy to this call; returns the turn kind."""
+        from .devin_acp import DIGEST_PREFIX, DIGEST_TOOL
         if (call["user_prompt"] or "").startswith(DIGEST_PREFIX) and tool != DIGEST_TOOL:
             raise PermissionError("This digest prompt is scoped to the digest tool")
+        kind, woken = wake_policy.classify("devin", text=call["user_prompt"])
+        if kind == wake_policy.USER:
+            from .devin_acp import bridge_turn_active
+            if bridge_turn_active(store, project, call["session"]):
+                # Whatever the host recorded after the prompt, a bridge turn is still running here.
+                kind = wake_policy.UNKNOWN
+        action = wake_policy.tool_action(tool, args)
+        if kind == wake_policy.UNKNOWN and action in wake_policy.USER_ONLY:
+            raise wake_policy.WakePolicyRefused(
+                f"Refused by the bridge's wake policy: {action} changes need a turn the user started, and a "
+                "bridge turn is running or just ran in this chat; retry in a new turn in a minute.")
+        if kind == wake_policy.WAKE and tool in ("pickup_notification", "acknowledge") and (
+                (args or {}).get("notification_id", (args or {}).get("id")) != woken):
+            raise wake_policy.WakePolicyRefused(
+                "Refused by the bridge's wake policy: a bridge turn handles only its own notification.")
+        wake_policy.check(cfg.root, project, "devin", kind, action,
+                          reply_to=(args or {}).get("reply_to") or (args or {}).get("notification_id"),
+                          woken=woken)
+        if (kind == wake_policy.WAKE and action in (wake_policy.SEND, wake_policy.REPLY)
+                and tool != "finish_wake"):
+            # Act only on mail this turn has actually picked up.
+            if not woken or not store.picked_up(project, woken, "devin", call["session"]):
+                raise wake_policy.WakePolicyRefused(
+                    "Refused by the bridge's wake policy: pick up this wake's notification before messaging.")
+        return kind
+
+    def current(tool, args=None, **options):
+        options.setdefault("freshness", turn_window())
+        call = _native_call(project, tool, args, **options)
+        call["turn_kind"] = policy(call, tool, args)
         return call
 
     @server.tool()
@@ -214,6 +247,7 @@ def make_role_server(cfg, project):
                 continue
         if call is None or role is None:
             raise PermissionError("Current direct user prompt must explicitly invoke take coordinator or take bridge")
+        policy(call, "prepare_role_handoff")
         nonce = secrets.token_urlsafe(32)
         with closing(sqlite3.connect(cfg.database)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS devin_role_challenges(challenge_hash TEXT PRIMARY KEY,project TEXT,session TEXT,workspace TEXT,role TEXT,expires REAL,used INTEGER DEFAULT 0)")
@@ -234,6 +268,7 @@ def make_role_server(cfg, project):
             raise PermissionError("A fresh role handoff challenge is required")
         tool = "take_coordinator" if role == "coordinator" else "take_bridge"
         call = _native_call(project, tool, {"challenge": challenge}, role_command=role)
+        policy(call, tool)
         digest = hashlib.sha256(challenge.encode()).hexdigest()
         with closing(sqlite3.connect(cfg.database)) as db, db:
             db.execute("CREATE TABLE IF NOT EXISTS devin_role_challenge_proofs(challenge_hash TEXT PRIMARY KEY,orchestrator INTEGER NOT NULL,request_id TEXT NOT NULL)")
@@ -327,12 +362,14 @@ def make_role_server(cfg, project):
         return devin_acp._pickup_notification(store, project, role, call["session"], notification_id)
 
     @server.tool()
-    def finish_wake(notification_id: str, lease: str, reply: str | None = None) -> dict:
-        """Complete the exact automatic notification with its pickup lease and optional text reply."""
+    def finish_wake(notification_id: str, lease: str, reply: str | None = None,
+                    ack_only: bool = False) -> dict:
+        """Complete the exact automatic notification with its pickup lease and optional text reply.
+        Set ack_only when the reply only confirms receipt: it then wakes nobody."""
         from . import devin_acp
 
-        args = {"notification_id": notification_id, "lease": lease, "reply": reply}
-        call = current(devin_acp.FINISH_TOOL, args, argument_defaults={"reply": None},
+        args = {"notification_id": notification_id, "lease": lease, "reply": reply, "ack_only": ack_only}
+        call = current(devin_acp.FINISH_TOOL, args, argument_defaults={"reply": None, "ack_only": False},
                        latest_turn=True, freshness=devin_acp.NATIVE_WAKE_SECONDS)
         name = server_name(project)
         _, _, prompt = devin_acp.active_wake(store, project, name, call, notification_id, lease=lease)
@@ -340,7 +377,8 @@ def make_role_server(cfg, project):
                                                 notification_id, call["user_at"], _native_db(),
                                                 user_row_id=call["user_row_id"])
         return devin_acp._finish_notification(store, project, call["session"], notification_id,
-                                              observed.get(devin_acp.PICKUP_TOOL), notification_id, lease, reply)
+                                              observed.get(devin_acp.PICKUP_TOOL), notification_id, lease, reply,
+                                              ack_only=ack_only, origin=wake_policy.origin(call["turn_kind"]))
 
     @server.tool()
     def acknowledge(id: str, lease: str) -> dict:
@@ -354,21 +392,25 @@ def make_role_server(cfg, project):
         args={"recipient":recipient,"body":body,"key":key}
         if reply_to is not None:args["reply_to"]=reply_to
         call=current("send_message",args)
-        return store.send(project,"devin",recipient,body,key,reply_to=reply_to,session=call["session"])
+        return store.send(project,"devin",recipient,body,key,reply_to=reply_to,session=call["session"],
+                          origin=wake_policy.origin(call["turn_kind"]))
 
     @server.tool()
     def send_fanout(recipients: list[str], body: str, key: str) -> dict:
         """Send one free-text request to all named peer harnesses in this project. Reuse the key on retry."""
         args = {"recipients": recipients, "body": body, "key": key}
         call = current("send_fanout", args)
-        return store.send_fanout(project, "devin", recipients, body, key, session=call["session"])
+        return store.send_fanout(project, "devin", recipients, body, key, session=call["session"],
+                                 origin=wake_policy.origin(call["turn_kind"]))
 
     @server.tool()
-    def reply_free_text(reply_to: str, body: str, key: str) -> dict:
-        """Send a correlated reply to a received request. Use its delivery ID and reuse the reply key on retry."""
-        args = {"reply_to": reply_to, "body": body, "key": key}
-        call = current("reply_free_text", args)
-        return store.reply_free_text(project, "devin", reply_to, body, key, session=call["session"])
+    def reply_free_text(reply_to: str, body: str, key: str, ack_only: bool = False) -> dict:
+        """Send a correlated reply to a received request. Use its delivery ID and reuse the reply key on retry.
+        Set ack_only when the reply only confirms receipt: it then wakes nobody."""
+        args = {"reply_to": reply_to, "body": body, "key": key, "ack_only": ack_only}
+        call = current("reply_free_text", args, argument_defaults={"ack_only": False})
+        return store.reply_free_text(project, "devin", reply_to, body, key, session=call["session"],
+                                     origin=wake_policy.origin(call["turn_kind"]), ack_only=ack_only)
 
     @server.tool()
     def bridge_digest(action: str = "show") -> dict:
@@ -394,6 +436,7 @@ def make_role_server(cfg, project):
 
         call = _native_call(project, "propagate_skills", {"sources": sources, "mode": mode, "workspace": workspace},
                             argument_defaults={"mode": "auto", "workspace": ""}, latest_turn=True)
+        policy(call, "propagate_skills")
         requested_mode, requested_sources = propagation.explicit_skill_request(call["user_prompt"])
         if sources != requested_sources:
             raise PermissionError("Skill sources must exactly match the current direct user request")

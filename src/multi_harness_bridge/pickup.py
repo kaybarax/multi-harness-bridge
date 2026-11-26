@@ -269,6 +269,12 @@ def _write_json(path, data):
     config.atomic_json(path, data)
 
 
+def _mark_hint(root, project, harness, session, ids=()):
+    """Recorded before the hint is printed, so the turn it starts is never taken for the user's."""
+    from . import wake_policy
+    wake_policy.record_hint(root, project, harness, session, ids)
+
+
 def listen(cfg, store, project, harness, session, *, output, role="coordinator", interval=1.0,
            wait=time.sleep, clock=time.time, rehint_seconds=None, max_cycles=None):
     """Hint the bound coordinator chat about its own pending mail.
@@ -307,6 +313,7 @@ def listen(cfg, store, project, harness, session, *, output, role="coordinator",
         if role == "inbox":
             seq = _digest_seq(digest_marker)
             if seq > last_digest:
+                _mark_hint(cfg.root, project, harness, session)
                 print(json.dumps({"mhb": "digest", "project": project, "harness": harness,
                                   "seq": seq}), file=output, flush=True)
                 last_digest = seq
@@ -335,6 +342,7 @@ def listen(cfg, store, project, harness, session, *, output, role="coordinator",
                     "session": session, "count": len(due),
                     "messages": [{"id": item["id"], "sender": item["sender"], "kind": item["kind"]}
                                  for item in due]}
+            _mark_hint(cfg.root, project, harness, session, [item["id"] for item in due])
             print(json.dumps(line), file=output, flush=True)
             for item in due:
                 hinted[(item["id"], item["attempt"])] = now

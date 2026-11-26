@@ -115,6 +115,8 @@ def test_cli_auto_selects_declared_entry_from_verified_active_workspace(tmp_path
     monkeypatch.setenv("CODEX_THREAD_ID", "native-thread")
     monkeypatch.setattr(skills, "_native_invocation", lambda host, hint=None: role_adapters.Invocation(
         "sample", "codex", "native-thread", "", dev, proof="fixture-native"))
+    # The person typed the request in this thread (the wake policy checks the turn).
+    monkeypatch.setattr(role_adapters, "codex_turn", lambda **_: ("propagate skills from claude", "composer"))
     monkeypatch.chdir(docs)
 
     skills.main(["--from", "claude"])

@@ -83,6 +83,7 @@ The [architecture guide](docs/architecture.md) explains the design and failure b
 | Connect another client | Use a role-scoped MCP server on stdio or authenticated A2A v1 JSON-RPC on loopback. See [Mailbox protocols](docs/protocol.md). |
 | Diagnose delayed delivery | Inspect the queue lease, native wake result, inbox forwarding, coordinator read and provider receipt in sequence. See [Operations](docs/operations.md). |
 | Let coordinators collect their own mail | The default for Codex, Claude Code and Devin Local (`coordinator_pickup: pull`). A shared watcher forwards mail without opening or selecting chats; the bridge chat becomes a history board with digests. See [Coordinator pickup](docs/pickup.md). |
+| Let woken coordinators act | A turn the bridge starts may read, reply, message the other bound harnesses and carry on with assigned work (`wake_actions: act`, the default for Codex, Claude Code and Devin Local). Role changes, bridge settings and skill propagation are refused in such turns on every host, receipts can be ack-only, and a per-pair loop cap raises an alert. See [Wake-turn policy](docs/wake-policy.md). |
 | Wake a busy Codex coordinator | Enable the agent relay with `mhb option set PROJECT codex coordinator_wake agent-relay`; the inbox agent injects the wake into the coordinator's active turn. See [Native wake](docs/native.md). |
 
 ## Platform support

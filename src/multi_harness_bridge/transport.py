@@ -75,7 +75,7 @@ def revoke(config, token):
         return db.execute("DELETE FROM credentials WHERE digest=?", (_digest(token),)).rowcount
 
 
-def dispatch(config, token, command):
+def dispatch(config, token, command, *, remote=False):
     if not isinstance(command, dict):
         raise ValueError("Expected a JSON object")
     owner = authenticate(config, token)
@@ -92,6 +92,25 @@ def dispatch(config, token, command):
     for key in required[op]:
         if key not in command:
             raise ValueError(f"Missing {key}")
+    from . import skills, wake_policy
+    action = {"status": "read", "claim": "read", "finish": "finish", "send": "send",
+              "send_fanout": "send", "reply_free_text": "reply"}.get(op, "settings")
+    if op == "send" and command.get("reply_to"):
+        action = "reply"
+    if remote:
+        # A network caller's turn cannot be classified: it may message (counted toward the
+        # loop cap) but never change settings.
+        kind = wake_policy.UNKNOWN
+        wake_policy.check(config.root, project, harness, kind, action)
+    else:
+        # A credential caller is always an agent, never a terminal: with no host session
+        # to classify, it counts as unknown (it may message, counted, but never change settings).
+        if skills.caller_host() is None:
+            kind = wake_policy.UNKNOWN
+            wake_policy.check(config.root, project, harness, kind, action)
+        else:
+            kind, _ = skills.enforce_caller(config, project, action, reply_to=command.get("reply_to"))
+    sent_from = {"origin": wake_policy.origin(kind)}
     if op == "status":
         return store.status(project, harness)
     if op == "claim":
@@ -102,13 +121,13 @@ def dispatch(config, token, command):
         raise PermissionError("Coordinator ownership is required for this operation")
     if op == "send":
         return store.send(project, harness, command["recipient"], command["body"], command["key"],
-                          reply_to=command.get("reply_to"), session=session)
+                          reply_to=command.get("reply_to"), session=session, **sent_from)
     if op == "send_fanout":
         return store.send_fanout(project, harness, command["recipients"], command["body"], command["key"],
-                                 session=session)
+                                 session=session, **sent_from)
     if op == "reply_free_text":
         return store.reply_free_text(project, harness, command["reply_to"], command["body"], command["key"],
-                                     session=session)
+                                     session=session, **sent_from)
     return {"result": store.set_enabled(project, harness, op == "resume", session=session)}
 
 

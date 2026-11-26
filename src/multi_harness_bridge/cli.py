@@ -131,10 +131,41 @@ def self_test():
     return {"checks": checks}
 
 
+def _action(args):
+    """The wake-policy class of one mhb command."""
+    command, action = args.command, getattr(args, "action", None)
+    if command in {"project", "option", "watch", "digest", "orchestrator", "credential"} and action in {
+            "list", "status", "show", None}:
+        return "read"
+    if command in {"project", "skill-entry", "option", "watch", "digest", "orchestrator", "credential",
+                   "init", "stop", "resume", "serve", "mcp"}:
+        return "settings"
+    if command == "pickup":
+        return "read" if args.no_start else "settings"
+    if command == "bind":
+        return "role"
+    if command == "send":
+        return "reply" if getattr(args, "reply_to", None) else "send"
+    if command == "finish":
+        return "finish"
+    return "read"
+
+
+def _enforce(config, args):
+    """Refuse what the wake policy does not allow from the calling host turn."""
+    from . import skills
+    project = getattr(args, "project", None)
+    if project is not None and project not in config.projects:
+        project = None
+    kind, _ = skills.enforce_caller(config, project, _action(args), reply_to=getattr(args, "reply_to", None))
+    return kind
+
+
 def run(args):
     if args.command == "self-test":
         return self_test()
     config = settings.load()
+    turn = _enforce(config, args)
     if args.command == "project":
         if args.action == "add":
             config = settings.register(args.name, args.roots)
@@ -237,8 +268,9 @@ def run(args):
         return {"project": project, "harness": harness, "roles": store.roles(project, harness),
                 "queue": store.status(project, harness)}
     if args.command == "send":
+        from . import wake_policy
         return store.send(project, harness, settings.identifier(args.recipient), args.body, args.key,
-                          reply_to=args.reply_to)
+                          reply_to=args.reply_to, origin=wake_policy.origin(turn))
     if args.command == "claim":
         return {"message": store.claim(project, harness, args.role, args.session)}
     if args.command == "finish":

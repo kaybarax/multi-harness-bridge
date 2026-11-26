@@ -25,7 +25,7 @@ def application(config, port):
         async def execute(self, context, event_queue):
             try:
                 command = json.loads(get_message_text(context.message))
-                result = await asyncio.to_thread(dispatch, config, bearer.get(), command)
+                result = await asyncio.to_thread(dispatch, config, bearer.get(), command, remote=True)
             except (ValueError, TypeError, PermissionError, RuntimeError) as exc:
                 result = {"error": str(exc)}
             await event_queue.enqueue_event(new_text_message(json.dumps(result)))
@@ -34,7 +34,7 @@ def application(config, port):
             raise NotImplementedError("Mailbox operations complete synchronously")
 
     card = AgentCard(
-        name="Multi Harness Bridge", version="1.5.0",
+        name="Multi Harness Bridge", version="1.6.0",
         description="Project-scoped local coordination mailbox. Send JSON operations in a text part.",
         capabilities=AgentCapabilities(streaming=False, push_notifications=False),
         default_input_modes=["text/plain"], default_output_modes=["text/plain"],
